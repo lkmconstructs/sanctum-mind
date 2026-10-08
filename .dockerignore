@@ -6,6 +6,7 @@ dist
 .env.*
 !.env.example
 .embed-cache
+exchange
 coverage
 *.log
 test

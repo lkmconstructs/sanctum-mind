@@ -138,6 +138,9 @@ async function main(): Promise<void> {
       return;
     }
     case "stdio": {
+      if (!process.env.SANCTUM_BEARER) {
+        fail("SANCTUM_BEARER is not set; stdio needs the mind's key (under Docker: set SANCTUM_BEARER in the client's environment and run docker exec -i -e SANCTUM_BEARER <container> node dist/cli.js stdio)");
+      }
       defaultCoolingMs();
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);

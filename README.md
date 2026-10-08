@@ -34,9 +34,10 @@ You need Docker. The steps below start a database, create your first mind, and s
 
 ### 1. Start it (Docker)
 
-Open a terminal in the folder where you cloned this project. Run these four commands, one at a time, waiting for each to finish:
+Open a terminal in the folder where you cloned this project. Run these commands, one at a time, waiting for each to finish:
 
 ```bash
+mkdir -p exchange                       # a folder for moving minds in and out (see Portability); on Linux, if your user id is not 1000, also run: sudo chown 1000:1000 exchange
 docker compose up -d db                 # Postgres 16 + pgvector, with a healthcheck
 docker compose run --rm init            # migrates, makes the mind "alpha", prints its key and MCP configs
 docker compose up -d mind               # the service on http://127.0.0.1:8002 (published to loopback only)
@@ -46,13 +47,15 @@ docker compose up -d daemon             # the background passes: decay, expiry, 
 The second command prints a lot. Near the end it shows:
 
 - the mind's **key** ("bearer key"). It is shown once, and only a fingerprint of it is stored. Copy it somewhere safe now.
-- two ready-to-paste **connection configs**, one called stdio and one called Streamable HTTP.
+- two ready-to-paste **connection configs**, one called Streamable HTTP and one called stdio (Docker). The next section says which to use.
 
 To name your mind something other than `alpha`, run `MIND=beta docker compose run --rm init` (use your own name in place of `beta`). It is safe to run `init` again. It will not replace an existing key unless you add `--rotate`:
 
 ```bash
-docker compose run --rm init node dist/cli.js init --mind alpha --rotate
+docker compose run --rm init node dist/cli.js init --mind alpha --docker --public-db-host localhost:5432 --rotate
 ```
+
+(Naming a command replaces the one in `docker-compose.yml`, so that line repeats `--docker` and `--public-db-host`. Leave them out and `init` prints the clone-only stdio config instead.)
 
 The built-in passwords are for your own machine only. If anything other than you will reach this machine, set `POSTGRES_PASSWORD` and `APP_PASSWORD` (in your environment, or in a `.env` file next to `docker-compose.yml`) before the first `docker compose up -d db`; changing them later takes manual steps. Use letters and digits only, because they are placed inside web addresses. To change the cooling wait, set `IDENTITY_COOLING_HOURS` the same way (default 24, 0 for solo use). Compose passes it to both the service and the daemon.
 
@@ -60,15 +63,16 @@ If the output shows `<app-password>` where a password should be, substitute the 
 
 ### 2. Connect it to an app
 
-The app that will talk to your mind (the "MCP client") needs one of the two configs that `init` printed. sanctum-mind speaks standard MCP, so any client that supports it works; nothing here is specific to one vendor.
+The app that will talk to your mind (the "MCP client") needs one of the configs that `init` printed. sanctum-mind speaks standard MCP, so any client that supports it works; nothing here is specific to one vendor.
 
 - **HTTP**: for an app that can connect to a web address. Use the HTTP config. It points at `http://localhost:8002/mcp` and carries the key. With HTTP, each mind holds only its own key. This is the safer option when several minds share a service.
 - **stdio**: for an app that launches the service itself (Claude Desktop and Claude Code are two such apps; any MCP client that starts a local command works the same way), so no web server is needed. The config contains the `sanctum_app` database address and the key. That address is a credential for every mind in the database, so use stdio only where every mind on that machine is trusted alike. To launch from a clone, the config runs `node /absolute/path/to/sanctum-mind/dist/cli.js stdio`. That file exists after `npm run build`, so this path needs Node.js 22+ on your computer. Whether a given app also accepts the HTTP config is the app's call; check its documentation.
-- **If you used Docker, use the HTTP config.** The stdio config that Docker's `init` prints points at `/app/dist/cli.js`, a path inside the container that does not exist on your machine, and its database address shows `<app-password>`. To use stdio with a Docker setup, you need a host build: clone the project, run `npm ci && npm run build`, and put your clone's `dist/cli.js` path and your `APP_PASSWORD` into the config.
+- **stdio (Docker)**: for an app that launches a local command, when you only have Docker. The config runs `docker exec -i` into the running `sanctum-mind` container and starts the stdio server there. The container already holds the database address, so no database credential goes into your app's settings; only the mind's key does, and it is handed to `docker` through the environment, not typed on the command line where other users could see it in `ps`. The mind container must be running (`docker compose up -d mind`), and `docker` must be on the path of the app that launches it. The container has the fixed name `sanctum-mind`; if you run two copies of this project on one machine the names collide, so rename one in `docker-compose.yml` and run `init` with `--container <that name>`.
+- **If you used Docker, use the HTTP config or the stdio (Docker) config; the host-path stdio config is for a clone.** `init` run through Docker does not print the host-path one, because its path would point inside the container, not at your machine.
 
 Paste the config into your app's MCP server settings, replacing any placeholders, then restart the app. The `"type":"http"` key in the HTTP config is specific to some clients, so check your client's documentation for its shape and for where it keeps that settings file. This project does not document other apps' settings locations, because they change.
 
-The two shapes look like this (`init` fills in the real values for you):
+The three shapes look like this (`init` fills in the real values for you):
 
 ```json
 {"mcpServers":{"sanctum-mind":{"type":"http","url":"http://localhost:8002/mcp","headers":{"Authorization":"Bearer <key>"}}}}
@@ -76,6 +80,10 @@ The two shapes look like this (`init` fills in the real values for you):
 
 ```json
 {"mcpServers":{"sanctum-mind":{"command":"node","args":["/absolute/path/to/sanctum-mind/dist/cli.js","stdio"],"env":{"DATABASE_URL":"<sanctum_app URL>","SANCTUM_BEARER":"<key>"}}}}
+```
+
+```json
+{"mcpServers":{"sanctum-mind":{"command":"docker","args":["exec","-i","-e","SANCTUM_BEARER","sanctum-mind","node","dist/cli.js","stdio"],"env":{"SANCTUM_BEARER":"<key>"}}}}
 ```
 
 If you did not use Docker, see "Without Docker" under For engineers.
@@ -119,17 +127,17 @@ For the full list, the exact fields and the error shapes, see [CONTRACTS.md](CON
 
 ## If something goes wrong
 
-These are admin commands, run by you in a terminal, not by your mind. Suspend, restore, rotate (`init`), grants and purge need the admin database address in `DATABASE_URL`. `export-mind` and `import-mind` need the `sanctum_app` address and refuse the admin one. `sinks requeue` works with either. Outside Docker, run them as `npm start -- <command>`. Under Docker, run the admin ones through the init service: `docker compose run --rm init node dist/cli.js <command> ...` (for example `docker compose run --rm init node dist/cli.js suspend-access --mind alpha`). Export and import have no clean Docker form: they need the `sanctum_app` address, and the compose file has no mount to carry a file in or out of a one-off container, so run them from a clone (see "Without Docker").
+These are admin commands, run by you in a terminal, not by your mind. Suspend, restore, rotate (`init`), grants and purge need the admin database address in `DATABASE_URL`. `export-mind` and `import-mind` need the `sanctum_app` address and refuse the admin one. `sinks requeue` works with either. Outside Docker, run them as `npm start -- <command>`. Under Docker, run the admin ones through the init service: `docker compose run --rm init node dist/cli.js <command> ...` (for example `docker compose run --rm init node dist/cli.js suspend-access --mind alpha`). Export, import, `embed-backfill` and `sinks requeue` run through the `tools` service instead, which has the `sanctum_app` address and your `./exchange` folder mounted at `/exchange` inside the container: `docker compose run --rm tools node dist/cli.js <command> ...`. Always write and read files under `/exchange`; anywhere else inside the container disappears when the command ends.
 
 - **A key might be exposed.** Do these three in order:
   1. `suspend-access --mind alpha`: the key stops working at once and the grants it gave stop applying. Nothing is deleted. While suspended, the mind cannot act at all, including withdrawing a cooling change.
   2. Rotate the key: `init --mind alpha --rotate`. It does not lift the suspension.
   3. `restore-access --mind alpha`: the mind works again. Any waiting identity change is pushed back by the time it was suspended, so nothing can finish cooling while the key was in doubt.
-- **Back up or move a mind.** `export-mind --mind alpha --out alpha.json` writes the ledger, graph and current state to a file. Vectors are not included.
-- **Restore a mind from a file.** `import-mind alpha.json --mind alpha --dry-run` shows what would happen. Run it again without `--dry-run` to do it. Importing is safe to repeat. It refuses to plant identity or vows into a mind that already has them (override with `--allow-core`, which lands them live and skips cooling). Only a mind that has never had an identity or a vow takes the file's cores as they are; one that retired every core still counts as having had one, and refuses without the flag. Any open waiting changes in the file arrive withdrawn.
+- **Back up or move a mind.** `export-mind --mind alpha --out alpha.json` writes the ledger, graph and current state to a file. Vectors are not included. Under Docker: `docker compose run --rm tools node dist/cli.js export-mind --mind alpha --out /exchange/alpha.json`, and the file appears in `./exchange` on your machine. It will not overwrite a file that is already there.
+- **Restore a mind from a file.** `import-mind alpha.json --mind alpha --dry-run` shows what would happen (under Docker: `docker compose run --rm tools node dist/cli.js import-mind /exchange/alpha.json --mind alpha --dry-run`; put the file in `./exchange` first). Run it again without `--dry-run` to do it. Importing is safe to repeat. It refuses to plant identity or vows into a mind that already has them (override with `--allow-core`, which lands them live and skips cooling). Only a mind that has never had an identity or a vow takes the file's cores as they are; one that retired every core still counts as having had one, and refuses without the flag. Any open waiting changes in the file arrive withdrawn.
 - **Delete a mind.** `purge-mind --mind alpha --confirm alpha`. This is the only way anything is ever deleted. It removes the mind and everything it wrote. It refuses if the mind still has letters with another mind (add `--sever-letters` to delete those too). Copies already sent to an outside system stay there.
 - **Let one mind steward another.** `grant add --from alpha --to beta --scope steward` (scopes: `read`, `write`, `relate`, `letter`, `steward`). Record only grants the mind has asked for. `grant list --mind alpha` and `grant revoke ...` do the rest.
-- **Retry stuck deliveries.** `sinks requeue --sink <name>` (see "Outbox and sinks").
+- **Retry stuck deliveries.** `sinks requeue --sink <name>` (see "Outbox and sinks"; under Docker, through `tools` or `init`).
 
 The old names `disable-mind` and `enable-mind` still work and mean the same as `suspend-access` and `restore-access`.
 
@@ -181,7 +189,7 @@ Prefer `SANCTUM_APP_PASSWORD` to `--app-password`: command-line arguments are vi
 
 `sanctum_app` is a login shared by the whole Postgres cluster, not by one database. If it already has a login (another sanctum-mind database in this cluster set it up), `init` leaves its password alone and prints the URL with `<app-password>` in place of it. Supplying a different password then fails with an explanation and changes nothing, because it would lock the other deployments out. Pass `--force` only when you mean to change the password for all of them.
 
-`DATABASE_URL` for `init` is an admin connection: it creates the `sanctum_app` login, which is what the service runs as. `init` runs the migrations, sets that login's password (generated and shown once, unless you pass `--app-password`), creates the mind with a fresh 32-byte bearer key (only its hash is stored; the key is shown once), and prints the service `DATABASE_URL`, the key, and the client configs. Add `--write-env` to also save them to `./.env` (never overwrites an existing file), `--json` for machine-readable output, `--port` / `--http-url` if the service is not on `http://localhost:8002`. With `--json`, take `mind.bearer` and `mcp`. Under Docker, the printed database host is `localhost:5432` (`--public-db-host`); services inside compose reach it as `db:5432`.
+`DATABASE_URL` for `init` is an admin connection: it creates the `sanctum_app` login, which is what the service runs as. `init` runs the migrations, sets that login's password (generated and shown once, unless you pass `--app-password`), creates the mind with a fresh 32-byte bearer key (only its hash is stored; the key is shown once), and prints the service `DATABASE_URL`, the key, and the client configs. Add `--write-env` to also save them to `./.env` (never overwrites an existing file), `--json` for machine-readable output, `--port` / `--http-url` if the service is not on `http://localhost:8002`. With `--json`, take `mind.bearer` and `mcp`. Under Docker, the printed database host is `localhost:5432` (`--public-db-host`); services inside compose reach it as `db:5432`. Compose passes `--docker`, which prints the HTTP and stdio (Docker) configs and omits the host-path stdio one (`--json` then has `mcp.http` and `mcp.stdio_docker`; without it, `mcp.stdio` and `mcp.http`); `--container <name>` changes the container the stdio (Docker) config names (default `sanctum-mind`, the `container_name` of the mind service). `stdio` exits at once with a clear error when `SANCTUM_BEARER` is unset.
 
 Inside the clone, without a build, the stdio config can use the source instead:
 
@@ -307,6 +315,17 @@ npm start -- export-mind --mind alpha --out alpha.json          # sanctum_app UR
 npm start -- import-mind alpha.json --mind alpha --dry-run        # sanctum_app URL, not admin; into a fresh database or a fresh mind
 DATABASE_URL=<admin> npm start -- purge-mind --mind alpha --confirm alpha   # the only deletion path
 ```
+
+Under Docker there is no Node on the host, so use the `tools` service (profile `tools`, `sanctum_app` address, `./exchange` mounted at `/exchange`). Create the folder first: `mkdir -p exchange`. On Linux the container writes as uid 1000, so if your own user id is not 1000 (check with `id -u`), run `sudo chown 1000:1000 exchange` too. Docker Desktop on Mac and Windows handles this itself. Export refuses to overwrite an existing file. The exported file is private (mode 0600) and owned by uid 1000, so on Linux with another user id read it back with `sudo`, or with `docker compose run --rm tools cat /exchange/alpha.json`. A file saved by a different host user, with those private permissions, cannot be imported until you `chmod` it so uid 1000 can read it (for example `chmod 644`, or `sudo chown 1000:1000` it):
+
+```sh
+docker compose run --rm tools node dist/cli.js export-mind --mind alpha --out /exchange/alpha.json
+docker compose run --rm tools node dist/cli.js import-mind /exchange/alpha.json --mind alpha --dry-run
+docker compose run --rm tools node dist/cli.js embed-backfill
+docker compose run --rm tools node dist/cli.js sinks requeue --sink <name>
+```
+
+`tools` has no default command (run with none it prints the command list). `purge-mind` and the other admin commands stay on the `init` service.
 
 Export is one repeatable-read snapshot. Import is idempotent by id and refuses ids that belong to another mind in the target. Import refuses to plant identity or vows into a mind that already has them (unless `--allow-core`; under it the identity and vow nodes land live beside the existing ones, take effect immediately and do not cool, and the report says so in a note), arrives with open declarations (pending or accepted alike) withdrawn and attestations cleared (and a vow's declared break stripped), and attributes every imported proposal to the importing mind. Received letters are never imported (they are the sender's to re-send; export omits ones scheduled for later); letters this mind sent to other minds are imported only with `--with-letters` (otherwise reported as `ignored`), and then without their read receipt, with `sent_at` taken from the sending event, and only when that event is a `letter.send` whose recipient matches; rows that reference ids outside the file are skipped and counted (`--strict` aborts instead); a dry run never advances `events.seq`.
 

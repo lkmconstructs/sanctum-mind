@@ -5,11 +5,18 @@
 # and the background passes (settles cooled identity changes, delivers sinks):  docker compose up -d daemon
 #
 # Choose the mind with MIND (default alpha):  MIND=beta docker compose run --rm init
-# init is idempotent and never rotates an existing key unless you pass --rotate:
-#   docker compose run --rm init node dist/cli.js init --mind alpha --rotate
+# init is idempotent and never rotates an existing key unless you pass --rotate (repeat --docker and the
+# other flags when you replace the command, since the command below is replaced as a whole):
+#   docker compose run --rm init node dist/cli.js init --mind alpha --docker --public-db-host localhost:5432 --rotate
 # The same one-shot also works through the service image:
-#   docker compose run --rm -e DATABASE_URL="$ADMIN_DATABASE_URL" mind node dist/cli.js init --mind alpha
+#   docker compose run --rm -e DATABASE_URL="$ADMIN_DATABASE_URL" mind node dist/cli.js init --mind alpha --docker --public-db-host localhost:5432
 # ADMIN_DATABASE_URL defaults to the bundled db's postgres user.
+#
+# Export and import go through the "tools" service (same image, sanctum_app login, ./exchange mounted at /exchange):
+#   mkdir -p exchange                      # must exist and be writable by uid 1000 (the container's "node" user)
+#   docker compose run --rm tools node dist/cli.js export-mind --mind alpha --out /exchange/alpha.json
+#   docker compose run --rm tools node dist/cli.js import-mind /exchange/alpha.json --mind alpha --dry-run
+# It also runs embed-backfill and "sinks requeue --sink <name>". Admin commands stay on the init service.
 #
 # The passwords below are for local use only. Override POSTGRES_PASSWORD and APP_PASSWORD
 # (environment or a .env file next to this one) before exposing anything. Use URL-safe
@@ -43,12 +50,17 @@ services:
       DATABASE_URL: ${ADMIN_DATABASE_URL:-postgresql://postgres:${POSTGRES_PASSWORD:-sanctum_local}@db:5432/sanctum_mind}
       SANCTUM_APP_PASSWORD: ${APP_PASSWORD:-sanctum_app_local}
     # --public-db-host only changes the DATABASE_URL printed in the configs (your machine reaches the
-    # database on localhost:5432); init itself connects to db:5432.
-    command: ["node", "dist/cli.js", "init", "--mind", "${MIND:-alpha}", "--port", "${PORT:-8002}", "--public-db-host", "localhost:5432"]
+    # database on localhost:5432); init itself connects to db:5432. --docker prints the HTTP and stdio (Docker)
+    # configs and leaves out the host-path stdio config, which cannot work on the host.
+    command: ["node", "dist/cli.js", "init", "--mind", "${MIND:-alpha}", "--port", "${PORT:-8002}", "--public-db-host", "localhost:5432", "--docker"]
 
   mind:
     build: .
     image: sanctum-mind:local
+    # A fixed name so the stdio (Docker) config can say `docker exec -i ... sanctum-mind node dist/cli.js stdio`
+    # without knowing the compose project name. Two stacks on one machine would collide on it: rename it in one
+    # of them (and pass --container <name> to init so the printed config matches), or use HTTP only.
+    container_name: sanctum-mind
     depends_on:
       db:
         condition: service_healthy
@@ -70,6 +82,29 @@ services:
     volumes:
       - embed-cache:/data/embed-cache
     restart: unless-stopped
+
+  # One-off export, import and maintenance as the sanctum_app login. Not started by `docker compose up`
+  # (profile "tools"); name the command, as in the examples at the top. The container runs as
+  # "node" (uid 1000), so ./exchange on the host must exist and be writable by that uid. export-mind refuses to
+  # overwrite an existing file.
+  tools:
+    build: .
+    image: sanctum-mind:local
+    profiles: ["tools"]
+    # With no command given this just prints the command list and exits (the image's own default would start the http service).
+    command: ["node", "dist/cli.js", "--help"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://sanctum_app:${APP_PASSWORD:-sanctum_app_local}@db:5432/sanctum_mind
+      EMBEDDER: ${EMBEDDER:-local}
+      EMBED_CACHE_DIR: /data/embed-cache
+      SINKS: ${SINKS:-}
+      SINKS_FILE: ${SINKS_FILE:-}
+    volumes:
+      - ./exchange:/exchange
+      - embed-cache:/data/embed-cache
 
   # The metabolism passes for every enabled mind (needs the mind created by init first).
   daemon:

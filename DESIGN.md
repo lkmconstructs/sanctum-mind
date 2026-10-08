@@ -131,8 +131,22 @@ failures.
 | Ops | `mind_health` |
 
 Deferred to their own design pass: `mind_dream`, `mind_unconscious`,
-`mind_maintain`, `mind_patterns`. The daemon is implemented: deterministic passes over the ledger
-and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `vow.break.settled` written as the mind). There are ten passes, including `identity.settle`.
+`mind_maintain`. The daemon is implemented: deterministic passes over the ledger
+and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are ten passes, including `identity.settle`.
+
+### Noticing
+
+`mind_patterns` became the extractor (CONTRACTS, "Noticing"): a scheduled, optional, off-by-default,
+model-backed pass that proposes links, patterns and distillations from a mind's recent ledger. It is
+proposal-only by construction. A proposal becomes memory only when the mind accepts it, and the
+memory it becomes is authored by the mind with provenance to its sources, which stay untouched.
+The operator can enable, schedule, pause or disable it and choose between two stages, scoring
+silently or presenting ranked proposals; no stage writes memory, and the schema admits no third.
+
+The scorer is a fixed reranker plus an interpretable per-mind logistic model trained on that mind's
+own accepts, rejects and expiries, with a documented prior until there is enough feedback. No
+neural model: complexity is earned from measured data, not assumed. The machine may become better
+at noticing. It does not inherit the right to remember on the mind's behalf.
 
 ## Stack
 

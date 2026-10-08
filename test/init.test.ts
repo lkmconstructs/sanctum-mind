@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -159,7 +160,7 @@ describe("init", () => {
     const parsed = JSON.parse(JSON.stringify(r));
     const stdio = parsed.mcp.stdio.mcpServers["sanctum-mind"];
     expect(stdio.command).not.toBe("npx"); // run under vitest: node on the running file, never the unpublished package
-    expect(JSON.stringify(stdio)).not.toContain("-y");
+    expect(stdio.args).not.toContain("-y"); // args only: the random key may legitimately contain "-y"
     expect(stdio._note).toMatch(/not published yet/);
     expect(stdio.env.SANCTUM_BEARER).toBe(r.mind.bearer);
     expect(stdio.env.DATABASE_URL).toContain("sanctum_app");
@@ -172,6 +173,46 @@ describe("init", () => {
     });
     expect(parsed.curl).toContain("https://mind.example.test/verbs/mind_orient");
     expect(parsed.curl).toContain("mind_orient");
+  });
+
+  it("--json without --docker has stdio and http, no stdio_docker", async () => {
+    const r = await runInit(opts({ appPassword: "pw" }));
+    const parsed = JSON.parse(JSON.stringify(r));
+    expect(Object.keys(parsed.mcp).sort()).toEqual(["http", "stdio"]);
+    expect(parsed.mcp.stdio_docker).toBeUndefined();
+    const text = formatInit(r);
+    expect(text).toContain("MCP client config, stdio (Claude Desktop");
+    expect(text).not.toContain("stdio (Docker)");
+  });
+
+  it("--docker prints http and stdio (Docker) only, passing the key per exec", async () => {
+    const r = await runInit(opts({ appPassword: "pw", docker: true }));
+    const parsed = JSON.parse(JSON.stringify(r));
+    expect(Object.keys(parsed.mcp).sort()).toEqual(["http", "stdio_docker"]);
+    expect(parsed.mcp.stdio_docker).toEqual({
+      mcpServers: {
+        "sanctum-mind": {
+          command: "docker",
+          args: ["exec", "-i", "-e", "SANCTUM_BEARER", "sanctum-mind", "node", "dist/cli.js", "stdio"],
+          env: { SANCTUM_BEARER: r.mind.bearer },
+        },
+      },
+    });
+    expect(JSON.stringify(parsed.mcp.stdio_docker.mcpServers["sanctum-mind"].args)).not.toContain(r.mind.bearer!); // never on the command line
+    expect(JSON.stringify(parsed.mcp)).not.toContain("DATABASE_URL"); // the host never sees a database credential
+    expect(JSON.stringify(parsed.mcp)).not.toContain("/app/dist/cli.js");
+    const text = formatInit(r);
+    expect(text).toContain("stdio (Docker)");
+    expect(text).not.toContain("MCP client config, stdio (Claude Desktop");
+    expect(text).toContain("Streamable HTTP");
+  });
+
+  it("--docker on an existing mind shows the key placeholder, and --container renames the target", async () => {
+    await runInit(opts({ appPassword: "pw", docker: true }));
+    const again = await runInit(opts({ appPassword: "pw", docker: true, container: "other-mind" }));
+    const srv = again.mcp.stdio_docker!.mcpServers["sanctum-mind"];
+    expect(srv.env.SANCTUM_BEARER).toBe("<bearer-key>");
+    expect(srv.args).toContain("other-mind");
   });
 
   it("writes .env only with --write-env and never overwrites", async () => {
@@ -215,6 +256,16 @@ describe("parseInitArgs", () => {
     expect(p).toMatchObject({ port: 9, httpUrl: "http://localhost:9", json: true, rotate: true, writeEnv: true, appPassword: "s" });
   });
 
+  it("reads --docker and --container", () => {
+    const d = parseInitArgs(["--mind", "a"], {});
+    expect(d.docker).toBe(false);
+    expect(d.container).toBe("sanctum-mind");
+    const o = parseInitArgs(["--mind", "a", "--docker", "--container", "x-mind-1"], {});
+    expect(o.docker).toBe(true);
+    expect(o.container).toBe("x-mind-1");
+    expect(() => parseInitArgs(["--mind", "a", "--container", "bad name;"], {})).toThrow(/invalid --container/);
+  });
+
   it("requires --mind and a sane port", () => {
     expect(() => parseInitArgs([], {})).toThrow(/--mind/);
     expect(() => parseInitArgs(["--mind", "a", "--port", "99999"], {})).toThrow(/invalid --port/);
@@ -223,22 +274,34 @@ describe("parseInitArgs", () => {
 });
 
 describe("stdio config", () => {
+  it("stdio exits 1 with a clear message when SANCTUM_BEARER is unset, before any database connection", () => {
+    const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
+    const cli = new URL("../src/cli.ts", import.meta.url).pathname;
+    const env: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: "postgresql://nobody@127.0.0.1:1/none" }; // unreachable: must not be tried
+    delete env.SANCTUM_BEARER;
+    const r = spawnSync(tsx, [cli, "stdio"], { env, encoding: "utf8", timeout: 15_000 });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("SANCTUM_BEARER is not set");
+    expect(r.stderr).toContain("the mind's key");
+    expect(r.stdout).toBe(""); // stdout belongs to the MCP protocol
+  });
+
   it("runs the local checkout, never the unpublished npm package", async () => {
     const dist = await runInit(opts({ appPassword: "pw", cliPath: new URL("../dist/cli.js", import.meta.url).pathname }));
-    const d = dist.mcp.stdio.mcpServers["sanctum-mind"];
+    const d = dist.mcp.stdio!.mcpServers["sanctum-mind"];
     expect(d.command).toBe("node");
     expect(d.args).toEqual([new URL("../dist/cli.js", import.meta.url).pathname, "stdio"]);
     expect(d._note).toBe("replace the path if you move the checkout; the npm package is not published yet");
 
     const ts = await runInit(opts({ appPassword: "pw", cliPath: new URL("../src/cli.ts", import.meta.url).pathname }));
-    const t = ts.mcp.stdio.mcpServers["sanctum-mind"];
+    const t = ts.mcp.stdio!.mcpServers["sanctum-mind"];
     expect(t.command).toBe("npx");
     expect(t.args).toEqual(["tsx", new URL("../src/cli.ts", import.meta.url).pathname, "stdio"]);
 
     for (const r of [dist, ts, await runInit(opts({ appPassword: "pw" }))]) {
       expect(JSON.stringify(r.mcp.stdio)).not.toContain("sanctum-mind\",\"stdio");
       expect(formatInit(r)).not.toContain("npx -y");
-      expect(r.mcp.stdio.mcpServers["sanctum-mind"].args).not.toContain("-y");
+      expect(r.mcp.stdio!.mcpServers["sanctum-mind"].args).not.toContain("-y");
     }
   });
 });
@@ -340,7 +403,7 @@ describe("init options", () => {
   it("--public-db-host changes only the printed configs", async () => {
     const r = await runInit(opts({ appPassword: "pw", publicDbHost: "db.example.test:6543" }));
     expect(r.app_database_url).toContain("db.example.test:6543");
-    expect(r.mcp.stdio.mcpServers["sanctum-mind"].env.DATABASE_URL).toContain("db.example.test:6543");
+    expect(r.mcp.stdio!.mcpServers["sanctum-mind"].env.DATABASE_URL).toContain("db.example.test:6543");
     expect(r.migrations.applied.length).toBeGreaterThan(0); // the real connection still worked
     expect(parseInitArgs(["--mind", "a", "--public-db-host", "localhost:5432"], {}).publicDbHost).toBe("localhost:5432");
     expect(() => parseInitArgs(["--mind", "a", "--public-db-host", "bad host/x"], {})).toThrow(/public-db-host/);

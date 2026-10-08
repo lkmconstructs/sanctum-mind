@@ -29,6 +29,10 @@ export interface InitOptions {
   publicDbHost?: string | undefined;
   /** The cli entry that the stdio config should launch; default: the running one. */
   cliPath?: string;
+  /** Running under compose: print the HTTP and stdio (Docker) configs, not the host-path stdio one. */
+  docker?: boolean;
+  /** The running mind service container named in the stdio (Docker) config. */
+  container?: string;
 }
 
 export type MindStatus = "created" | "exists" | "rotated";
@@ -43,7 +47,10 @@ export interface InitResult {
   /** Contains the real password only when it was generated this run; otherwise a placeholder. */
   app_database_url: string;
   mcp: {
-    stdio: { mcpServers: { "sanctum-mind": { _note: string; command: string; args: string[]; env: Record<string, string> } } };
+    /** Host-path stdio for a clone; absent under --docker, where the path cannot exist on the host. */
+    stdio?: { mcpServers: { "sanctum-mind": { _note: string; command: string; args: string[]; env: Record<string, string> } } };
+    /** `docker exec` into the running mind container; present only under --docker. */
+    stdio_docker?: { mcpServers: { "sanctum-mind": { command: "docker"; args: string[]; env: { SANCTUM_BEARER: string } } } };
     http: { mcpServers: { "sanctum-mind": { type: "http"; url: string; headers: { Authorization: string } } } };
   };
   curl: string;
@@ -55,6 +62,8 @@ export class InitError extends Error {}
 
 const APP_PW_PLACEHOLDER = "<app-password>";
 const BEARER_PLACEHOLDER = "<bearer-key>";
+/** Matches container_name of the mind service in docker-compose.yml. */
+export const DEFAULT_CONTAINER = "sanctum-mind";
 
 export function parseInitArgs(argv: string[], env: Record<string, string | undefined>): InitOptions {
   let values;
@@ -71,6 +80,8 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
         "write-env": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
         "public-db-host": { type: "string" },
+        docker: { type: "boolean", default: false },
+        container: { type: "string" },
       },
       allowPositionals: false,
     }));
@@ -84,6 +95,8 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
   const appPassword = values["app-password"] ?? (env.SANCTUM_APP_PASSWORD || undefined);
   const publicDbHost = values["public-db-host"];
   if (publicDbHost !== undefined) checkHostPort(publicDbHost);
+  const container = values.container ?? DEFAULT_CONTAINER;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(container)) throw new InitError(`invalid --container "${container}"`);
   return {
     databaseUrl: env.DATABASE_URL || undefined,
     mind: values.mind,
@@ -95,6 +108,8 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
     writeEnv: values["write-env"] ?? false,
     force: values.force ?? false,
     publicDbHost,
+    docker: values.docker ?? false,
+    container,
   };
 }
 
@@ -124,6 +139,10 @@ options:
   --http-url <url>       public URL of the HTTP service (default http://localhost:<port>)
   --rotate               replace the key of a mind that already exists
   --write-env            write ./.env with the app settings (never overwrites)
+  --docker               running under Docker Compose: print the HTTP and stdio (Docker) configs and
+                         leave out the host-path stdio config, which cannot work on the host
+  --container <name>     only with --docker (ignored otherwise): the mind container the stdio (Docker)
+                         config execs into (default sanctum-mind, the container_name in docker-compose.yml)
   --json                 machine-readable output`;
 
 function newSecret(bytes: number): string {
@@ -343,22 +362,38 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     const appUrlShown = generated !== undefined ? withPublicHost(appUrlReal!, opts.publicDbHost) : maskedAppUrl(opts.databaseUrl, opts.publicDbHost);
     const bearerShown = bearer ?? BEARER_PLACEHOLDER;
     const httpBase = opts.httpUrl.replace(/\/+$/, "");
-    const mcp: InitResult["mcp"] = {
-      stdio: {
-        mcpServers: {
-          "sanctum-mind": {
-            _note: STDIO_NOTE,
-            ...stdioLaunch(opts.cliPath),
-            env: { DATABASE_URL: appUrlShown, SANCTUM_BEARER: bearerShown },
-          },
-        },
-      },
-      http: {
-        mcpServers: {
-          "sanctum-mind": { type: "http", url: `${httpBase}/mcp`, headers: { Authorization: `Bearer ${bearerShown}` } },
-        },
+    const http = {
+      mcpServers: {
+        "sanctum-mind": { type: "http" as const, url: `${httpBase}/mcp`, headers: { Authorization: `Bearer ${bearerShown}` } },
       },
     };
+    const mcp: InitResult["mcp"] = opts.docker
+      ? {
+          http,
+          // The mind container already holds the sanctum_app DATABASE_URL. The key goes in the client's environment and
+          // `-e SANCTUM_BEARER` (no value) forwards it, so it never appears on the docker command line (ps, /proc).
+          stdio_docker: {
+            mcpServers: {
+              "sanctum-mind": {
+                command: "docker",
+                args: ["exec", "-i", "-e", "SANCTUM_BEARER", opts.container ?? DEFAULT_CONTAINER, "node", "dist/cli.js", "stdio"],
+                env: { SANCTUM_BEARER: bearerShown },
+              },
+            },
+          },
+        }
+      : {
+          stdio: {
+            mcpServers: {
+              "sanctum-mind": {
+                _note: STDIO_NOTE,
+                ...stdioLaunch(opts.cliPath),
+                env: { DATABASE_URL: appUrlShown, SANCTUM_BEARER: bearerShown },
+              },
+            },
+          },
+          http,
+        };
     const curl =
       `curl -s ${httpBase}/verbs/mind_orient -H 'Authorization: Bearer ${bearerShown}' ` +
       `-H 'content-type: application/json' -d '{"mind_id":"${opts.mind}","depth":"quick"}'`;
@@ -431,11 +466,18 @@ export function formatInit(r: InitResult): string {
     L.push(`  ${r.mind.bearer}`);
   }
   L.push("");
-  L.push("MCP client config, stdio (Claude Desktop / Claude Code):");
-  L.push(JSON.stringify(r.mcp.stdio, null, 2));
-  L.push("");
-  L.push("MCP client config, Streamable HTTP:");
+  if (r.mcp.stdio) {
+    L.push("MCP client config, stdio (Claude Desktop / Claude Code):");
+    L.push(JSON.stringify(r.mcp.stdio, null, 2));
+    L.push("");
+  }
+  L.push("MCP client config, Streamable HTTP (for a client that connects to a URL):");
   L.push(JSON.stringify(r.mcp.http, null, 2));
+  if (r.mcp.stdio_docker) {
+    L.push("");
+    L.push("MCP client config, stdio (Docker) (for a client that launches a local command; the mind container must be running):");
+    L.push(JSON.stringify(r.mcp.stdio_docker, null, 2));
+  }
   L.push("");
   L.push("First wake:");
   L.push(`  ${r.curl}`);
