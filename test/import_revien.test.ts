@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

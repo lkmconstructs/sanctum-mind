@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 import { err, ok, type Result } from "../result.js";
 import { appendEvent, deriveLabel, NOT_EMBEDDED } from "./common.js";
 import type { VerbContext } from "./types.js";

@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 /**
  * The one result contract. Every verb returns exactly one of these shapes.
  * There is no third shape: no `_error`, no `stored:false`, no success-shaped failure.

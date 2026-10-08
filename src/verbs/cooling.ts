@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 /**
  * The cooling period for declared identity changes (a rewrite of a core, the breaking of a vow).
  * `IDENTITY_COOLING_HOURS`: a non-negative integer number of hours, default 24; 0 means no cooling

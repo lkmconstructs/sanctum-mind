@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 /**
  * Daemon thresholds. Defaults are constants; each can be overridden by a `DAEMON_*` env var, validated
  * as a positive integer. The env is read once (getDaemonConfig caches); tests override through the

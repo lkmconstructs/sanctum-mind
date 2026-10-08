@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 import { parseArgs } from "node:util";
 import { seedMindsFromFile } from "./auth.js";
 import { assertRlsEnforced, createPool } from "./db/pool.js";

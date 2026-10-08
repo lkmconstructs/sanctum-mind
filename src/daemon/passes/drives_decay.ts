@@ -1,3 +1,6 @@
+// sanctum-mind. Copyright 2026 LKM Constructs LLC.
+// Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
+
 import { DRIVES, levelsAt, loadDriveRows, persistDecay } from "../../verbs/drives.js";
 import { HOUR_MS, ago, type DaemonPass, type PassContext } from "./types.js";
 
