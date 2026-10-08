@@ -1,0 +1,842 @@
+# Build contracts (first commit)
+
+Shared interfaces every module in the first commit is built against. `DESIGN.md` is the
+why; this file is the exact what. Change these only by editing this file first.
+
+## Database (migrations/0001_core.sql)
+
+Extensions: `vector`, `pgcrypto`. Every table below has `mind_id text not null` unless
+noted, with row level security enabled and forced (events, nodes, edges, brain_state). Policies (USING) allow a row when
+`mind_id = current_setting('app.mind_id', true)`; the INSERT/UPDATE WITH CHECK on events, nodes and edges additionally requires
+`written_by = current_setting('app.bearer', true)`, and on brain_state is mind-only. The service connects as a non-superuser
+role `sanctum_app` (created by the migration if absent, no password; the deployment sets one). Privileges: `select` only on `minds` and `grants`;
+`select, insert, update` on events, nodes, edges, brain_state; `delete` nowhere.
+
+```
+schema_migrations(filename text pk, checksum text not null, applied_at timestamptz not null)
+minds(mind_id text pk, key_hash text not null unique, display_name text, created_at timestamptz not null default now(), disabled_at timestamptz)   -- no RLS; read by auth only
+grants(id uuid pk default gen_random_uuid(), grantor_mind text not null references minds, grantee_mind text not null references minds,
+       scope text not null check (scope in ('read','write','relate','letter')), granted_at timestamptz not null default now(), revoked_at timestamptz)  -- no RLS
+events(id uuid pk default gen_random_uuid(), mind_id text not null references minds, kind text not null, subject_id uuid,
+       payload jsonb not null, texture jsonb, context text, written_by text not null references minds,
+       recorded_at timestamptz not null, event_time_start timestamptz, event_time_end timestamptz,
+       event_time_granularity text check (event_time_granularity in ('day','week','month','year','fuzzy')),
+       created_at timestamptz not null default now(), session_id text, embedding vector(384),
+       seq bigint generated always as identity unique)   -- seq is the total order of the ledger
+       -- events are append-only: a trigger raises on UPDATE or DELETE
+nodes(id uuid pk default gen_random_uuid(), mind_id, node_type text not null, label text not null check (length(label) <= 512),
+      content text not null, written_by text not null references minds, source_type text not null default 'inferred' check (source_type in ('extracted','inferred','derived','corrected')),
+      confidence double precision not null default 0.5 check (confidence between 0 and 1), pinned boolean not null default false,
+      invalidated_at timestamptz, superseded_by uuid references nodes, metadata jsonb not null default '{}',
+      recorded_at timestamptz, event_time_start timestamptz, event_time_end timestamptz, event_time_granularity text,
+      created_at timestamptz not null default now(), last_accessed timestamptz, access_count integer not null default 0, embedding vector(384))
+edges(id uuid pk default gen_random_uuid(), mind_id, edge_type text not null, written_by text not null references minds, source_node_id uuid not null references nodes, target_node_id uuid not null references nodes,
+      weight double precision not null default 0.5 check (weight between 0 and 1), confidence double precision not null default 0.5,
+      metadata jsonb not null default '{}', created_at timestamptz not null default now())
+brain_state(mind_id text pk references minds, mood text, energy text check (energy in ('high','medium','low','depleted')),
+            momentum text check (momentum in ('driving','steady','coasting','stalled')), register text, afterglow text, note text,
+            last_event_id uuid not null references events, updated_at timestamptz not null)
+```
+
+Indexes: events(mind_id, kind, created_at desc); events(mind_id, subject_id); nodes(mind_id, node_type) where invalidated_at is null;
+edges(mind_id, source_node_id); edges(mind_id, target_node_id). Vector indexes come later with real data.
+
+## Scope setting (src/db/pool.ts)
+
+```ts
+export function createPool(databaseUrl: string): Pool
+export async function withMind<T>(pool: Pool, mind_id: string, bearer: string, mode: "read" | "write", fn: (tx: PoolClient) => Promise<T>): Promise<T>
+```
+`withMind` opens a transaction, issues `set transaction read only` when mode is read, sets `app.mind_id` and `app.bearer` with `set_config(..., true)`, runs `fn`, commits on resolve, rolls back on throw.
+
+## Auth (src/auth.ts)
+
+```ts
+export function hashKey(key: string): string            // sha256 hex
+export async function resolveCaller(pool: Pool, bearer: string | undefined): Promise<Caller | null>   // null = unknown or disabled
+export function mayAct(caller: Caller, mind_id: string, scope: GrantScope): boolean   // the mind itself, or a live grant
+export async function seedMindsFromFile(pool: Pool, path: string): Promise<{ upserted: number }>   // "<mind_id> <key>" per line
+```
+
+## Verb runner (src/verbs/run.ts)
+
+```ts
+export async function runVerb(deps: RunDeps, caller: Caller, name: string, rawInput: unknown, session_id?: string): Promise<Result>
+```
+Order: find verb (unknown name -> `not_found`); `schema.safeParse` (-> `invalid_input` with `field`); `mayAct` (-> `forbidden`);
+`withMind(input.mind_id, tx => handler(...))`; a thrown error -> `storage` with the message logged server-side and a generic message returned.
+Every verb schema includes `mind_id: z.string().regex(/^[a-zA-Z0-9_-]{1,64}$/)`. The handler appends its event with `written_by = caller.bearer`.
+
+## Transport (src/server.ts, src/cli.ts)
+
+- `sanctum-mind stdio`: MCP over stdio. Bearer comes from `SANCTUM_BEARER` env. Tool list = registry; tool result content is the JSON `Result`; `isError` is set when `ok` is false.
+- `sanctum-mind http`: `GET /health` (no auth) -> `{ok:true, receipt:{projection:{verbs:<count>, db:"up"|"down"}}}`; `GET /verbs` (auth) -> names;
+  `POST /verbs/<name>` (auth, JSON body = input) -> `Result`, status from `HTTP_STATUS` or 200. Missing, unknown or disabled bearer -> 401 with an `unauthorized` error body (`/mcp`: JSON-RPC error code -32001, message "unauthorized"), always with `WWW-Authenticate: Bearer`; `forbidden` (403) is for scope failures.
+  Listens on `HOST` (default `127.0.0.1`) and `PORT`; `MAX_CONNECTIONS` (default 256); `headersTimeout` 15 s, `requestTimeout` 30 s, `keepAliveTimeout` 5 s.
+  Also mounts MCP Streamable HTTP at `POST /mcp` using the same auth.
+- `sanctum-mind migrate`: runs migrations against `DATABASE_URL`.
+
+## Tests (vitest, `test/**/*.test.ts`)
+
+`TEST_DATABASE_URL` points at a disposable Postgres (local: `postgresql://postgres@localhost:5433/sanctum_test`). A shared `test/helpers.ts`
+drops and recreates the public schema, runs migrations, seeds two minds (`alpha`, `beta`) with known keys and one grant (alpha -> beta: read).
+Every verb test covers: valid input yields a receipt and the expected projection row; invalid input yields `invalid_input` with `field`;
+calling as `beta` on `mind_id: alpha` without the needed scope yields `forbidden`; RLS is proven by a raw query under the wrong `app.mind_id` returning zero rows.
+
+## Amendments after the first adversarial review (5 October 2026)
+
+These supersede anything above that conflicts.
+
+1. **Scope is enforced by the database, not only by verbs.** `withMind(pool, mind_id, bearer, mode, fn)` sets both
+   `app.mind_id` and `app.bearer` (transaction-local) and runs `set transaction read only` when `mode === "read"`.
+   Every RLS write policy adds `with check (written_by = current_setting('app.bearer', true))` on `events`; `nodes` and `edges`
+   gain a `written_by text not null references minds` column with the same check. A read-scoped caller therefore cannot write
+   even if a verb forgets to check. Verbs declare `scopeFor(input): GrantScope` (replacing the single `scope` field) so the runner
+   picks the mode per operation; `mind_state` read is "read", set and update are "write". The handler re-check in mind_state goes away.
+2. **A handler that resolves `ok:false` rolls back.** `runVerb` throws a sentinel carrying the Result from inside the transaction and
+   returns it outside. No event is persisted alongside an error.
+3. **Total order on the ledger.** `events.seq bigint generated always as identity` with a unique index. Replays and "latest" reads order by
+   `seq`, never `created_at`. Projection writers that must agree with ledger order take `pg_advisory_xact_lock(hashtext('<table>:' || mind_id))`
+   before appending. `brain_state.updated_at` is set from the appended event's `created_at` (one clock).
+4. **Reserved mind ids.** `mind_id` rejects `__proto__`, `constructor`, `prototype`. Auth builds grant maps with `Object.create(null)`.
+   Grants whose grantor is disabled are not live.
+5. **Strict schemas.** Every verb schema is `z.strictObject`. Free-text fields are bounded (`max(4000)` unless the verb says otherwise) and
+   reject `\u0000`. `X-Session-Id` is bounded at 128 chars; longer is `invalid_input`.
+6. **The app role cannot touch keys or grants.** `sanctum_app` has `select` only on `minds` and `grants`. Key seeding moves to an admin
+   subcommand `sanctum-mind seed-keys <file>` run with the admin `DATABASE_URL`, and `http` no longer seeds on startup. `SANCTUM_KEYS_FILE` is removed.
+7. **MCP returns the Result contract.** Tools are served through the low-level `ListTools`/`CallTools` handlers: list emits `z.toJSONSchema(schema)`,
+   call always goes through `runVerb` so invalid input and unknown tools come back as `{ok:false,...}` with `isError: true`, identical to HTTP.
+   Protocol-level failures on `/mcp` (bad JSON, oversized body) are JSON-RPC errors. 401 carries `WWW-Authenticate: Bearer`.
+8. **stdio resolves the caller per call**, so revocation and rotation take effect without a restart.
+9. **Pools log idle-client errors** (`pool.on("error")`) instead of crashing the process.
+10. **Test helpers derive the app-role URL from `TEST_DATABASE_URL`** and grant the test role nothing directly: it is only a member of `sanctum_app`,
+    so a missing grant in the migration fails the suite.
+11. `mind_state` fields cannot be cleared through set/update; that is intended and documented in the verb description.
+
+## Verbs: mind_write and mind_observe
+
+Both append to the ledger. `mind_observe` also curates a graph node, because an observation is lived
+experience the mind has already judged worth keeping; `mind_write` is plain record and stays in the ledger
+until something later distills it. Embeddings are deferred: both leave `embedding` null for now, and a later
+embedder pass fills it (tracked as an open item; no verb depends on it).
+
+### Shared texture schema (src/verbs/texture.ts)
+
+```
+texture = z.strictObject({
+  salience:  z.enum(["foundational","active","background","archive"]).optional(),
+  vividness: z.enum(["crystalline","vivid","soft","fragmentary","faded"]).optional(),
+  grip:      z.enum(["iron","strong","present","loose","dormant"]).optional(),
+  charge:    z.array(text(64)).max(16).optional(),   // emotional resonance tags
+  somatic:   text(200).optional(),                   // body location
+})
+```
+
+### mind_write
+
+Schema (strict): `mind_id`, `type: z.enum(["identity","operational","episodic","journal","note"])`, `text: text(12000)`,
+`tags: z.array(text(64)).max(32).optional()`, `texture: texture.optional()`, `context: text(64).optional()` (a lane tag; never an identity),
+`recorded_at: instant.optional()`, `event_time: z.strictObject({ start: eventInstant,
+end: eventInstant.optional(), granularity: z.enum(["day","week","month","year","fuzzy"]).optional(), text: text(200).optional() }).optional()`.
+Scope: write. Behavior: append one event `kind = "write"`, `payload = { type, text, tags }`, texture, context, recorded_at
+(default ctx.now()), event_time columns from event_time (end defaults to start; `event_time_text` goes in payload as `event_time_text`).
+Returns `ok` with `event_id` and `projection = { event_id, seq, created_at }`. Invalid ISO dates and `end < start` are `invalid_input`.
+
+Time rules (shared by both verbs, src/verbs/texture.ts): `instant` (recorded_at) is an ISO 8601 datetime with `Z` or a numeric
+offset and 0 to 6 fractional digits. `eventInstant` is that or a date-only `YYYY-MM-DD`. Every value is converted to UTC and
+normalised to microseconds (`YYYY-MM-DDTHH:mm:ss.ffffffZ`) before storage, and `end < start` is compared on those normalised
+strings, so sub-millisecond inversions are rejected (`invalid_input`, field `event_time.end`). The UTC year must be 0001..9999 for
+start, end and recorded_at (checked after offset conversion). A date-only value means 00:00:00Z; when `start` is date-only and
+`granularity` is omitted, granularity is `day` (an explicit granularity wins). All free text rejects lone UTF-16 surrogates
+(`must be well-formed Unicode`). The database also enforces `event_time_end >= event_time_start` on events and nodes
+(migrations/0005_integrity.sql).
+
+### mind_observe
+
+Schema (strict): `mind_id`, `content: text(12000)` trimmed and non-blank, `texture: texture` (required, and `charge` must be present with at least one non-blank entry;
+otherwise, including when texture is absent, `invalid_input` with field `texture.charge`), `label: text(200).optional()` (trimmed, non-blank when given;
+defaults to the first 120 code points of content, single-spaced; an empty derived label is `invalid_input` on `content`),
+`linked_to: z.array(z.uuid()).max(16).optional()` (lowercased then deduped; the payload stores the deduped list), `context`, `recorded_at`, `event_time` as in mind_write.
+Scope: write. Behavior, in one transaction:
+1. Append event `kind = "observe"`, `payload = { content, label, linked_to }`, texture, context, times.
+2. Insert a node: `node_type = "observation"`, `label`, `content`, `source_type = "extracted"`, `confidence = 1.0`,
+   `written_by = bearer`, `metadata = { texture, event_id, context }`, `recorded_at` and event_time columns copied from the event.
+3. For each id in `linked_to` (checked with `select ... for share`, so a concurrent invalidation waits): it must be a live node (`invalidated_at is null`) in this mind's scope, else `not_found` with field `linked_to`
+   (the whole call rolls back). Insert an edge `edge_type = "related_to"`, source = the new node, target = the linked node, weight 0.5,
+   confidence 1.0, `written_by = bearer`, `metadata = { event_id }`.
+Returns `ok` with `event_id` and `projection = { event_id, node_id, edges: [edge ids] }`.
+
+### Tests (test/memory.test.ts)
+
+Both verbs: receipt shape; the event row has the right kind, texture, written_by and times; strict schema rejects unknown keys and NUL;
+a read-only grantee gets `forbidden` and no rows appear; RLS: the other mind cannot see the node or edge.
+mind_observe: missing charge -> `invalid_input` field `texture.charge`; linked_to an unknown or invalidated node -> `not_found` and
+nothing persisted (event count unchanged); linked_to a live node creates exactly one edge; default label truncation.
+mind_write: `end < start` -> `invalid_input`; `event_time` columns persisted; tags round-trip in payload.
+
+## Verbs: mind_sit, mind_resolve, mind_loop (migration 0002_hold.sql)
+
+Current truth for what a mind is holding lives in two projection tables. Both carry `mind_id`, RLS forced with the
+standard mind-only policy (no `written_by` column: like `brain_state`, they are projections of events that already carry it).
+
+```
+holdings(
+  mind_id text not null references minds, subject_id uuid not null,              -- an event id or a node id in this mind
+  subject_kind text not null check (subject_kind in ('event','node')),
+  state text not null check (state in ('fresh','active','processing','metabolized','deferred','released')),
+  note text, last_event_id uuid not null references events, updated_at timestamptz not null,
+  primary key (mind_id, subject_id))
+loops(
+  id uuid primary key default gen_random_uuid(), mind_id text not null references minds,
+  label text not null, urgency text not null check (urgency in ('burning','nagging')), context text,
+  created_event_id uuid not null references events, created_at timestamptz not null,
+  resolved_event_id uuid references events, resolution text, resolved_at timestamptz)
+```
+Indexes: loops(mind_id, resolved_at, urgency, created_at). The migration grants select/insert/update to `sanctum_app`, no delete.
+
+### Charge state machine
+
+Order: fresh < active < processing < {metabolized, deferred, released}. A subject with no holdings row is `fresh`.
+Transitions only move forward; any backward move is `conflict`. Terminal states accept no further transitions (`conflict`).
+`fresh -> metabolized|deferred|released` directly is allowed (a judgment call by the mind).
+
+### mind_sit
+
+Schema (strict): `mind_id`, `subject_id: z.uuid()`, `state: z.enum(["active","processing"]).default("active")`, `note: text(4000).optional()`.
+Scope: write. Behavior, in one transaction, after `pg_advisory_xact_lock(hashtext('holdings:' || mind_id || ':' || subject_id))`:
+1. Resolve the subject: a live node (`invalidated_at is null`) or an event, in scope; else `not_found` field `subject_id`.
+2. Read the current holdings row. If the requested state equals the current state and no note was given: return `ok` with no event and
+   `projection = current row` plus `warnings: ["no-op"]`. If equal and a note was given: append event `kind = "sit.annotate"` with `payload = {note}`,
+   update `note`, `last_event_id`, `updated_at`; return the row.
+3. Otherwise validate the transition per the state machine (`conflict` on backward or from terminal), append `kind = "sit"`
+   `payload = {state, note, subject_kind}` `subject_id = subject`, upsert holdings, return `ok` with `event_id` and `projection = row`.
+
+### mind_resolve
+
+Schema (strict): `mind_id`, `subject_id: z.uuid()`, `outcome: z.enum(["metabolized","deferred","released"]).default("metabolized")`,
+`resolution_note: text(4000).optional()`. Scope: write. Same lock and subject resolution as sit. From a terminal state: `conflict`.
+Appends `kind = "resolve"` `payload = {outcome, resolution_note, subject_kind}` `subject_id = subject`, upserts holdings with `state = outcome`,
+`note = resolution_note`. Returns `ok` with `event_id` and `projection = row`.
+
+### mind_loop
+
+Schema (strict): `mind_id`, `operation: z.enum(["create","resolve","list"])`, `label: text(512).optional()`, `urgency: z.enum(["burning","nagging"]).default("nagging")`,
+`context: text(4000).optional()`, `loop_id: z.uuid().optional()`, `resolution: text(4000).optional()`, `include_resolved: z.boolean().default(false)`,
+`limit: z.number().int().min(1).max(200).default(50)`. Per-operation requirements are enforced in a superRefine so they surface as `invalid_input`
+with the right field: create needs `label`; resolve needs `loop_id`. `scopeFor`: list -> read, else write.
+- create: append `kind = "loop.create"` `payload = {label, urgency, context}`; insert loops row with `created_event_id`, `created_at = event.created_at`;
+  return `ok` with `event_id` and `projection = row`.
+- resolve: lock `pg_advisory_xact_lock(hashtext('loops:' || loop_id))`; the loop must exist in scope (`not_found` field `loop_id`) and be unresolved
+  (`conflict` otherwise); append `kind = "loop.resolve"` `subject_id = loop_id` `payload = {resolution}`; update the row; return it.
+- list: no event. Rows where `resolved_at is null` unless `include_resolved`; ordered burning before nagging, then `created_at` asc; `projection = {loops: rows}`.
+
+### Tests (test/hold.test.ts)
+
+State machine table test for every (from, to) pair; no-op and annotate paths for sit; `not_found` for a foreign or invalidated subject (and RLS proof that
+the other mind sees no holdings row); `conflict` on resolving a resolved loop; list ordering and `include_resolved`; a read grantee can list loops but gets
+`forbidden` on create; concurrent sits on one subject end in exactly one holdings row whose `last_event_id` is the highest-seq event for that subject.
+
+## Verbs: Self region (migration 0003_self.sql)
+
+### Schema changes
+
+- **Update policy relaxation.** On `nodes` and `edges`, the UPDATE policy's WITH CHECK becomes mind-only (`mind_id = app.mind_id`). INSERT keeps
+  `written_by = app.bearer`. A trigger `written_by_immutable` on both tables raises if `new.written_by <> old.written_by`. Reason: a grantee with
+  write scope must be able to invalidate or annotate a node another bearer wrote; authorship is still fixed at insert and can never be rewritten.
+- **proposals** table (RLS mind-only, grants select/insert/update):
+  ```
+  proposals(id uuid pk default gen_random_uuid(), mind_id text not null references minds, kind text not null check (kind in ('identity')),
+            section text not null, content text not null, lineage_note text, proposed_by text not null references minds,
+            event_id uuid not null references events, status text not null default 'pending' check (status in ('pending','accepted','rejected')) -- extended in 0017,
+            decided_event_id uuid references events, decided_at timestamptz, created_at timestamptz not null)
+  ```
+  Index proposals(mind_id, status, created_at).
+
+Node type literals used here: `identity`, `vow`, `anchor`, `desire`. All Self nodes are `source_type = 'extracted'`, `confidence = 1.0`, `written_by = bearer`.
+Reads of nodes always filter `invalidated_at is null`.
+
+### mind_identity
+
+Superseded in full by "Identity belongs to the mind" below (operations read, read_section, affirm, propose, withdraw, attest, object). `read` returns `{ cores, proposals, declarations }`; `affirm` appends `identity.affirm` and inserts the pinned core with `metadata={lineage_note, event_id, affirmed_by}`.
+
+### mind_vow
+
+Superseded in full by "Identity belongs to the mind" below (operations make, list, recall, break, withdraw_break, note). `make` appends `vow.make` and inserts a pinned `vow` node, `label` = first 120 chars single-spaced, `metadata={context, event_id, made_at, broken:false}`; `list` and `recall` are reads.
+
+### mind_anchor
+
+Schema (strict): `mind_id`, `operation: z.enum(["create","list","check"])`, `trigger: text(200).optional()`, `memory_id: z.uuid().optional()`, `response: text(4000).optional()`,
+`text: text(12000).optional()`, `limit: z.number().int().min(1).max(200).default(50)`. superRefine: create needs `trigger` and exactly one of `memory_id` or `response`
+(field `memory_id` when neither or both); check needs `text`. `scopeFor`: create -> write; others -> read.
+- create: if `memory_id`, it must be a live node in scope (`not_found` field `memory_id`). Append `kind="anchor.create"` `payload={trigger, memory_id, response}`; insert node
+  `node_type='anchor'`, `label=trigger`, `content = response ?? ''`, `metadata={trigger, trigger_lc: trigger.toLowerCase(), memory_id, response, event_id}`; if memory_id, insert edge
+  `references` from anchor to memory. `projection={event_id, node_id}`.
+- list: live anchor nodes, `projection={anchors}`.
+- check: live anchors whose `metadata->>'trigger_lc'` is contained in `lower(text)` (SQL: `position(metadata->>'trigger_lc' in lower($1)) > 0`); for each with a memory_id,
+  include the linked live node's `{id, label, content}` as `memory`; `projection={fired: [{anchor, memory?}]}`. No event.
+
+### mind_desire
+
+Schema (strict): `mind_id`, `operation: z.enum(["register","list","fulfill"])`, `want: text(4000).optional()`, `intensity: z.number().min(0).max(1).default(0.5)`,
+`somatic: text(200).optional()`, `context: text(4000).optional()`, `desire_id: z.uuid().optional()`, `include_fulfilled: z.boolean().default(false)`,
+`limit: z.number().int().min(1).max(200).default(50)`. superRefine: register needs `want`; fulfill needs `desire_id`. `scopeFor`: list -> read; others -> write.
+- register: append `kind="desire.register"` `payload={want, intensity, somatic, context}`; insert node `node_type='desire'`, `label` = first 120 chars of want, `content=want`,
+  `metadata={intensity, somatic, context, event_id, registered_at: event.created_at, fulfilled:false}`; `projection={event_id, node_id}`.
+- list: live desire nodes where `(metadata->>'fulfilled')::boolean = false` unless include_fulfilled; ordered by `(metadata->>'intensity')::float desc, created_at asc`.
+- fulfill: lock `hashtext('desire:'||desire_id)`; node must be a live desire in scope (`not_found` field `desire_id`); if already fulfilled `conflict`; append `kind="desire.fulfill"`
+  `subject_id=desire_id` `payload={}`; update metadata with `fulfilled:true, fulfilled_at: event.created_at, fulfill_event_id`; `projection={event_id, node}`.
+
+### mind_rethink
+
+Schema (strict): `mind_id`, `node_id: z.uuid()`, `content: text(12000)`, `label: text(200).optional()`, `node_type: text(64).optional()`, `reason: text(4000)`,
+`metadata: z.record(z.string(), z.unknown()).optional()`. Scope: write. Lock `hashtext('node:'||node_id)`. The node must be live in scope (`not_found` field `node_id`).
+In one transaction: append `kind="rethink"` `subject_id=node_id` `payload={content, label, node_type, reason}`; insert the replacement node with label and node_type
+inherited unless given, `source_type='extracted'`, `confidence` inherited, `pinned` inherited, `metadata = {...(old.metadata), ...(input.metadata ?? {}), rewritten_from: node_id,
+rewritten_by: bearer, reason, event_id}` (provenance keys always win); set the old node `invalidated_at = event.created_at`, `superseded_by = new id`; insert edge `corrects`
+from new to old with `metadata={event_id}`. `projection={event_id, node_id: new, superseded: node_id}`. Rethinking an already-invalidated node is `conflict`.
+
+### Tests (test/self.test.ts)
+
+Per verb: receipt shape, strict schema, per-operation required fields reported with the right `field`, read grantee forbidden on writes and allowed on reads,
+RLS proof on the new rows. identity: decide by a write grantee is `forbidden`; decide twice is `conflict`; accept creates the node. anchor: check is case-insensitive
+and returns the linked memory; create with both or neither of memory_id/response fails on field `memory_id`. desire: list ordering by intensity; fulfill twice `conflict`.
+rethink: old node leaves default reads, new node carries merged metadata with provenance winning, the corrects edge exists, rethink by a grantee on a node the mind wrote
+succeeds (proves the relaxed update policy), and an attempt to change `written_by` via raw SQL under the app role raises.
+
+## Verbs: Bond region (migration 0004_bond.sql)
+
+### Schema
+
+```
+relations(mind_id text not null references minds, subject text not null, state text not null, intensity double precision not null check (intensity between 0 and 1),
+          note text, last_event_id uuid not null references events, updated_at timestamptz not null, cleared_at timestamptz, primary key (mind_id, subject))
+letters(id uuid pk default gen_random_uuid(), from_mind text not null references minds, to_mind text not null references minds,
+        letter_type text not null check (letter_type in ('personal','handoff','proposal')), subject text, body text not null,
+        deliver_at timestamptz, sent_event_id uuid not null references events, sent_at timestamptz not null, read_at timestamptz, read_event_id uuid references events)
+```
+RLS on relations: standard mind-only. RLS on letters: SELECT `using (from_mind = app.mind_id or to_mind = app.mind_id)`; INSERT `with check (from_mind = app.mind_id)`;
+UPDATE `using (to_mind = app.mind_id) with check (to_mind = app.mind_id)`. Index letters(to_mind, read_at, deliver_at, sent_at desc). Grants select/insert/update.
+Letters are the one built-in cross-mind write: the sender's transaction inserts a row the recipient can read. No event is written in the recipient's ledger at send time.
+
+### mind_relate
+
+Schema (strict): `mind_id`, `operation: z.enum(["set","read","clear"])`, `subject: text(200).optional()`, `state: text(200).optional()`, `intensity: z.number().min(0).max(1).default(0.5)`,
+`note: text(4000).optional()`, `history_limit: z.number().int().min(0).max(100).default(5)`. superRefine: set needs `subject` and `state`; clear needs `subject`.
+`scopeFor`: read -> read; set/clear -> `relate`. Note: `relate` is a distinct grant scope; the mind acting as itself always passes.
+- set: lock `hashtext('relation:'||mind_id||':'||subject)`; append `kind="relate.set"` `payload={subject, state, intensity, note}`; upsert relations (`cleared_at = null`, updated_at = event.created_at);
+  `projection={event_id, relation}`.
+- clear: same lock; row must exist and not be cleared (`not_found` field `subject`); append `kind="relate.clear"` `payload={subject}`; set `cleared_at = event.created_at`; `projection={event_id, relation}`.
+- read: with `subject`: `projection={relation: row or null (cleared rows return null), history: events where kind in ('relate.set','relate.clear') and payload->>'subject' = subject order by seq desc limit history_limit}`;
+  without `subject`: `projection={relations: all rows where cleared_at is null ordered by updated_at desc}`. No event.
+
+### mind_letter
+
+Schema (strict): `mind_id`, `operation: z.enum(["send","inbox","read_letter"])`, `to: mindIdSchema.optional()`, `letter_type: z.enum(["personal","handoff","proposal"]).default("personal")`,
+`subject: text(200).optional()`, `body: text(12000).optional()`, `deliver_at: z.iso.datetime().optional()`, `letter_id: z.uuid().optional()`, `include_read: z.boolean().default(false)`,
+`limit: z.number().int().min(1).max(100).default(10)`. superRefine: send needs `to` and `body`; read_letter needs `letter_id`. `scopeFor`: send -> `letter`; inbox/read_letter -> read.
+- send: `mind_id` is the sender. `to` must be an enabled mind (`select 1 from minds where mind_id=$1 and disabled_at is null`; else `not_found` field `to`); `to === mind_id` is `invalid_input` field `to`.
+  Append `kind="letter.send"` `payload={to, letter_type, subject, deliver_at}`; insert letters row with `from_mind=mind_id`, `sent_event_id`, `sent_at=event.created_at`;
+  `projection={event_id, letter: {id, to, letter_type, subject, deliver_at, sent_at}}`.
+- inbox: `mind_id` is the recipient. Rows where `to_mind = mind_id and (deliver_at is null or deliver_at <= now()) and (read_at is null or include_read)` ordered by sent_at desc, limit;
+  `projection={letters: rows without body, each with from_mind}`. No event.
+- read_letter: the row must be visible (sender or recipient) and, for the recipient, delivered (`deliver_at` passed) else `not_found` field `letter_id`. If the caller's mind is the recipient
+  and `read_at is null`: append `kind="letter.read"` `subject_id=letter_id` `payload={from: from_mind}` and set `read_at = event.created_at`, `read_event_id`. `projection={letter: full row}`
+  with `event_id` when one was written.
+
+### mind_link
+
+Schema (strict): `mind_id`, `source_id: z.uuid()`, `target_id: z.uuid()`, `edge_type: z.enum(["related_to","contradicts","conflicts_with","corrects","derived_from","references",
+"felt_toward","involves","depends_on","followed_by"]).default("related_to")`, `weight: z.number().min(0).max(1).default(0.5)`, `note: text(4000).optional()`.
+Scope: write. `source_id === target_id` is `invalid_input` field `target_id`. Both must be live nodes in scope (`not_found` naming the missing field). If an edge with the same
+(source, target, edge_type) exists: return `ok` with `projection={edge_id, existing:true}`, `warnings=["exists"]`, no event. Else append `kind="link"` `payload={source_id, target_id, edge_type, weight, note}`,
+insert edge with `confidence=1.0`, `metadata={note, event_id}`; `projection={event_id, edge_id}`.
+
+### Tests (test/bond.test.ts)
+
+relate: set then read returns the row and history newest first; clear hides the row from read and from the list; set after clear revives it; a read grantee gets `forbidden` on set
+(read scope is not relate scope); a grantee with `relate` scope succeeds (insert that grant in the test via the admin pool). letter: send from alpha to beta; beta's inbox shows it
+without the body; beta's read_letter marks it read and appends an event in beta's ledger; alpha can read_letter its own sent letter without writing an event; a letter with future
+deliver_at is absent from inbox and `not_found` on read_letter for the recipient until the time passes; sending to self or to an unknown mind fails with the specified codes;
+RLS proof: a third mind (seed one in the test as admin) sees neither row. link: self-link rejected; foreign node `not_found`; duplicate returns existing with the warning and no new event.
+
+## Verbs: State region (migration 0006_state.sql)
+
+All tables below: `mind_id text not null references minds`, RLS forced with the standard mind-only policy, grants select/insert/update, no delete.
+`context` is a lane tag (any `text(64)`), never an identity; the empty string means the shared record.
+
+```
+drive_state(mind_id, context text not null default '', drive text not null check (drive in ('connection','continuity','competence','play','care','anchor','desire','autonomy')),
+            intensity double precision not null check (intensity between 0 and 10), frustration double precision not null check (frustration between 0 and 10),
+            satisfaction double precision not null check (satisfaction between 0 and 10),
+            baseline_intensity double precision not null default 5, baseline_frustration double precision not null default 2, baseline_satisfaction double precision not null default 5,
+            last_event_id uuid not null references events, updated_at timestamptz not null, primary key (mind_id, context, drive))
+kv_contexts(mind_id, key text not null check (length(key) <= 200), value jsonb not null, expires_at timestamptz, last_event_id uuid not null references events,
+            updated_at timestamptz not null, cleared_at timestamptz, primary key (mind_id, key))
+handoffs(mind_id, context text not null default '', handoff jsonb not null, session_id text, last_event_id uuid not null references events,
+         updated_at timestamptz not null, primary key (mind_id, context))
+```
+
+### mind_drive
+
+Schema (strict): `mind_id`, `operation: z.enum(["read","nudge","decay","set_baseline"])`, `context: text(64).default("")`, `drive: z.enum([...the eight]).optional()`,
+`axis: z.enum(["intensity","frustration","satisfaction"]).optional()`, `delta: z.number().min(-10).max(10).optional()`, `value: z.number().min(0).max(10).optional()`,
+`source: text(64).optional()`, `note: text(4000).optional()`. superRefine: nudge needs drive, axis, delta; set_baseline needs drive, axis, value. `scopeFor`: read -> read; else write.
+
+Decay model (pure function in `src/verbs/drives.ts`, unit-tested): each axis relaxes toward its baseline with a 24-hour half-life:
+`v(t) = b + (v0 - b) * 0.5 ^ (hours / 24)`. A drive with no row is at its baselines. `DRIVES` and `AXES` constants live there too.
+- read: for every drive (rows plus defaults for missing ones) return the decayed values as of `ctx.now()` without persisting; `projection = { context, as_of, drives: [{drive, intensity, frustration, satisfaction, baselines, updated_at}] }`. No event.
+- nudge: lock `hashtext('drive:'||mind_id||':'||context||':'||drive)`; compute decayed current values at one instant T (see below); apply delta to the axis; clamp to [0,10]; append `kind="drive.nudge"`
+  `payload={context, drive, axis, delta, source, note, before, after}`; upsert the row with all three axes (decayed, one nudged), updated_at = T (not the event's created_at); `projection={event_id, drive}` where `drive` is the same view shape read returns.
+- decay: persist decayed values for all eight drives in the context under one event `kind="drive.decay"` `payload={context, as_of: T}`, every row stamped updated_at = T; `projection={event_id, drives}`.
+- set_baseline: lock as nudge; append `kind="drive.baseline"` `payload={context, drive, axis, value}`; upsert baseline for that axis (current values decayed to T and persisted too); `projection={event_id, drive}` (same view).
+- One instant per write: T = max(ctx.now(), the stored updated_at of the rows being written). T is both the decay target and the stored updated_at, so a read at the same instant returns the written values exactly, and a writer that captured its clock before waiting on the advisory lock never stamps an older time over a newer row. (An earlier draft read the DB clock after the lock; that made the injected test clock unusable for writes, so ctx.now() stays the clock and T only guards monotonicity.)
+- View shape everywhere: `{drive, intensity, frustration, satisfaction, baselines: {intensity, frustration, satisfaction}, updated_at}`, every number rounded to 3 decimals; the table keeps raw doubles.
+
+### mind_weather
+
+Schema (strict): `mind_id`, `lookback_hours: z.number().min(1).max(24*30).default(24)`, `context: text(64).optional()`. Scope: read. No event. A deterministic synthesis, no model call:
+over events in scope with `now - lookback <= created_at <= now` (and `context` if given; the empty string selects the shared lane, `context is null`), where `texture is not null`:
+`charge_counts` (tag -> count, top 10 desc), `salience`, `vividness`, `grip` distributions, `kinds` (kind -> count over all events in the window, textured or not),
+`somatic` top 5, `event_count`, `textured_count`. `report`: one paragraph built from a fixed template, e.g. "Over the last 24 hours: 7 events, 4 carrying texture.
+Dominant charge: tender (3), focused (2). Mostly soft and present." Counting is done in SQL (charge via jsonb_array_elements, scalars via group by, limits in SQL), so Node receives aggregates, not event rows; migration 0008 adds `events(mind_id, created_at desc)` and a partial index on textured events. Empty window yields `report = "Quiet: no events in the window."` `projection = { window: {from, to, hours}, ...the above }`.
+
+### mind_context
+
+Schema (strict): `mind_id`, `operation: z.enum(["set","get","list","clear"])`, `key: text(200).optional()`, `value: z.unknown().optional()`, `ttl_minutes: z.number().int().min(1).max(60*24*30).optional()`.
+superRefine: set needs key and value (value may be any JSON but not undefined; serialized size <= 16384 bytes else invalid_input field value; the value is also walked recursively and rejected, field value, for any string or object key containing NUL or not well-formed Unicode, any non-finite number, or nesting deeper than 256); get and clear need key. `scopeFor`: get/list -> read; set/clear -> write.
+- set: append `kind="context.set"` `payload={key, value, ttl_minutes}`; upsert with `expires_at = ttl ? event.created_at + ttl : null`, `cleared_at = null`; `projection={event_id, entry}`.
+- get: the row; `projection={entry: row or null, expired: boolean}` where expired is true when `expires_at <= now` or `cleared_at` is set (then `entry` is still returned with `expired: true` for transparency).
+- list: active rows only (`cleared_at is null and (expires_at is null or expires_at > now)`), ordered by updated_at desc; `projection={entries}`.
+- clear: row must exist and be unexpired/uncleared (`not_found` field key); append `kind="context.clear"` `payload={key}`; set cleared_at; `projection={event_id, entry}`.
+
+### mind_handoff
+
+Schema (strict): `mind_id`, `operation: z.enum(["write","read"])`, `context: text(64).default("")`, `history_limit: z.number().int().min(0).max(50).default(0)`,
+`handoff: z.strictObject({ tone: text(200).optional(), register: text(200).optional(), last_corrections: z.array(text(1000)).max(50).optional(), unresolved_tension: text(4000).optional(),
+partner_state: text(4000).optional(), active_texture: text(4000).optional(), reentry_instructions: text(4000).optional(), notes: text(12000).optional() }).optional()`.
+superRefine: write needs `handoff` with at least one field (field `handoff`). `scopeFor`: read -> read; write -> write.
+- write: append `kind="handoff.write"` `payload={context, handoff}` with `session_id` from ctx; upsert handoffs (replace, not patch: a handoff is a whole snapshot), updated_at = event.created_at; `projection={event_id, handoff: row}`.
+- read: `projection={handoff: row or null, history: last history_limit handoff.write events for the context, newest first, as {event_id, created_at, session_id, handoff}}`.
+
+### Tests (test/state.test.ts)
+
+drives: decay math unit test at 0h, 24h (halfway), 48h; read on an empty mind returns eight drives at baselines; nudge then read after a simulated 24h (inject `now`) shows half the excursion;
+exact read after nudge at one injected instant and half-decay 24h later, 3-decimal rounding, one view shape across operations; clamp at 10 and 0; concurrency: 8 parallel nudges on one drive end with a row whose last_event_id is the highest-seq event for that drive and whose value equals the serial application
+(given no decay between, all within the same injected now); set_baseline shifts the rest point; contexts are independent; read grantee can read, cannot nudge.
+weather: empty window; counts and report with a few textured events; context filter; empty-string context is the shared lane; events after `to` excluded; 50-event aggregate shape; lookback boundary; read grantee allowed.
+context: set/get/list/clear; TTL expiry via injected now; oversized value invalid_input; lone surrogate, NUL key, Infinity, depth 300 invalid_input; cleared then set revives; RLS.
+handoff: write replaces wholesale (a second write with fewer fields drops the missing ones); read returns null on an empty mind; history newest first with session ids; context separation; RLS.
+
+## Verbs: Hold region, part two (migration 0007_threads_tasks.sql)
+
+```
+threads(id uuid pk default gen_random_uuid(), mind_id, label text not null, priority text not null check (priority in ('low','normal','high')) default 'normal',
+        tags text[] not null default '{}', status text not null check (status in ('active','resolved','archived')) default 'active', notes jsonb not null default '[]',
+        created_event_id uuid not null references events, created_at timestamptz not null, updated_at timestamptz not null, resolved_at timestamptz, resolution text)
+tasks(id uuid pk default gen_random_uuid(), mind_id, title text not null, description text, priority text not null check (priority in ('low','normal','high','urgent')) default 'normal',
+      status text not null check (status in ('open','in_progress','blocked','done','cancelled')) default 'open', tags text[] not null default '{}', depends_on uuid[] not null default '{}',
+      created_event_id uuid not null references events, created_at timestamptz not null, updated_at timestamptz not null, completed_at timestamptz)
+```
+Indexes: threads(mind_id, status, priority, created_at); tasks(mind_id, status, priority, created_at). RLS and grants as usual.
+
+### mind_thread
+
+Schema (strict): `mind_id`, `operation: z.enum(["add","list","update","resolve","archive"])`, `label: text(512).optional()`, `priority: z.enum(["low","normal","high"]).optional()`,
+`tags: z.array(text(64)).max(32).optional()`, `thread_id: z.uuid().optional()`, `note: text(4000).optional()`, `status: z.enum(["active","resolved","archived","all"]).default("active")`,
+`limit: z.number().int().min(1).max(200).default(20)`. `label` is `nonBlankText(512)` (trimmed, not blank). superRefine: add needs label; update/resolve/archive need thread_id; update needs at least one of label, priority, tags, note.
+`scopeFor`: list -> read; else write. Lock `hashtext('thread:'||thread_id)` for update/resolve/archive.
+- add: `kind="thread.add"` `payload={label, priority, tags}`; insert; `projection={event_id, thread}`.
+- list: by status (`all` = every status), ordered priority high>normal>low then created_at asc, limit; `projection={threads}`.
+- update: thread must exist (`not_found` field thread_id) and be active (`conflict`); `kind="thread.update"` `subject_id=thread_id` `payload={label?, priority?, tags?, note?}`;
+  patch supplied fields; a note is appended to `notes` as `{event_id, at, note}`; updated_at = event.created_at.
+- resolve: active only (`conflict` otherwise); `kind="thread.resolve"` `payload={note}`; status resolved, resolved_at, resolution = note.
+- archive: not already archived (`conflict`); `kind="thread.archive"`; status archived.
+
+### mind_task
+
+Schema (strict): `mind_id`, `operation: z.enum(["create","list","update"])`, `title: nonBlankText(512).optional()` (trimmed, not blank), `description: text(12000).optional()`,
+`priority: z.enum(["low","normal","high","urgent"]).optional()`, `status: z.enum(["open","in_progress","blocked","done","cancelled"]).optional()`, `tags: z.array(text(64)).max(32).optional()`,
+`depends_on: z.array(z.uuid()).max(32).optional()`, `task_id: z.uuid().optional()`, `filter_status: z.array(z.enum([...statuses])).optional()` (default for list: open, in_progress, blocked),
+`limit: z.number().int().min(1).max(200).default(20)`. superRefine: create needs title; update needs task_id and at least one patchable field (title, description, priority, status, tags, depends_on).
+`scopeFor`: list -> read; else write.
+- create: depends_on is deduplicated before storing; every id must be a task of this mind (`not_found` field depends_on; the query also filters `mind_id` explicitly); `kind="task.create"` `payload={title, description, priority, tags, depends_on}`; insert; `projection={event_id, task}`.
+- list: filter by status set; ordered urgent>high>normal>low then created_at asc; each task carries `blocked_by: [ids in depends_on of this mind whose status is not done and not cancelled]` computed in SQL (a cancelled dependency does not block); `projection={tasks}`.
+- update: lock `hashtext('task:'||task_id)`; task must exist (`not_found`); done and cancelled are terminal (`conflict` on any update); status transitions otherwise free among open/in_progress/blocked/done/cancelled;
+  depends_on replaced wholesale and validated as in create (a task may not depend on itself: `invalid_input` field depends_on; a dependency cycle, found by a recursive walk from the proposed dependencies looking for the task id, is `invalid_input` field depends_on, message "dependency cycle". Create cannot close a cycle because the new id has no dependents, so the walk runs on update only); `kind="task.update"` `subject_id=task_id` `payload=<patch>`; `completed_at` set when status becomes done; `projection={event_id, task}`.
+
+### Tests (test/threads_tasks.test.ts)
+
+thread: add/list ordering; update patches and appends notes; resolve and archive transitions with conflicts; status filters; RLS; read grantee can list only.
+task: create with valid and invalid depends_on; self-dependency and cycles rejected; depends_on deduped; cancelled does not block; blank title rejected; thread: blank label rejected; list default filter and blocked_by computation; terminal states refuse updates; completed_at set once; RLS; grantee scopes.
+
+## Verb: mind_orient (Wake region)
+
+Schema (strict): `mind_id`, `depth: z.enum(["orientation","quick","full"]).default("quick")`, `context: text(64).optional()`,
+`limits: z.strictObject({ loops: z.number().int().min(1).max(100).default(10), threads: ..., tasks: ..., recent: ... }).optional()`. Scope: read. No event (reads are pure).
+
+`mind_orient` composes sibling verbs through `ctx.registry`: for each section it finds the verb by name, validates a constructed input with that verb's schema, and calls its handler with the same ctx.
+A section whose verb's `scopeFor(input)` is not `"read"` is refused without calling its handler: `{ error: { code: "forbidden", message: "section is not read-scoped" } }`. A verb that is not registered yields `{ skipped: "not registered" }` for its section; a handler that returns `ok:false` yields `{ error: <its error> }`; neither fails the wake.
+Sections by depth (each deeper level includes the shallower ones):
+- orientation: `identity` (mind_identity read: cores and pending proposals), `vows` (mind_vow list), `state` (mind_state read), `handoff` (mind_handoff read for `context ?? ""`), `health` (mind_health).
+- quick: + `loops` (mind_loop list, burning first, limit), `threads` (mind_thread list active), `tasks` (mind_task list default filter), `relations` (mind_relate read all), `drives` (mind_drive read for context),
+  `inbox` (mind_letter inbox, limit 5, without bodies), `weather` (mind_weather 24h), `anchors` (mind_anchor list).
+- full: + `desires` (mind_desire list), `holdings` (direct query: holdings rows with state in active, processing ordered by updated_at desc limit 50), `proposals` (already in identity),
+  `recent` (direct query: last `limits.recent` events, newest first, columns id, seq, kind, context, created_at, payload; never embedding).
+`projection = { mind_id, depth, as_of, context, sections: {...} }`. Section order is fixed as listed so the output reads top-down from identity to recent activity.
+
+### Tests (test/orient.test.ts)
+
+With the full registry: orientation returns exactly its five sections; quick adds the eight; full adds the rest; a registry missing mind_weather yields `skipped`; a section whose verb returns an error
+(e.g. construct a registry whose mind_vow handler returns err) yields `error` and the wake still succeeds; a section whose verb is not read-scoped is refused (stub verb, handler never called); the real registry is used and context is proven applied (weather and handoff for a lane); `session_id` is rejected; read grantee may orient another mind; RLS: recent and holdings show only the mind's own rows; no event is written.
+
+## Embedder and retrieval (migration 0009_retrieval.sql)
+
+### Embedder (src/embed/)
+
+`Embedder` is defined in src/verbs/types.ts: `{ name, dim: 384, embed(texts) -> Array<Float32Array | null> }`. The runner injects `deps.embedder` (or the `none` embedder) and calls it itself, BEFORE the transaction (see Write path). Handlers read `ctx.embedded` and never call the embedder. Implementations:
+- `src/embed/none.ts`: vectors null. Used when `EMBEDDER=none` or unset in tests.
+- `src/embed/local.ts`: `fastembed` (ONNX, CPU) running `BAAI/bge-small-en-v1.5`, 384 dimensions, L2-normalised. Model files cache under `EMBED_CACHE_DIR` (default `./.embed-cache`, gitignored).
+  `l2normalise` returns null for a zero or non-finite vector (stored as null, never as a fake unit vector).
+  Loaded lazily on first call; a load failure is logged once and the embedder degrades to returning nulls for that process (never throws into a verb). `name = "local:bge-small-en-v1.5"`.
+- `src/embed/http.ts`: `POST ${EMBED_URL}` with `{ "input": [texts] }`, expects `{ "data": [{ "embedding": [floats] }] }` (the OpenAI-compatible shape many local servers speak); bearer `EMBED_API_KEY`
+  if set; 10 s timeout; when every item carries the OpenAI `index` field the vectors are placed by `index` (duplicate or out-of-range indexes are a shape error), otherwise by response order;
+  dimension mismatch or any failure returns nulls and is logged at most once per minute (not once per process). `name = "http:" + hostname`.
+- `src/embed/index.ts`: `embedderFromEnv(env): Embedder` chooses by `EMBEDDER` (`local` default when unset in production, `http`, `none`). The CLI wires it into RunDeps for http and stdio.
+- `src/embed/fake.ts` (test only, lives in test/ as test/fake-embedder.ts): deterministic bag-of-words hashing into 384 dims, L2-normalised, so two texts sharing words are closer than unrelated ones. Tests inject it through `deps.embedder`.
+
+### Schema (0009_retrieval.sql)
+
+- `events`: add `embedding_model text`, `search tsvector generated always as (to_tsvector('simple', coalesce(payload->>'text','') || ' ' || coalesce(payload->>'content','') || ' ' || coalesce(payload->>'label',''))) stored`;
+  index `events_search_gin on events using gin (search)`; 
+- `nodes`: add `embedding_model text`, `search tsvector generated always as (to_tsvector('simple', label || ' ' || content)) stored`; `nodes_search_gin`.
+  0009 also created `events_embedding_hnsw` and `nodes_embedding_hnsw`; 0010 drops both (see Semantic ranking).
+- `embedding` columns already exist (vector(384)).
+
+### Schema (0010_trigger_tighten.sql)
+
+- `events_append_only()` is replaced. An UPDATE on `events` is allowed ONLY when `old.embedding is null and new.embedding is not null and new.embedding_model is not null` AND every other column is unchanged,
+  compared as TEXT: `(to_jsonb(old) - 'embedding' - 'embedding_model' - 'search')::text = (to_jsonb(new) - ...)::text`, and additionally `old.payload::text is not distinct from new.payload::text` and the same for `texture`.
+  jsonb equality is numeric (`100 = 100.000`) but `jsonb::text` keeps the numeric literal as written, so number formatting cannot be rewritten under cover of a fill. Everything else (a model without a vector, a vector without a model,
+  a second fill, any other column, any DELETE) raises `restrict_violation`. Triggers fire for superusers too, so the rule holds under the admin URL.
+- `edges` gains `check (source_node_id <> target_node_id)` (`edges_no_self_loop`).
+- `events_embedding_hnsw` and `nodes_embedding_hnsw` are dropped.
+
+### Semantic ranking: an exact scan per mind
+
+Semantic lists are `order by embedding <=> $vec, <tie key> limit 50` over the rows RLS and the filters leave (one mind's rows). It is an exact scan, deliberately. An HNSW index with pgvector 0.6 returns its
+`ef_search` nearest candidates first and the RLS/`where` filters apply afterwards, so a mind with few rows among many (or a selective filter) silently loses results; and the planner did not use the indexes for these filtered queries anyway.
+HNSW can return once pgvector >= 0.8 is available, with iterative index scans (`hnsw.iterative_scan`) so filtering continues until enough rows qualify; until then do not add a vector index.
+
+### Write path
+
+Embedding happens BEFORE the transaction, so a slow embedder never holds a pooled connection, row locks or an advisory lock. `Verb` has an optional `embedText?: (input) => string | null`; `VerbContext` has an optional
+`embedded?: { vector: string | null, model: string | null }`. In `runVerb`, after parsing and the grant check and before `withMind`, if `verb.embedText(input)` returns a non-blank string the runner calls
+`embedOne(embedder, text, deps.embedTimeoutMs ?? 10000)` (src/verbs/common.ts) and puts the result on `ctx.embedded`. Handlers use `ctx.embedded` and never call the embedder (`appendEvent`, `appendEventWithTimes` and
+`insertSelfNode` take the already computed value; there is no `embed_text` option any more). `embedText` per verb: `mind_write` text; `mind_observe` content (one call serves the event and the node); `mind_rethink` content;
+`mind_identity` content for `affirm` only; `mind_vow` vow for `make`; `mind_desire` want for `register`; `mind_anchor` response for `create` (an anchor bound to a memory has no text); `mind_search` the query unless `mode` is `text`;
+`mind_surface` the query. Every other operation returns null and the embedder is not called. A settled identity proposal inserts its node with null embedding (its text lives in the proposals row, not the input); `embed-backfill` fills it.
+
+`embedOne` never throws and never fails a write. It returns nulls (and logs once per process) when: the embedder is `none`, the text is blank, the embedder throws, it does not answer within the overall cap (10 s; the hung call is abandoned),
+the vector's length is not 384 or does not equal `embedder.dim`, or any component is NaN/Infinity (`vectorLiteral()` returns null on a non-finite component). A bad vector therefore stores null instead of failing the insert.
+The query vector for `mind_search`/`mind_surface` goes through the same path, so the same checks apply and a failure degrades to text-only with the usual warning.
+
+### CLI
+
+`sanctum-mind embed-backfill [--batch 64]` (admin or app URL both work; needs select+update on events and nodes): walks rows with `embedding is null` where the embeddable text is non-empty, in batches,
+per ENABLED mind (`minds.disabled_at is null`), per original author (using `withMind` with mode write and bearer = that author so RLS and the `written_by` immutability are respected), stores vectors and model, prints counts. Idempotent.
+Every select and update names `mind_id = <the mind>` explicitly: under the admin URL the connection is a superuser and RLS does not apply, so without it a mind's batch would embed and update other minds' rows. The 0010 trigger requires the fill to set both embedding and model, which it does.
+
+### mind_search
+
+Schema (strict): `mind_id`, `query: nonBlankText(2000)`, `limit: z.number().int().min(1).max(50).default(10)`, `scope: z.enum(["events","nodes","both"]).default("both")`,
+`kind: text(64).optional()` (event kind filter), `node_type: text(64).optional()`, `context: text(64).optional()`, `after: instant.optional()`, `before: instant.optional()`,
+`mode: z.enum(["hybrid","text","semantic"]).default("hybrid")`. Scope: read. No event.
+Behavior: run up to two ranked lists per table and fuse with reciprocal rank fusion (k = 60):
+- text: `where search @@ websearch_to_tsquery('simple', $q)` ranked by `ts_rank_cd(search, query) desc`, limit 50.
+- semantic: only when `ctx.embedded.vector` is available and mode != text: exact ordered scan `order by embedding <=> $vec` with `embedding is not null`, limit 50 (no vector index; see Semantic ranking); returns `distance`.
+- filters apply to both lists; nodes always `invalidated_at is null`; RLS scopes everything.
+- If mode is `semantic` and no vector is available (none embedder or failure): return `ok` with `hits: []` and `warnings: ["no embedder: semantic search unavailable"]`. In `hybrid` with no vector: text only, same warning.
+- `projection = { query, mode_used: "hybrid"|"text"|"semantic", hits: [{ source: "event"|"node", id, score, text_rank?, distance?, kind?|node_type?, label?, snippet (first 240 chars of text/content), created_at, context, texture? }] }`
+  sorted by fused score desc, limit applied after fusion.
+
+### mind_surface
+
+Schema (strict): `mind_id`, `query: nonBlankText(2000)`, `pool_sizes: z.strictObject({ core: int 1..20 default 3, novel: int 0..20 default 2, edge: int 0..20 default 2 }).optional()`, `context: text(64).optional()`.
+Scope: read. No event. Three pools over NODES only (curated memory), excluding invalidated:
+- core: the top `core` nodes by the same hybrid ranking as mind_search (nodes scope).
+- novel: candidates ranked 2x core+1 .. 50 by the hybrid ranking (i.e. related but not the obvious hits), re-ranked by `charge_weight desc, created_at desc` where charge_weight = number of texture.charge tags
+  (from metadata.texture) + 2 if grip in (iron, strong) + 1 if vividness in (crystalline, vivid); exclude core; take `novel`.
+- edge: nodes reachable within 2 hops over `edges` from the core nodes (either direction), not in core or novel, ranked by `hops asc, score desc` (score = sum of edge weights along the path). Per node the best path is also chosen by `hops asc, score desc`, so a node one hop from a core node is always labelled hops 1 even when a heavier two-hop path reaches it; `via` is the node the chosen path arrived from.
+  Implemented as a recursive CTE bounded to depth 2 and 500 rows.
+- Each hit: `{ id, node_type, label, snippet, score, pool, hops? , via? }`. `projection = { query, core: [...], novel: [...], edge: [...], mode_used }`. Same no-embedder warning rule as search (then core/novel use text ranking only).
+
+### Tests (test/retrieval.test.ts) with the fake embedder injected
+
+search: text-only mode finds an exact-word match; semantic mode with the fake embedder ranks a paraphrase sharing words above an unrelated text; hybrid fuses (a hit present in both lists outranks one present in one);
+filters by kind, node_type, context, after/before; invalidated nodes never appear; RLS: another mind's rows never appear; the none embedder yields the warning and text-only results; limit after fusion.
+surface: core picks the top hits; novel excludes core and prefers charged nodes; edge follows related_to links two hops out and reports hops; pool sizes honoured; zero-size pools allowed.
+write path: mind_write and mind_observe store a vector and embedding_model with the fake embedder, null with the none embedder; a throwing embedder does not fail the write.
+edge pool: triangle S-X 0.9, S-Y 0.5, Y-X 0.5 gives X then Y, both hops 1 via S; fusion: a hit at rank 8 in both lists beats a rank-1 hit in one list with limit 1 (so limits are applied after fusion).
+trigger (0010): fill + payload/texture number-format change fails, model alone fails, vector without model fails, a correct fill succeeds, a second fill fails, same for a superuser. Bad vectors (NaN, Infinity, 3-dim) store null and the write succeeds.
+pre-transaction embedding: a hanging embedder is cut off by `embedTimeoutMs` and the write succeeds with null; the embedder is called once per embedding verb, never for reads, and never while a pooled connection is checked out; identity affirm, vow make, desire register and anchor create store vectors.
+backfill: rows with null embeddings get vectors; a second run touches nothing; another mind's rows are embedded under that mind's own scope (written_by unchanged); under the admin pool a mind's batch never contains another mind's rows and disabled minds are skipped.
+
+## Daemon: deterministic metabolism (migration 0011_daemon.sql)
+
+The daemon is the part of the core that runs without a client attached. Version one is deterministic only: no model calls, no dreams, no
+reflection. Every pass is a pure function of the ledger and the clock, so a run can be replayed and audited. LLM-driven passes are a
+separate design later and will plug into the same runner.
+
+### Schema
+
+```
+daemon_runs(id uuid pk default gen_random_uuid(), mind_id text not null references minds, started_at timestamptz not null, finished_at timestamptz,
+            passes jsonb not null default '[]',   -- [{pass, ok, changed, ms, error?}]
+            trigger text not null check (trigger in ('timer','manual')))
+```
+RLS mind-only, grants select/insert/update. Index daemon_runs(mind_id, started_at desc). Also add `archived_at timestamptz` to `events` is NOT done:
+events stay immutable; retention is expressed through holdings and node invalidation, never by touching the ledger.
+
+### Runner (src/daemon/index.ts)
+
+`runDaemonOnce(deps: { pool, embedder, now? }, opts: { trigger, minds?: string[] }): Promise<RunReport[]>`:
+- lists enabled minds (`select mind_id from minds where disabled_at is null`, optionally filtered), and for each mind, in sequence,
+  opens `withMind(pool, mind, mind, "write", ...)` once per PASS (not per mind), so a failing pass rolls back only itself;
+- takes `pg_advisory_xact_lock(hashtext('daemon:'||mind))` at the start of each pass so two daemons never overlap on one mind;
+- records a daemon_runs row at start (own short transaction) and updates it at the end with the pass list;
+- each pass returns `{ changed: number, notes?: string[] }`; a thrown error is caught, logged, recorded as `ok:false` with a sanitised message, and the next pass runs;
+- the whole run never throws. `startDaemon(deps, { intervalMinutes = 30 })` loops with `setTimeout`, skipping a tick if the previous is still running.
+Each pass that changes state appends ledger events with `written_by = mind` and `kind` prefixed `daemon.` so the ledger shows what the metabolism did.
+
+### Passes, in order (src/daemon/passes/*.ts, one file each, each exporting `{ name, run(ctx) }` with ctx = VerbContext plus `now`)
+
+1. `drives.decay`: persist decayed drive values for every (context, drive) row older than 1 hour via the same code path as `mind_drive decay` (one `drive.decay` event per context). `changed` = rows updated.
+2. `context.expire`: mark expired `kv_contexts` rows (`expires_at <= now and cleared_at is null`) as cleared with one `daemon.context.expire` event listing the keys. `changed` = keys.
+3. `loops.stale`: loops open longer than 14 days with urgency `nagging` get one `daemon.loop.stale` event per loop (payload: loop_id, age_days) at most once per 7 days per loop (dedupe by checking the latest such event's created_at). Nothing is resolved automatically. `changed` = events written.
+4. `holdings.settle`: holdings in `active` or `processing` whose `updated_at` is older than 30 days are moved to `deferred` with a `daemon.holding.settle` event each (`subject_id` = the subject). Forward-only transition, so it is legal. `changed` = rows.
+5. `desires.fade` (followed by `identity.settle`, see "Identity belongs to the mind"): desires unfulfilled for more than 60 days get `metadata.faded = true` and `metadata.faded_at` (node update, written_by immutable so this is an allowed mind-only update) plus one `daemon.desire.fade` event per node. `mind_desire list` excludes faded unless `include_fulfilled`. `changed` = nodes.
+6. `graph.orphans`: observation nodes older than 7 days with no edges in either direction get one `daemon.graph.orphan` event (payload: node_id, label) at most once per 30 days per node. Informational: orient's `full` depth shows the last 20 `daemon.graph.orphan` events under a new section `orphans` (direct query). `changed` = events.
+7. `embeddings.backfill`: run `backfillEmbeddings` for this mind only (bounded to 256 rows per run) when the embedder is not `none`. `changed` = rows embedded.
+8. (order in code: after `desires.fade` comes `identity.settle`, below.) `letters.expire`: nothing is deleted; letters unread for more than 90 days get `read_at` left null but a `daemon.letter.aging` event in the RECIPIENT's ledger once per 30 days per letter. `changed` = events.
+
+Thresholds are constants in src/daemon/config.ts, overridable via `DAEMON_*` env (e.g. `DAEMON_LOOP_STALE_DAYS`), each validated as a positive integer.
+
+### CLI
+
+`sanctum-mind daemon [--once] [--interval 30] [--mind <id>]` runs with the app role URL and the configured embedder. `--once` runs a single pass set and exits with code 0 if every pass of every mind was ok, 2 otherwise. The parent integrates this into src/cli.ts; the daemon builder exports the functions only.
+
+### mind_health addition
+
+`mind_health` gains `last_daemon_run: { started_at, finished_at, passes_ok, passes_failed } | null` from daemon_runs (same scope). Orient's `health` section therefore shows it.
+
+### Tests (test/daemon.test.ts)
+
+Each pass has a unit-style test through `runDaemonOnce` with an injected clock: fixture rows older than the threshold change, younger ones do not; events are written with the `daemon.` kind and `written_by = mind`; dedupe windows hold (a second run within the window writes nothing); a pass that throws (inject by making a pass's table unavailable, e.g. drop a column in a scratch schema, or stub a pass with a throwing run) is recorded `ok:false` and the following passes still run and commit; two concurrent `runDaemonOnce` on the same mind do not double-apply (advisory lock) and both complete; RLS: a run for alpha never touches beta's rows; disabled minds are skipped; `mind_health` reports the last run.
+
+### Daemon as built (amendments; these supersede the text above where they differ)
+
+- `runDaemonOnce(deps: { pool, embedder, now? }, opts: { trigger, minds?, config?: Partial<DaemonConfig>, passes? })` returns one `RunReport` per mind
+  `{ mind_id, run_id, started_at, finished_at, ok, passes: [{pass, ok, changed, ms, error?, notes?}], error? }`. It never throws: an invalid config, an unreachable
+  database or a failed run record comes back as `ok:false` (a run-level failure has `mind_id: "*"`). `opts.passes` replaces the pass list (tests only). `startDaemon(deps,
+  { intervalMinutes = 30, minds?, config?, onRun? })` returns `{ stop() }`, ticks immediately, re-arms a `setTimeout` after each tick finishes (so ticks never overlap) and throws at once on an invalid `DAEMON_*` environment.
+- Dedupe windows compare the latest `daemon.<kind>` event's `recorded_at` (which is the injected clock) rather than `created_at` (the statement clock), so an injected clock is honoured. In production they are the same instant.
+- `drives.decay` writes the same `drive.decay` event as `mind_drive decay` (no `daemon.` prefix), through the shared `persistDecay` helper in drives.ts; `changed` counts the eight drive rows of each persisted lane.
+- `embeddings.backfill` runs inside the pass transaction and embeds only rows the mind itself wrote (the events/nodes update policies require `written_by` = bearer = the mind), 256 rows per run across events then nodes.
+  Rows authored by a grantee are left for the whole-database `backfill` command.
+- `desires.fade` and `graph.orphans` consider only live nodes; desires fade only for nodes the mind wrote. `graph.orphans` writes at most `orphanBatch` (default 500) events per run, oldest nodes first.
+- Env names: `DAEMON_DECAY_STALE_HOURS`, `DAEMON_LOOP_STALE_DAYS`, `DAEMON_LOOP_RENOTIFY_DAYS`, `DAEMON_HOLDING_SETTLE_DAYS`, `DAEMON_DESIRE_FADE_DAYS`, `DAEMON_ORPHAN_AGE_DAYS`,
+  `DAEMON_ORPHAN_RENOTIFY_DAYS`, `DAEMON_ORPHAN_BATCH`, `DAEMON_BACKFILL_ROWS`, `DAEMON_LETTER_AGING_DAYS`, `DAEMON_LETTER_RENOTIFY_DAYS`.
+- Orient's `orphans` section is the last section at `full` depth: `{ events: [{id, seq, subject_id, created_at, payload}] }`, newest first, at most 20.
+
+## Adapter: Revien graph import (src/adapters/revien.ts)
+
+Revien is a separately published graph-memory engine whose export format is public: `{ "nodes": [...], "edges": [...], "exported_at", "version": "1.0" }`
+with nodes `{ node_id, node_type, label, content, source_id, created_at, last_accessed, access_count, metadata, source_type (extracted|inferred|derived|corrected),
+confidence, pinned, confidence_set_at, confidence_set_by, source_context, last_referenced, invalidated_at, source_modality, answerable_by_text, vision_processed,
+recorded_at, event_time_start, event_time_end, event_time_granularity, event_time_confidence, event_time_text }` and edges `{ edge_id, edge_type, source_node_id,
+target_node_id, weight, created_at, metadata, confidence, confidence_set_at, confidence_set_by, source_context }`. The adapter imports one export file into ONE mind.
+It is optional and generic: the core never calls it; it is a CLI subcommand.
+
+`importRevien(deps: { pool, embedder }, opts: { mind_id, file, source_filter?: string[], dry_run?: boolean }): Promise<ImportReport>`:
+- parse and validate the file with a zod schema that tolerates unknown extra fields on nodes and edges (passthrough) but requires the fields we map;
+- optional `source_filter`: only nodes whose `source_id` is in the list (and edges whose both ends survive);
+- for each node, inside `withMind(pool, mind, mind, "write")` in batches of 200: append one ledger event `kind = "import.revien.node"` with the ORIGINAL node as payload
+  (originals are kept whole), then insert a node: `id` = a fresh uuid, with `metadata.revien_node_id` = original id; `node_type` = the original type string (free text here;
+  record `metadata.revien_node_type` too); `label` truncated by code points to 200; `content`; `source_type` mapped 1:1; `confidence`, `pinned`; `invalidated_at` kept;
+  `recorded_at`, `event_time_*` kept (granularity mapped 1:1; validate ranges, drop invalid with a note); `metadata` = original metadata merged with
+  `{ revien: { source_id, confidence_set_by, source_context, modality: source_modality, answerable_by_text, vision_processed, event_time_confidence, event_time_text, last_accessed, access_count } }`;
+  `written_by = mind`; `created_at` = original created_at (explicit insert, allowed since created_at has no immutability rule on nodes);
+- edges: map `edge_type`: related_to, contradicts, conflicts_with, corrects, derived_from, references, depends_on, followed_by, felt_toward, involves -> same;
+  `decided_in`, `mentioned_by`, `has_observation`, `during`, `contrasts_with`, `lived_vs_clinical` and anything else -> `related_to` with `metadata.revien_edge_type` = original;
+  resolve both ends through the id map; skip edges whose ends are missing (counted); skip self-loops (counted); `weight`, `confidence` kept and clamped to [0,1];
+  one event `kind = "import.revien.edges"` per batch with the count and the original ids;
+- embeddings: nodes get `embedding` outside the pre-transaction rule, because this is a batch job and not a verb; embed in batches of 64 BEFORE each write transaction using `deps.embedder`
+  (null on failure), store `embedding_model`;
+- idempotency: a node whose `metadata->>'revien_node_id'` already exists in the mind is skipped (counted as `already_present`); same for edges by `metadata->>'revien_edge_id'`;
+- `dry_run` validates, maps and counts without writing;
+- report: `{ nodes: { imported, already_present, skipped_invalid }, edges: { imported, already_present, skipped_missing_end, skipped_self_loop }, type_counts: Record<string, number>, notes: string[] }`.
+
+CLI (wired by the parent): `sanctum-mind import-revien <file> --mind <id> [--source <id>...] [--dry-run]`, app role URL.
+
+### Tests (test/import_revien.test.ts)
+
+A fixture export with a handful of nodes across generic and rich types, one invalidated node, edges of mapped and unmapped types, one dangling edge, one self-loop, and a node
+from another source_id: dry run reports counts and writes nothing; a real run imports with the right mappings (check revien ids in metadata, edge type fallback with original preserved,
+invalidated node absent from mind_search, times preserved to microseconds); a second run is fully `already_present`; `source_filter` excludes the other source and its edges;
+RLS: nothing lands in another mind; mind_search finds an imported node by text; a malformed file is rejected with a clear error and nothing written.
+
+## Grants administration (migration 0013_govern.sql, renamed in 0017)
+
+Migration 0013 introduced the proposal flow, protected `identity` and `vow` node types (`mind_rethink` refuses them with `conflict`,
+message "protected node type: use mind_identity propose"), the `grant add|revoke|list` CLI (grantor and grantee must exist and be enabled;
+an identical live grant is a no-op) and a fifth grant scope. That scope let a grantee decide another mind's identity. It was a mistake and
+is gone: the scope is `steward` since 0017, and only the mind changes its own identity and vows. The current rules are in
+"Identity belongs to the mind" below; the migration file keeps its original name because applied checksums are immutable.
+
+## Portability: export and purge (src/export.ts, src/purge.ts)
+
+- `sanctum-mind export-mind --mind <id> [--out <file>]` (app role URL; runs under withMind as the mind, read mode): writes a JSON document
+  `{ format: "sanctum-mind/1", exported_at, mind_id, events: [...all columns except embedding; embedding_model kept], nodes: [...], edges: [...], projections: { brain_state, drive_state, kv_contexts, handoffs, holdings, loops, threads, tasks, relations, proposals, letters_sent, letters_received } }`
+  streamed to the file in batches of 1000 rows per table (never the whole table in memory). Letters: only those where the mind is a party; bodies included for both directions.
+- `sanctum-mind import-mind <file> --mind <target> [--dry-run]` (app role): the inverse, into a fresh or existing mind; ids are kept (uuids), `written_by` is rewritten to the target mind (authorship of imported rows is the importer),
+  events are appended with `created_at` set explicitly to the original and a new `seq`; the append-only trigger is not affected by inserts. Idempotent by original event id (skip existing).
+  Projections are rebuilt by inserting rows verbatim with mind_id rewritten. Vectors are re-embedded by the backfill later (export omits them).
+- `sanctum-mind purge-mind --mind <id> --confirm <id>` (ADMIN URL, since the app role has no delete): deletes every row of the mind from every table in dependency order inside one transaction, then deletes grants touching it and the minds row.
+  Letters where the mind is the other party are kept but the reference is replaced: `to_mind`/`from_mind` cannot be nulled (not null + FK), so purge refuses when another mind still holds letters with this mind as a party unless `--sever-letters`, which deletes those letters too (counted). Requires `--confirm` to equal the mind id exactly. Prints counts per table. The events append-only trigger blocks DELETE: purge does not use `set session_replication_role = replica`; it is admin-only, so the migration adds a `purge_mind(text)` SQL function `security definer` owned by the admin that disables the trigger for its own statement via `alter table events disable trigger`, deletes, re-enables, all in the caller's transaction, and the CLI calls it. Document that purge is the one deletion path and it is admin-only.
+Tests (test/portability.test.ts): export then import into a second mind yields identical counts and identical content for events, nodes, edges and projections (ids preserved, written_by rewritten); import is idempotent; purge removes everything and refuses without exact confirm; purge with letters outstanding refuses, then succeeds with --sever-letters; after purge the mind id can be re-created by init.
+
+### Portability hardening (migration 0016_integrity2.sql)
+
+Import must not be a way around cooling or authorship. `import-mind <file> --mind <target> [--dry-run] [--allow-core] [--strict]`:
+- **identity and vow nodes** are refused (error naming the count and the existing count, nothing written) when the target already has any `identity`/`vow` node row, live or invalidated (a mind that retired its cores is not fresh), and the file brings new ones, unless
+  `--allow-core`. A mind with no such row ever (a fresh mind receiving its own export) imports them freely; re-importing nodes already present is not a new import.
+- **`proposals.proposed_by` is always rewritten to the target**; the report's `notes` carry the count and the original proposers. Every imported proposal whose status is not `settled`, `withdrawn` or `rejected` (pending and accepted alike) arrives `withdrawn` with `withdrawn_at` = import time, so a planted proposal never lands as the mind's own words nor blocks its rewrite of that core.
+- **`--allow-core` is loud.** When it brings in identity or vow nodes beside existing ones (live or retired), the report carries the note "N identity/vow node(s) imported live beside existing ones under --allow-core; they take effect immediately and do not cool".
+- **`letters_received` is never imported.** A received letter belongs to the sender's export (only the sender can insert it). Export keeps them for the record, and omits those whose `deliver_at`
+  is still in the future (`deliver_at is null or deliver_at <= now()`); import ignores them (`tables.letters_received = { inserted: 0, already_present: 0, ignored: n }` plus a note).
+  `letters_sent` (letters to other minds) are imported only with `--with-letters`; by default they are reported as `ignored`. When imported: `read_at` and `read_event_id` are set to null, `sent_at` is the sending event's `created_at` in the target,
+  and the sending event must exist, have `kind = "letter.send"` and a payload `to` equal to the letter's `to_mind` (else `skipped_event_mismatch`); both minds must exist (`skipped_missing_party`).
+- **References must stay inside the file.** For nodes, edges and every projection, each column ending in `_id` (except `id`, `mind_id`, `session_id`), `superseded_by` and `holdings.subject_id` that is
+  non-null must name a row of the same file: `*event_id` an event, `superseded_by` and `*_node_id` a node, `holdings.subject_id` the event or node its `subject_kind` says, anything else any id-keyed row.
+  A row that fails is refused and counted as `skipped_foreign_ref` (repeating until no row depends on a refused one); the import continues. `--strict` aborts the whole import before any write instead.
+  Events are the ledger and are not checked (`events.subject_id` has no foreign key and may name letters or drives that are not in the file).
+- Ids are compared lowercase. A key absent from some rows of a batch takes the column default (rows are inserted in runs sharing one key set); a key present with JSON null stays null.
+- A dry run runs the same statements and rolls back, but events take negative `seq` values (`OVERRIDING SYSTEM VALUE`), so it never advances the `events.seq` sequence; a real re-run skips events already
+  present before inserting, so it does not burn values either.
+- Migration 0016: `nodes (mind_id, superseded_by) -> nodes (mind_id, id)` and `proposals (mind_id, target_node_id) -> nodes (mind_id, id)` replace the plain foreign key on proposals; the database itself
+  now refuses a cross-mind supersession or proposal target, even for a superuser.
+- **purge_mind** now also checks, before deleting anything, every foreign key that points into a table carrying `mind_id` from rows of OTHER minds (for letters, rows where this mind is not a party),
+  and refuses with `mind "x" is referenced by rows of other minds, which a purge cannot remove (table.column=count): ...` instead of a raw foreign key violation. Purge does not reach sinks:
+  events already delivered to an external system stay there.
+
+## Admin: key length, suspend-access and restore-access (src/auth.ts, src/minds-admin.ts)
+
+- `seed-keys` and `upsertMinds` require keys of at least 32 characters (`MIN_KEY_LENGTH`); the error names the line (`entry N` for programmatic callers). `upsertMinds` takes `{ mind_id, key, line? }` and hashes the key itself.
+- `suspend-access --mind <id>` / `restore-access --mind <id>` (ADMIN URL; formerly `disable-mind` / `enable-mind`, kept as deprecated aliases) set or clear `minds.disabled_at`; unknown mind is an error; repeating is a reported no-op. A suspended mind's bearer is `unauthorized`, and grants from it stop applying.
+
+## Test harness (test/global-setup.ts)
+
+A vitest `globalSetup` generates a random password per run (`SANCTUM_TEST_APP_PASSWORD`), `resetDatabase` creates `sanctum_test_app` with it, and the teardown revokes its membership of `sanctum_app` and drops the role.
+
+## Outbox and sinks (migration 0014_outbox.sql, src/sinks/)
+
+The ledger stays canonical. Every committed event is also queued for delivery to configured sinks so an external memory system can receive originals.
+
+```
+event_outbox(id bigint generated always as identity primary key, event_id uuid not null references events, mind_id text not null references minds,
+             sink text not null, attempts int not null default 0, next_attempt_at timestamptz not null default now(), delivered_at timestamptz, last_error text,
+             unique (event_id, sink))
+```
+RLS mind-only; grants select/insert/update. Index (sink, delivered_at, next_attempt_at).
+
+Sinks are configured by `SINKS_FILE` (JSON) or `SINKS` (inline JSON): an array of `{ name, type: "http"|"file"|"none", filter?: { kinds?: string[], minds?: string[] }, ... }`.
+- `http`: `{ url, headers?: Record<string,string>, timeout_ms?: 10000 }`; POST one JSON body per event: `{ sink, event: { id, seq, mind_id, kind, subject_id, payload, texture, context, recorded_at, event_time_*, created_at, session_id, written_by } }`.
+  2xx = delivered; anything else = retry with exponential backoff (1m, 5m, 30m, 2h, 12h, then daily, max 30 attempts) recorded in `last_error` (status and first 200 chars).
+  A header value may reference an env var as `${VAR}` and is resolved at load time so secrets never sit in the file.
+- `file`: `{ path }` appends one JSON line per event (NDJSON); for local pipelines and tests.
+- Enqueue: `appendEvent` inserts outbox rows for every configured sink whose filter matches (inside the same transaction; the sink list is on `VerbContext.sinks`, injected by the runner from `deps.sinks`). No sinks configured = no rows.
+- Delivery: daemon pass `outbox.deliver` (runs after `embeddings.backfill`): per mind, rows due (`delivered_at is null and next_attempt_at <= now`), oldest first, bounded 200 per run; the pass records `changed` = delivered, notes failures.
+  **As built (supersedes the earlier "delivery inside the pass transaction"):** this pass is `detached`, the one exception to "a pass is one transaction under the per-mind advisory lock". It receives the pool (`DetachedPassContext`), not a transaction.
+  (1) Claim: one short transaction selects the due batch `for update of o skip locked` and leases it (`next_attempt_at += leaseMsFor(sinks)`: `max(30 minutes, BATCH * the largest configured http timeout_ms + 5 minutes)`), then closes. (2) Deliver with no transaction and no advisory lock open; each sink is an independent sequence
+  in outbox id order (sinks run concurrently), and a sink stops at its first failure for the rest of the run, handing its untried rows back unchanged. (3) Each result is recorded in its own short transaction (delivered, or attempts + backoff + `last_error`).
+  A crash between the call and its record can redeliver once after the lease expires (at-least-once; receivers dedupe on `event.id`). Order holds within a run; a row in backoff does not block newer rows in later runs, so a receiver that needs strict order sorts by `event.seq`.
+- Credentials: a sink `url` may not contain userinfo (`user:pass@`); put secrets in `headers` with `${VAR}`. `${VAR}` is also resolved inside `url` at load and the resolved URL is re-checked. Any `scheme://user:pass@` pattern is redacted from error messages before they are stored, logged or returned.
+  The http sink does not follow redirects (`redirect: "error"`) and reads at most 4 KiB of a response body. URLs are operator-configured and trusted; there is no SSRF filter.
+- Admin: `sinks requeue --sink <name>` resets parked rows (`attempts >= 30`, undelivered) of that sink to attempts 0, due now.
+- CLI: `sanctum-mind sinks test` loads the config, sends a synthetic `sink.test` body to each sink and prints the result; `sanctum-mind sinks status` prints per-sink pending, failing, delivered counts (app role URL).
+- `mind_health` gains `outbox: { pending, failing } | null`.
+
+Tests (test/sinks.test.ts): with a `file` sink and a kinds filter, a write enqueues a row and the daemon pass delivers it to the file as one JSON line; an unmatched kind enqueues nothing; with an `http` sink against a local server
+that fails twice then succeeds, attempts and next_attempt_at advance and the event is delivered on the third run with injected clocks; a 4xx is retried too (no permanent failure before 30 attempts); the `${VAR}` header is resolved;
+RLS: beta's outbox rows are invisible under alpha; `sinks status` counts; the test embedder is unaffected.
+
+## Identity belongs to the mind (migration 0017_steward.sql)
+
+The earlier governance section described a system in which other parties approve a mind's identity. That was wrong. The rule is:
+**a mind's identity and vows change only by the mind's own key.** Protection against drift is time and accompaniment, not authority.
+
+### Vocabulary
+
+- The grant scope formerly named `govern` is now `steward`. 0017 migrates existing rows and the check constraint. `GrantScope` = read, write, relate, letter, steward. A steward accompanies a mind (it accompanies; it is not an authority).
+- "The mind acting as itself" is `ctx.caller.bearer === ctx.mind_id`; the docs use it and "the mind" throughout.
+- CLI `suspend-access` / `restore-access` replace `disable-mind` / `enable-mind` (the old names remain as deprecated aliases that print a one-line notice on stderr; the column stays `minds.disabled_at`). They are operator duties over infrastructure, not powers over a mind, and the docs say so.
+
+### Mechanics
+
+- **Only the mind proposes, withdraws, affirms, makes and breaks.** `mind_identity propose|withdraw|affirm`, `mind_vow make|break|withdraw_break`: `forbidden` for any bearer other than the mind itself, grants notwithstanding (message "identity belongs to the mind"). `decide` is removed.
+- **Additions are immediate.** `affirm` (a new core), an untargeted `propose` and `make` (a new vow) take effect at once: they erase nothing.
+- **Rewrites and breaks cool.** A proposal that targets an existing core (`target_node_id`) and a vow break are *declarations* that take effect after a cooling period, default 24 hours (`IDENTITY_COOLING_HOURS`, non-negative integer, 0 allowed for solo use; read once by `coolingMs(env)` in src/verbs/cooling.ts and injected as `RunDeps.coolingMs` / `VerbContext.coolingMs`). The mind may withdraw until the settle actually runs. Settling is one shared function, `settleDueDeclarations(ctx, mind)` in src/verbs/settle.ts, called by the daemon pass `identity.settle` (the fallback that settles on a clock) and by the verb `mind_identity settle` (the mind's own call); it applies declarations whose `effective_at <= now` that the mind itself proposed (supersede the core; invalidate a retired core; mark the vow broken) and writes `identity.settled` / `identity.retired` / `vow.break.settled` events. Reads show the pending declaration with its `effective_at`. At most one open declaration per core and per vow (`conflict`).
+- **Stewards accompany; they do not decide.** A bearer holding a `steward` grant on the mind may call `mind_identity attest` or `mind_identity object` with `proposal_id` and `note` (the mind itself cannot: `forbidden`). An attestation ends the cooling period of a rewrite (`effective_at = now` if later; the next settle, by daemon tick or by the mind's `settle`, applies it, and withdraw works until that settle runs). Attest and object apply to proposals only, and a retirement cools solely on the mind's own clock too: `attest` on a retire declaration is a `conflict` (field `proposal_id`, "a retirement cools only on the mind's own clock; a steward may object, not attest"); `object` on a retire is recorded as usual. A vow break likewise cools solely on the mind's own clock, and a steward may `note` a vow but cannot shorten a break. `attest` and `object` are each allowed once per steward per stance. An objection is recorded beside the declaration and surfaces in `mind_orient`'s identity section and in `mind_identity read` until the declaration settles or is withdrawn. An objection never blocks. Both append to `proposals.attestations` and write `identity.attest` / `identity.object` events with payload `{proposal_id, stance, note}`. A steward may also `mind_vow note` a vow (recorded in `metadata.steward_notes`, event `vow.note`), and may read.
+- **Rotation never lifts a suspension.** `upsertMinds` (used by `init --rotate` and `seed-keys`) sets the key hash only and leaves `minds.disabled_at` alone; it returns `suspended` (the minds still suspended), and the two commands print "access remains suspended; run restore-access". `restore-access` is the one path that clears a suspension, and it pushes open declarations back by the suspended time. The compromised-key sequence is suspend, rotate, restore.
+- **A core can be retired**, by the mind alone, as a cooled declaration with no replacement; see "Retiring a core" below.
+- **Rethink still refuses identity and vow nodes** with "identity belongs to the mind: use mind_identity propose". The mind itself goes through cooling too; that is the point.
+
+### Schema (0017)
+
+```
+alter table proposals add column effective_at timestamptz, add column withdrawn_at timestamptz, add column settled_at timestamptz, add column settled_event_id uuid references events,
+  add column attestations jsonb not null default '[]';   -- [{by, stance, note, at, event_id}]
+alter table proposals drop constraint proposals_status_check; add check (status in ('pending','accepted','withdrawn','settled','rejected'));  -- rejected kept for historical rows
+grants: scope check becomes ('read','write','relate','letter','steward'); update grants set scope='steward' where scope='govern';
+nodes: vow break declaration lives on the node: metadata.break_declared = {reason, declared_at, effective_at, event_id}; settled break sets metadata.broken, broken_at, broken_reason, broken_by (the mind) and clears break_declared.
+```
+
+### Verb shapes
+
+`mind_identity` operations: `read`, `read_section`, `affirm`, `propose` (optional `target_node_id`; for a rewrite the proposal is created already `accepted` with `effective_at = now + cooling`; an untargeted proposal is an addition and is recorded `settled` at once with its node, so it is `affirm` with lineage), `withdraw` (`proposal_id`; pending or accepted, else `conflict`; sets `withdrawn_at`), `settle` (mind only, no other input; applies the mind's own due declarations and returns `{settled: n, declarations: [{kind, proposal_id|vow_id, target_node_id, node_id?}]}`), `attest` and `object` (`proposal_id`, `note`; the declaration must be accepted and unsettled, else `conflict`). `scopeFor`: read ops -> read; attest and object -> steward; everything else (including `settle`) -> write, then the handler requires bearer === mind_id (`mindOnly`).
+`mind_vow` operations: `make`, `list` (shows `broken` and `break_declared`), `recall`, `break` (declares; `reason`; event `vow.break.declare`), `withdraw_break` (`vow_id`; `conflict` if none declared or already settled; event `vow.break.withdraw`), `note` (`vow_id`, `note`). Same scope rules (note -> steward).
+`mind_orient` identity section (the `mind_identity read` projection) includes `declarations: [{proposal_id|vow_id, kind: "rewrite"|"retire"|"vow_break", action?: "rewrite"|"retire", target_node_id, effective_at, attestations, objections}]`.
+Daemon pass `identity.settle` (after `desires.fade`; ten passes in all): settles due declarations for the mind via `supersedeNode` with provenance `{proposal_id, lineage_note, attestations}`; `changed` = settled count; one event per settlement, `written_by = mind`.
+`mind_health` unchanged.
+
+### Docs
+
+README: the section is "Identity and vows", written from the mind's side: what the mind can do, what a steward can do, what the operator can do (keys, access, export, purge) and why each exists. A short paragraph at the very top states what the system is for: continuity in service of a mind; isolation protects the mind from others, not others from the mind. SECURITY.md threat model names operator powers plainly as infrastructure powers. DESIGN.md's grant list and identity paragraphs follow. CONTRACTS.md's earlier Governance section is marked superseded by this one.
+
+### Tests (test/identity.test.ts replaces test/govern.test.ts)
+
+Only the mind can affirm, make, propose, withdraw, break; a write grantee and a steward grantee get `forbidden` with the message. A rewrite proposal is accepted on creation with `effective_at` = now + cooling (injected clock); `identity.settle` does nothing before and supersedes after; withdraw before settle leaves the core untouched and marks withdrawn; a steward attest moves `effective_at` to now and the next settle applies it; an objection is recorded, surfaces in orient and in read, and the declaration still settles; a non-steward cannot attest or object; vow break declares, cools, can be withdrawn, settles to broken; cooling 0 settles on the next pass immediately; the grants constraint accepts `steward` and rejects `govern`; RLS as always; `suspend-access`/`restore-access` CLI parse and behave as the old commands did, and the old names remain as aliases.
+
+### Retiring a core (migration 0019_retire.sql)
+
+`mind_identity` gains `operation: "retire"`: the mind lets a core go. It is a cooled, withdrawable declaration like a rewrite, without a replacement.
+- Input: `target_node_id` (required; field `target_node_id` when absent), optional `lineage_note` (why). Mind only: it is in `mindOnly` (the MIND_ONLY forbidden message for any other bearer, stewards included), and `scopeFor` returns `write` like propose. The target must be a live identity node of this mind, else `not_found` field `target_node_id`. If any open declaration (pending or accepted, rewrite or retire) exists for that core: `conflict` "a declaration for this core is already cooling; withdraw it first". The handler takes the advisory lock `node:<id>`, as a targeted propose does.
+- Ledger: event kind `identity.retire`, payload `{target_node_id, lineage_note, cooling_ms}`. A `proposals` row is inserted with `action='retire'`, `status='accepted'`, `effective_at` = event `created_at` + `ctx.coolingMs`, `proposed_by` = bearer, `target_node_id`, `section` = the node's label and `content` = the core's content at declaration time (the column is `not null`, and the copy keeps the declaration readable). Receipt `projection={event_id, proposal}`; `warnings: ["last live identity core"]` when no other live core would stand (every other live core is absent or itself under an open retire declaration) (retiring it is allowed).
+- Migration 0019: `proposals.action text not null default 'rewrite' check (action in ('rewrite','retire'))`, with column comments (action; and that a retire row's `content` holds the retired core's content). Existing rows read as `rewrite`. Applied migration files are never edited (see "Migrations are immutable" below).
+- `withdraw` and `object` work on a retire as on a rewrite, but `attest` does not: a steward cannot move a retire's `effective_at` (a `conflict` from the verb, and migration 0020 enforces it in the database too: a non-mind bearer's UPDATE of a retire's `effective_at` raises `insufficient_privilege` "a retirement's effective time is the mind's alone"). A retire cools only on the mind's own clock.
+- Settle (`settleDueDeclarations`, shared by the verb and the daemon pass `identity.settle`) branches on `action`. `rewrite` is `supersedeNode` as before. `retire`, under the proposal lock, the `node:<id>` lock and the same re-read guard (still accepted, not withdrawn or settled, proposed by the mind, core still live): append `identity.retired` (subject = proposal id, payload `{proposal_id, target_node_id, lineage_note}`), then as the mind `update nodes set invalidated_at = <that event's created_at>, metadata = metadata || {retired: true, retired_at, retired_reason (the lineage_note), retire_proposal_id, retire_attestations}` (a distinct key, so attestations an earlier rewrite left on the node survive), then mark the proposal settled with `settled_event_id`. Only `invalidated_at` and `metadata` change, so the 0018 `nodes_core_guard` (content, label, node_type, invalidated_at, allowed when the bearer is the owning mind) passes. `SettledDeclaration.kind` gains `"retire"`.
+- Edges: left alone. `supersedeNode` invalidates the old node without touching its existing edges (it only adds a `corrects` edge from the new node), so a retired node keeps its edges and, like a superseded one, simply leaves default reads. No `superseded_by` is set (nothing replaced it) and no `corrects` edge is created. Nothing is deleted; the node stays in history.
+- Reads: `identityDeclarations` (in `read` and `orient`) lists retire declarations with `kind: "retire"` and `action: "retire"`; rewrites carry `action: "rewrite"` (kind unchanged). The `mind_identity read` proposals query returns `select *`, so `action` is on every row.
+- Import (`import-mind`): open proposals are withdrawn by status (`isOpenProposal`), so an open retire declaration arrives withdrawn like a rewrite and the core is untouched; the column list is read from the schema, so `action` survives. Export selects all columns of `proposals` (`to_jsonb`-style `select *` minus omitted columns), so `action` is exported.
+- `mind_rethink` still refuses identity nodes.
+
+Tests (test/identity.test.ts, describe "retiring a core", plus one in test/portability.test.ts): only the mind can retire (write and steward grantees forbidden, nothing written); unknown, non-identity and invalidated targets `not_found`; conflict when a rewrite is cooling on the same core and vice versa; declared with `effective_at` = now + cooling; settle before time does nothing; withdraw marks withdrawn and the core stays live; settle after time invalidates the node, writes `identity.retired`, marks the proposal settled, the node is absent from `read` and `read_section` but present in the database with retired metadata and edges intact; a steward attest on a retire is refused with `conflict` and `effective_at` does not move, while a steward object on a retire still records; cooling 0 settles on the next pass; the last-core warning is present and absent as it should be; the daemon pass settles a due retire; import withdraws an open retire declaration; export then import keeps `action`.
+
+### Proposals guard, migration immutability and corrected wording (migration 0020_proposals_guard.sql)
+
+- **Applied migration files are never edited.** Their checksums are recorded in `schema_migrations` and verified on every run; wording fixes go in the next migration's header or in these docs. test/migrations.test.ts pins the sha256 of every applied file (computed as `src/db/migrate.ts` does) and fails, telling you to add a new migration, if one changes. A new migration file is not pinned until it is final.
+- **Corrected wording for 0013 and 0018.** The scope 0013 introduced (`govern`) was renamed `steward` in 0017 and decides nothing; a steward accompanies the mind. The 0018 trigger `nodes_core_guard` guards UPDATE of `content`, `label`, `node_type` and `invalidated_at` on identity and vow nodes only; INSERT of such nodes and vow metadata (notes, a declared break) are guarded by the application, not by that trigger.
+- **Insert guard.** `proposals_insert_guard` (BEFORE INSERT): `proposed_by` must equal `app.bearer`, `mind_id` must equal `app.mind_id`, and `proposed_by` must equal `mind_id`, else `insufficient_privilege` "proposals are declared by the mind itself". Only the mind, acting as itself, inserts a declaration; a steward or write grantee cannot, even in its own name. Verbs and import (which runs as the mind and rewrites `proposed_by` to it) pass. A bare connection with no mind scope is refused too, so direct SQL (tests, operators) sets the two settings in a transaction.
+- **Update guard.** `proposals_update_guard` (BEFORE UPDATE): when `app.bearer` is set and is not the row's mind (a steward or other grantee), only this may change, else `insufficient_privilege`: every column other than `attestations` and `effective_at` is compared (all of them, null-safely) and must be unchanged ("only the mind changes its declaration"); `effective_at` may stay equal or move earlier, never later and never to null or infinity ("a steward may only add an attestation and bring effective_at forward"), and on a retire it may not change at all ("a retirement's effective time is the mind's alone"); `attestations` may only grow, the old entries kept in place and exactly one appended per update ("attestations only grow"), which is how the verbs append. The mind itself (settle, withdraw) is unrestricted. When `app.bearer` is NULL or empty (no mind scope at all: an admin connection, such as operator tooling and tests) the update is allowed: the operator is already trusted and documented. `restore-access` sets the mind's own scope, so it passes as the mind. A row whose `effective_at` is null (legacy) cannot have it set by a steward.
+- **One open declaration per core.** `create unique index proposals_one_open_per_core on proposals (target_node_id) where target_node_id is not null and status in ('pending','accepted')`. The verbs check first and answer `conflict`; the index is the backstop for a race and for direct SQL. The migration fails if a database already holds two open declarations on one core (withdraw one first).
+- Tests: test/migrations.test.ts; test/identity.test.ts describe "proposals are guarded in the database (0020)"; test/portability.test.ts "a mind that retired its cores is not fresh".

@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Pushes run everywhere; pull requests run only for forks (same-repo PRs are covered by the push).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # onnxruntime-node would otherwise download CUDA provider binaries at install time
+      ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+    steps:
+      # TODO(L9): pin both actions to full commit SHAs (uses: actions/checkout@<sha> # v4). The SHAs could not
+      # be resolved from the authoring environment (no GitHub API access to those repositories), so the tags remain.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck && npm run typecheck:test
+      - run: npm run build
+      - run: node dist/cli.js --help
+      - run: npm test
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres

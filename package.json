@@ -1,0 +1,45 @@
+{
+  "name": "sanctum-mind",
+  "version": "2.0.0-alpha.0",
+  "description": "Construct-neutral continuity substrate: one owned Postgres, append-only ledger, deterministic projections, any number of minds.",
+  "type": "module",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "sanctum-mind": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "SECURITY.md",
+    "ACKNOWLEDGEMENTS.md",
+    "LICENSE.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "start": "tsx src/cli.ts",
+    "dev:http": "tsx src/cli.ts http",
+    "dev:stdio": "tsx src/cli.ts stdio"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "fastembed": "3.0.0",
+    "pg": "8.23.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.3",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.3"
+  }
+}
