@@ -3,6 +3,7 @@
 
 import type { PoolClient } from "pg";
 import { normaliseInstant } from "./texture.js";
+import { bookkeepingExcluded } from "../extractor/events.js";
 
 /** Reciprocal rank fusion constant and per-list depth, from CONTRACTS.md. */
 export const RRF_K = 60;
@@ -74,7 +75,7 @@ function filterSql(table: Table, f: Filters, params: unknown[]): string {
     return `$${params.length}`;
   };
   if (table === "events") {
-    out.push("kind not like 'notice.%'"); // bookkeeping about proposals, not memory
+    out.push(bookkeepingExcluded()); // bookkeeping, not memory (repair.retired is a change to memory and stays)
     if (f.kind !== undefined) out.push(`kind = ${bind(f.kind)}`);
     if (f.context !== undefined) out.push(`context = ${bind(f.context)}`);
   } else {

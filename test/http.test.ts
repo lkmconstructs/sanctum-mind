@@ -197,7 +197,7 @@ describe("POST /mcp", () => {
   it("tools/list exposes both tools with a mind_id pattern in the input schema", async () => {
     const r = await mcp(TEST_KEYS.alpha, { jsonrpc: "2.0", id: 1, method: "tools/list" });
     const tools = r.json.result.tools as any[];
-    expect(tools.map((t) => t.name).sort()).toEqual(["mind_anchor", "mind_context", "mind_desire", "mind_drive", "mind_handoff", "mind_health", "mind_identity", "mind_letter", "mind_link", "mind_loop", "mind_notice", "mind_observe", "mind_orient", "mind_relate", "mind_resolve", "mind_rethink", "mind_search", "mind_sit", "mind_state", "mind_surface", "mind_task", "mind_thread", "mind_vow", "mind_weather", "mind_write"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["mind_anchor", "mind_attend", "mind_context", "mind_desire", "mind_drive", "mind_handoff", "mind_health", "mind_identity", "mind_letter", "mind_link", "mind_loop", "mind_notice", "mind_observe", "mind_orient", "mind_relate", "mind_resolve", "mind_rethink", "mind_search", "mind_sit", "mind_state", "mind_surface", "mind_task", "mind_thread", "mind_vow", "mind_weather", "mind_write"]);
     for (const t of tools) {
       expect(t.inputSchema.type).toBe("object");
       expect(typeof t.inputSchema.properties.mind_id.pattern).toBe("string");

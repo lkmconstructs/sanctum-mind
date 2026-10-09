@@ -18,6 +18,9 @@ import { SALIENCE_VALUE, type NoticingKind } from "./features.js";
  * days back). Rows are compared against every eligible row from the lookback (EXTRACTOR_LOOKBACK_DAYS, default 30), so a new node
  * can link to one from three weeks ago and a pattern can recur across days. Every candidate must contain at least one new row
  * (a metabolized `sit` resolved since `newStart` counts as the new fact for its own distillation); clusters may mix new and older rows.
+ * Attention: a row the mind is attending to (`Window.attended`: its pinned nodes and events, and what its top attention items rest
+ * on) counts as new for this run whatever its age, so attended things are noticed sooner, and carries `attended` for the feature of
+ * that name. It must still be eligible and inside the lookback and the newest-400 cap: attention changes what is new, not what is eligible.
  */
 export const LINK_COSINE = 0.6;
 export const CLUSTER_COSINE = 0.55;
@@ -44,8 +47,10 @@ export interface Item {
   keys: string[];
   charge: string[];
   salience: number | null;
-  /** appended since the last completed run */
+  /** appended since the last completed run, or attended to (see Window.attended) */
   isNew: boolean;
+  /** the mind is attending to this row: pinned, or under a top attention item */
+  attended: boolean;
 }
 
 export interface Window {
@@ -54,6 +59,8 @@ export interface Window {
   /** rows appended at or after this are new */
   newStart: Date;
   end: Date;
+  /** ids of nodes and events the mind is attending to: treated as new for this run. Absent means none. */
+  attended?: ReadonlySet<string>;
 }
 
 export interface Candidate {
@@ -147,14 +154,20 @@ interface NodeRow {
   id: string; text: string; created_at: Date; context: string | null; session_id: string | null; texture: unknown; emb: string | null;
 }
 
-const eventItem = (r: EventRow, newStart: Date): Item => ({
-  id: r.id, type: "event", text: r.text, ...parseVec(r.emb), created_at: r.created_at, context: r.context,
-  keys: keysOf(r.session_id), ...textureOf(r.texture), isNew: r.created_at.getTime() >= newStart.getTime(),
-});
-const nodeItem = (r: NodeRow, newStart: Date): Item => ({
-  id: r.id, type: "node", text: r.text, ...parseVec(r.emb), created_at: r.created_at, context: r.context,
-  keys: keysOf(r.session_id), ...textureOf(r.texture), isNew: r.created_at.getTime() >= newStart.getTime(),
-});
+const eventItem = (r: EventRow, w: Window): Item => {
+  const attended = w.attended?.has(r.id) === true;
+  return {
+    id: r.id, type: "event", text: r.text, ...parseVec(r.emb), created_at: r.created_at, context: r.context,
+    keys: keysOf(r.session_id), ...textureOf(r.texture), isNew: attended || r.created_at.getTime() >= w.newStart.getTime(), attended,
+  };
+};
+const nodeItem = (r: NodeRow, w: Window): Item => {
+  const attended = w.attended?.has(r.id) === true;
+  return {
+    id: r.id, type: "node", text: r.text, ...parseVec(r.emb), created_at: r.created_at, context: r.context,
+    keys: keysOf(r.session_id), ...textureOf(r.texture), isNew: attended || r.created_at.getTime() >= w.newStart.getTime(), attended,
+  };
+};
 
 const EVENT_TEXT = `coalesce(nullif(btrim(payload->>'text'), ''), nullif(btrim(payload->>'content'), ''))`;
 /** The eligibility filter for events, applied to every events query here (window rows and sit subjects alike). Parameter $1 is the mind. */
@@ -183,7 +196,7 @@ export async function loadWindow(tx: PoolClient, mind: string, w: Window): Promi
       order by n.created_at desc, n.id limit $3`,
     [mind, w.start, MAX_ROWS],
   );
-  const nodes = nd.rows.map((r) => nodeItem(r, w.newStart)).sort(byTime);
+  const nodes = nd.rows.map((r) => nodeItem(r, w)).sort(byTime);
   const ids = nodes.map((n) => n.id);
   const edgePairs = new Set<string>();
   if (ids.length >= 2) {
@@ -211,7 +224,7 @@ export async function loadWindow(tx: PoolClient, mind: string, w: Window): Promi
          from events where mind_id = $1 and id = any($2::uuid[]) and ${EVENT_ELIGIBLE}`,
       [mind, evIds],
     );
-    for (const row of r.rows) subjects.set(row.id, eventItem(row, w.newStart));
+    for (const row of r.rows) subjects.set(row.id, eventItem(row, w));
   }
   if (ndIds.length > 0) {
     const r = await tx.query<NodeRow>(
@@ -220,13 +233,13 @@ export async function loadWindow(tx: PoolClient, mind: string, w: Window): Promi
          from nodes n where n.mind_id = $1 and n.id = any($2::uuid[]) and ${NODE_ELIGIBLE}`,
       [mind, ndIds],
     );
-    for (const row of r.rows) subjects.set(row.id, nodeItem(row, w.newStart));
+    for (const row of r.rows) subjects.set(row.id, nodeItem(row, w));
   }
   for (const h of held.rows) {
     const s = subjects.get(h.subject_id);
     if (s && s.vec !== null) metabolized.push(s);
   }
-  return { events: ev.rows.map((r) => eventItem(r, w.newStart)).sort(byTime), nodes, edgePairs, metabolized };
+  return { events: ev.rows.map((r) => eventItem(r, w)).sort(byTime), nodes, edgePairs, metabolized };
 }
 
 // ---------- text for payloads ----------

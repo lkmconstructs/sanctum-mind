@@ -200,14 +200,63 @@ export interface ExtractorReport {
   acceptance_by_kind: Record<string, { accepted: number; decided: number; rate: number | null }>;
   /** The latest model row (null while the hand-set prior, version 0, is in use). */
   model: { version: number; trained_on: number; created_at: Date; metrics: Record<string, number> } | null;
+  /** Belief repair (kind repair), counted apart from the extractor's proposals above and below: those never include it. */
+  repairs: RepairReport;
   /** The latest row of each scheduled pass in extractor_runs (null if it never ran). notes are counts and short reasons. */
   last_runs: Record<string, { started_at: Date; ok: boolean; notes: Record<string, unknown> } | null>;
 }
 
+export interface RepairReport {
+  total: number;
+  by_status: Record<string, number>;
+  last_30_days: number;
+  /** What the mind answered when it accepted a repair: keep, rethink or retire (counts). */
+  decisions: { keep: number; rethink: number; retire: number };
+  /** Share of decided repairs (accepted + rejected + expired) that went each way; null until one is decided. */
+  rates: { keep: number | null; rethink: number | null; retire: number | null; rejected: number | null; expired: number | null };
+  decided: number;
+}
+
+async function repairReport(c: PoolClient, mind: string, since: Date): Promise<RepairReport> {
+  const st = await c.query<{ status: string; n: string; recent: string }>(
+    `select status, count(*) as n, count(*) filter (where created_at >= $2) as recent from noticings where mind_id = $1 and kind = 'repair' group by status`,
+    [mind, since],
+  );
+  const by_status: Record<string, number> = {};
+  let total = 0;
+  let recent = 0;
+  for (const r of st.rows) {
+    by_status[r.status] = Number(r.n);
+    total += Number(r.n);
+    recent += Number(r.recent);
+  }
+  const dec = await c.query<{ decision: string | null; n: string }>(
+    `select d.payload->>'decision' as decision, count(*) as n
+       from noticings n join events d on d.id = n.decided_event_id
+      where n.mind_id = $1 and n.kind = 'repair' and n.status = 'accepted' group by 1`,
+    [mind],
+  );
+  const decisions = { keep: 0, rethink: 0, retire: 0 };
+  for (const r of dec.rows) if (r.decision === "keep" || r.decision === "rethink" || r.decision === "retire") decisions[r.decision] = Number(r.n);
+  const decided = (by_status.accepted ?? 0) + (by_status.rejected ?? 0) + (by_status.expired ?? 0);
+  const rate = (n: number): number | null => (decided >= 1 ? n / decided : null);
+  return {
+    total, by_status, last_30_days: recent, decisions, decided,
+    rates: { keep: rate(decisions.keep), rethink: rate(decisions.rethink), retire: rate(decisions.retire), rejected: rate(by_status.rejected ?? 0), expired: rate(by_status.expired ?? 0) },
+  };
+}
+
+const fmtRepairs = (r: RepairReport): string => {
+  if (r.total === 0) return "none proposed";
+  const p = (v: number | null) => (v === null ? "n/a" : `${(v * 100).toFixed(1)}%`);
+  const status = Object.entries(r.by_status).sort().map(([k, v]) => `${k} ${v}`).join(", ");
+  return `${r.total} total (${r.last_30_days} in the last 30 days); ${status}; decisions: keep ${r.decisions.keep} (${p(r.rates.keep)}), rethink ${r.decisions.rethink} (${p(r.rates.rethink)}), retire ${r.decisions.retire} (${p(r.rates.retire)}); rejected ${p(r.rates.rejected)}, expired ${p(r.rates.expired)} of ${r.decided} decided`;
+};
+
 async function counts(c: PoolClient, mind: string, since: Date | null): Promise<Counts> {
   const r = await c.query<{ status: string; kind: string; stage: string; n: string }>(
     `select status, kind, stage, count(*) as n from noticings
-      where mind_id = $1 and ($2::timestamptz is null or created_at >= $2) group by status, kind, stage`,
+      where mind_id = $1 and kind <> 'repair' and ($2::timestamptz is null or created_at >= $2) group by status, kind, stage`,
     [mind, since],
   );
   const out: Counts = { total: 0, by_status: {}, by_kind: {}, by_stage: {} };
@@ -236,7 +285,7 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
       const r = await c.query<{ accepted: string; decided: string }>(
         `select count(*) filter (where status = 'accepted') as accepted,
                 count(*) filter (where status in ('accepted', 'rejected', 'expired')) as decided
-           from noticings where mind_id = $1 and stage = 'propose' and ($2::timestamptz is null or created_at >= $2)`,
+           from noticings where mind_id = $1 and kind <> 'repair' and stage = 'propose' and ($2::timestamptz is null or created_at >= $2)`,
         [mind, from],
       );
       const a = Number(r.rows[0]!.accepted);
@@ -254,7 +303,7 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
     const kinds = await c.query<{ kind: string; accepted: string; decided: string }>(
       `select kind, count(*) filter (where status = 'accepted') as accepted,
               count(*) filter (where status in ('accepted', 'rejected', 'expired')) as decided
-         from noticings where mind_id = $1 and stage = 'propose' group by kind`,
+         from noticings where mind_id = $1 and kind <> 'repair' and stage = 'propose' group by kind`,
       [mind],
     );
     const acceptance: ExtractorReport["acceptance_by_kind"] = {};
@@ -270,7 +319,7 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
       )
     ).rows[0];
     const last_runs: ExtractorReport["last_runs"] = {};
-    for (const pass of ["notice.extract", "notice.train"]) {
+    for (const pass of ["notice.extract", "notice.train", "notice.repair"]) {
       const r = await c.query<{ started_at: Date; ok: boolean; notes: Record<string, unknown> }>(
         `select started_at, ok, notes from extractor_runs where mind_id = $1 and pass = $2 order by started_at desc limit 1`,
         [mind, pass],
@@ -282,6 +331,7 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
       acceptance_by_kind: acceptance,
       model: mrow ?? null,
       last_runs,
+      repairs: await repairReport(c, mind, since),
       mind,
       state: st ? view(st) : { enabled: false, stage: "off", schedule: DEFAULT_SCHEDULE, paused: false },
       model_version: mv ?? 0,
@@ -304,6 +354,7 @@ const runNote = (n: Record<string, unknown>): string => {
   if (typeof n.proposed_total === "number") return ` (${n.proposed_total} proposed from ${String(n.candidates ?? "?")} candidate(s), reranker ${String(n.reranker ?? "?")})`;
   if (n.trained === false) return ` (not trained: ${String(n.reason ?? "")})`;
   if (n.trained === true) return ` (trained version ${String(n.version)})`;
+  if (typeof n.upstreams === "number") return ` (${String(n.proposed)} proposed for ${String(n.dependants)} dependant(s) of ${n.upstreams} changed node(s))`;
   return "";
 };
 
@@ -315,6 +366,7 @@ export function formatExtractorReport(r: ExtractorReport): string {
     `all time:     ${fmtCounts(r.all_time)}`,
     `last 30 days: ${fmtCounts(r.last_30_days)}`,
     `precision (shown to the mind, accepted / decided): ${pct(r.precision.value)} (${r.precision.accepted} of ${r.precision.decided}); last 30 days ${pct(r.precision.last_30_days)}`,
+    `repairs (counted apart): ${fmtRepairs(r.repairs)}`,
     `acceptance by kind (shown to the mind): ${
       Object.entries(r.acceptance_by_kind).sort().map(([k, v]) => `${k} ${v.rate === null ? "n/a" : `${(v.rate * 100).toFixed(1)}%`} (${v.accepted} of ${v.decided})`).join(", ") || "nothing shown yet"
     }`,

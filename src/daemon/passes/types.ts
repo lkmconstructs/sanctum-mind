@@ -11,6 +11,12 @@ import type { DaemonConfig } from "../config.js";
 /** A pass runs inside one write transaction scoped to one mind, authored by that mind, with the advisory lock held. */
 export interface PassContext extends VerbContext {
   config: DaemonConfig;
+  /**
+   * The node and event ids the mind is attending to right now (its pinned nodes and events, and what the top attention items
+   * rest on), wired by the daemon from the attention set. The extractor treats them as new for the current run. Absent in a
+   * context built without it (read as none).
+   */
+  attendedIds?: () => Promise<ReadonlySet<string>>;
 }
 
 export interface PassResult {

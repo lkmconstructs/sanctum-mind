@@ -222,7 +222,7 @@ describe("export", () => {
     expect(doc).toMatchObject({ format: "sanctum-mind/1", mind_id: "alpha" });
     expect(Object.keys(doc.projections)).toEqual([
       "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
-      "noticings", "extractor_state", "extractor_models", "extractor_runs", "letters_sent", "letters_received",
+      "noticings", "extractor_state", "extractor_models", "extractor_runs", "attention_pins", "letters_sent", "letters_received",
     ]);
     expect(doc.events).toHaveLength(2300);
     expect(doc.nodes).toHaveLength(2500);

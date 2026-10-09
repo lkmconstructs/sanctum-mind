@@ -13,6 +13,7 @@ import { embeddingsBackfill } from "./embeddings_backfill.js";
 import { lettersExpire } from "./letters_expire.js";
 import { noticeExpire } from "../../extractor/expire.js";
 import { noticeExtract } from "../../extractor/extract.js";
+import { noticeRepair } from "../../extractor/repair.js";
 import { noticeTrain } from "../../extractor/train.js";
 import { outboxDeliver } from "./outbox_deliver.js";
 
@@ -29,10 +30,11 @@ export const PASSES: readonly AnyPass[] = [
   outboxDeliver,
   lettersExpire,
   noticeExpire,
+  noticeRepair,
 ];
 
 /**
- * The model-backed passes of the extractor, listed apart from the eleven deterministic ones: each runs only for a mind whose
+ * The model-backed passes of the extractor, listed apart from the twelve deterministic ones: each runs only for a mind whose
  * extractor the operator has enabled, at most once a day at its schedule. They run after PASSES in a normal tick, and
  * report a "skipped" note when there is nothing to do.
  */

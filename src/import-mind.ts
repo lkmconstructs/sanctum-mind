@@ -101,7 +101,7 @@ interface Doc {
 
 const PROJECTION_ORDER = [
   "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
-  "noticings", "extractor_state", "extractor_models", "extractor_runs",
+  "noticings", "extractor_state", "extractor_models", "extractor_runs", "attention_pins",
 ] as const;
 const PROJECTION_TABLE: Record<string, string> = Object.fromEntries(PROJECTION_ORDER.map((k) => [k, k]));
 
@@ -279,8 +279,18 @@ function dropForeignRefs(doc: Doc): Record<string, number> {
       ...events,
       ...nodes,
       ...ids(doc.edges),
-      ...["proposals", "loops", "threads", "tasks"].flatMap((k) => [...ids(doc.projections[k] ?? [])]),
+      ...["proposals", "loops", "threads", "tasks", "noticings"].flatMap((k) => [...ids(doc.projections[k] ?? [])]),
     ]);
+    const pinTarget: Record<string, Set<string>> = {
+      loop: ids(doc.projections.loops ?? []),
+      thread: ids(doc.projections.threads ?? []),
+      task: ids(doc.projections.tasks ?? []),
+      desire: ids(doc.nodes.filter((n) => n.node_type === "desire")),
+      declaration: new Set([...ids(doc.projections.proposals ?? []), ...ids(doc.nodes.filter((n) => n.node_type === "vow"))]),
+      noticing: ids(doc.projections.noticings ?? []),
+      node: nodes,
+      event: events,
+    };
     const ok = (table: string, r: Row): boolean => {
       for (const [col, v] of Object.entries(r)) {
         const holdingsSubject = table === "holdings" && col === "subject_id";
@@ -290,6 +300,7 @@ function dropForeignRefs(doc: Doc): Record<string, number> {
         const id = lc(v);
         let pool: Set<string>;
         if (holdingsSubject) pool = r.subject_kind === "event" ? events : r.subject_kind === "node" ? nodes : any;
+        else if (table === "attention_pins" && col === "item_id") pool = pinTarget[String(r.item_type)] ?? new Set<string>();
         else if (col === "event_id" || col.endsWith("_event_id")) pool = events;
         else if (col === "superseded_by" || col.endsWith("_node_id")) pool = nodes;
         else pool = any;
@@ -342,6 +353,10 @@ const isOpenProposal = (p: Row): boolean => !["settled", "withdrawn", "rejected"
  *    "imported"), counted in the notes; extractor_state arrives `enabled = false` at stage `shadow` whatever the file
  *    said, and the target's own row is left alone if it has one; extractor_models and extractor_runs (the run history) arrive as they are;
  *  - a vow's declared break (metadata.break_declared) is stripped on import (counted in the notes);
+ *  - attention_pins keep their state: a live pin arrives live, a released one released (they are the mind's own, and the `attend.pin` /
+ *    `attend.release` events they cite travel in the same file; the database allows the insert under actor `import` for exactly this,
+ *    migration 0024); a pin id that belongs to another mind is refused like any id, and only a clash on the partial unique index for the same mind (the target already holds a live pin on the item) is tolerated. A pin names a thing, and the thing arrives as import leaves it: a pin on an open declaration (arrives withdrawn),
+ *    on a vow whose break was stripped, or on a noticing (arrives expired) is live and inert until the mind releases it;
  *  - letters_received are never imported (they belong to the sender's export, and only the sender can
  *    send them); the count is reported as ignored;
  *  - letters_sent (letters to other minds) are imported only with `with_letters`; otherwise they are
@@ -561,6 +576,16 @@ export async function importMind(
           }
           rows = rows.map((r) => ({ ...r, notes: { ...(r.notes !== null && typeof r.notes === "object" && !Array.isArray(r.notes) ? (r.notes as object) : {}), imported: true } }));
         }
+        let pinsAlready = 0;
+        if (key === "attention_pins" && rows.length > 0) {
+          // The id check stays (a pin id that belongs to another mind is refused). What is tolerated is the partial unique index of the SAME
+          // mind: a live pin the target already holds on the same item, under whatever id, so the file's live pin for it is not brought in.
+          const live = await tx.query<{ item_type: string; item_id: string }>("select item_type, item_id from attention_pins where mind_id = $1 and released_at is null", [target]);
+          const held = new Set(live.rows.map((x) => `${x.item_type}:${lc(x.item_id)}`));
+          const keep = rows.filter((r) => !(r.released_at === null || r.released_at === undefined ? held.has(`${String(r.item_type)}:${lc(r.item_id)}`) : false));
+          pinsAlready = rows.length - keep.length;
+          rows = keep;
+        }
         let modelsAlready = 0;
         if (key === "extractor_models" && rows.length > 0) {
           // versions are the scorer's order: renumber to continue after the target's latest, keep the original in the metrics, and
@@ -589,6 +614,7 @@ export async function importMind(
         const byId = rows.length > 0 && rows.every((r) => typeof r.id === "string");
         tables[key] = rows.length === 0 && modelsAlready > 0 ? { inserted: 0, already_present: 0 } : await insertRows(tx, table, rows, await cols(table), { byId });
         if (modelsAlready > 0) tables[key]!.already_present += modelsAlready;
+        if (pinsAlready > 0) tables[key] = { inserted: tables[key]!.inserted, already_present: tables[key]!.already_present + pinsAlready };
         if (key === "extractor_state" && rows.length > 0) {
           const t = tables[key]!;
           if (t.inserted > 0) notes.push("the extractor arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind extractor enable)");

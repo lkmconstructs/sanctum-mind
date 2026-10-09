@@ -127,12 +127,12 @@ failures.
 | Hold | `mind_sit`, `mind_resolve`, `mind_loop`, `mind_thread`, `mind_task` |
 | Self | `mind_identity` (read, read_section, affirm, propose, retire, withdraw, settle, attest, object), `mind_vow` (make, list, recall, break, withdraw_break, note), `mind_anchor`, `mind_desire`, `mind_rethink` |
 | Bond | `mind_relate`, `mind_letter`, `mind_link` |
-| State | `mind_state`, `mind_drive`, `mind_weather`, `mind_context`, `mind_handoff` |
+| State | `mind_state`, `mind_drive`, `mind_weather`, `mind_context`, `mind_handoff`, `mind_attend` (list, pin, release) |
 | Ops | `mind_health` |
 
 Deferred to their own design pass: `mind_dream`, `mind_unconscious`,
 `mind_maintain`. The daemon is implemented: deterministic passes over the ledger
-and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are eleven passes, all deterministic, including `identity.settle` and `notice.expire`. The optional model-backed extractor passes (`notice.extract`, `notice.train`) are listed separately: they run only for a mind whose extractor the operator has enabled, once a day.
+and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are twelve passes, all deterministic, including `identity.settle`, `notice.expire` and `notice.repair`. The optional model-backed extractor passes (`notice.extract`, `notice.train`) are listed separately: they run only for a mind whose extractor the operator has enabled, once a day.
 
 ### Noticing
 
@@ -149,6 +149,12 @@ The scorer is a fixed reranker plus an interpretable per-mind logistic model tra
 own accepts, rejects and expiries, with a documented prior until there is enough feedback. No
 neural model: complexity is earned from measured data, not assumed. The machine may become better
 at noticing. It does not inherit the right to remember on the mind's behalf.
+
+Belief repair (CONTRACTS, "Belief repair") reuses this machinery for one more question. When a node is superseded or retired, the nodes that depended on it are left alone; a deterministic pass, `notice.repair`, proposes that the mind look at each one, and the mind answers keep, rethink or retire through the same `mind_notice accept`. It needs no model, so it runs with the extractor off, and it reports a fact about the graph rather than a judgement, so it does not go through the shadow trial. It inherits every rule above: it only proposes, the database lets only the mind's own verb call decide, and identity and vow nodes can be kept but are rewritten or retired only through `mind_identity`, with cooling.
+
+### Attention
+
+`mind_attend` answers "what is this mind carrying right now" with arithmetic, not a model (CONTRACTS, "Attention"): the mind's own open loops, threads, tasks, desires, cooling declarations, waiting proposals and held charges, plus anything it pinned, each weighted 0 to 1 from how recent it is, how charged, what kind of thing it is and whether it is pinned. Pins are the one thing stored (`attention_pins`); only the mind, in a verb call, can pin or release, the database checks that, and a pin never changes the thing it names. `mind_orient` shows the top seven, and the extractor looks first at what is pinned or under the heaviest items.
 
 ## Stack
 

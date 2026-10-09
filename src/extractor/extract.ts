@@ -119,7 +119,9 @@ export const noticeExtract: DetachedPass = {
         const start = t !== null && t.getTime() > floor.getTime() ? t : floor;
         // new rows are those since the last completed run; they are compared against live rows from the lookback
         const lookback = new Date(started.getTime() - extractorLookbackDays() * DAY_MS);
-        const win = { start: lookback.getTime() < start.getTime() ? lookback : start, newStart: start, end: started };
+        // what the mind is attending to counts as new for this run (its pins, and what its heaviest items rest on)
+        const attended = c.attendedIds ? await c.attendedIds() : new Set<string>();
+        const win = { start: lookback.getTime() < start.getTime() ? lookback : start, newStart: start, end: started, attended };
         const loaded = await loadWindow(c.tx, mind, win);
         const found = generateCandidates(loaded, win);
         const ex = await c.tx.query<Existing>(

@@ -27,6 +27,7 @@ import { mind_orient } from "./mind_orient.js";
 import { mind_search } from "./mind_search.js";
 import { mind_surface } from "./mind_surface.js";
 import { mind_notice } from "./mind_notice.js";
+import { mind_attend } from "./mind_attend.js";
 
 export const registry: Registry = [
   // Wake
@@ -34,7 +35,7 @@ export const registry: Registry = [
   // Ops
   mind_health,
   // State
-  mind_state, mind_drive, mind_weather, mind_context, mind_handoff,
+  mind_state, mind_drive, mind_weather, mind_context, mind_handoff, mind_attend,
   // Remember
   mind_write, mind_observe, mind_search, mind_surface, mind_notice,
   // Hold

@@ -6,6 +6,8 @@ import { ok } from "../result.js";
 import { defineVerb } from "./types.js";
 import type { VerbContext } from "./types.js";
 import { mindIdSchema, text } from "./common.js";
+import { bookkeepingExcluded } from "../extractor/events.js";
+import { pendingRepairs } from "./mind_notice.js";
 
 const lim = (def: number, max = 100) => z.number().int().min(1).max(max).default(def);
 
@@ -39,7 +41,7 @@ async function compose(ctx: VerbContext, name: string, input: Record<string, unk
 export const mind_orient = defineVerb<typeof schema, unknown>({
   name: "mind_orient",
   description:
-    "Wake: compose identity, vows, state, handoff, health and (deeper) loops, threads, tasks, relations, drives, inbox, weather, anchors, noticings (when the operator has the extractor at stage propose), desires, holdings, recent events and daemon orphan sightings into one read. Appends no event.",
+    "Wake: compose identity, vows, state, handoff, health and (deeper) loops, threads, tasks, relations, drives, inbox, weather, anchors, attention (the top seven things it is carrying, with pins), noticings (when the operator has the extractor at stage propose), repairs (pending), desires, holdings, recent events and daemon orphan sightings into one read. Appends no event.",
   schema,
   scopeFor: () => "read",
   handler: async (ctx, input) => {
@@ -70,6 +72,8 @@ export const mind_orient = defineVerb<typeof schema, unknown>({
           run: (c) => compose(c, "mind_weather", { lookback_hours: 24, ...(context === undefined ? {} : { context }) }),
         },
         { key: "anchors", run: (c) => compose(c, "mind_anchor", { operation: "list" }) },
+        // what the mind is carrying: the seven heaviest things (mind_attend list), before the proposals
+        { key: "attention", run: (c) => compose(c, "mind_attend", { operation: "list", limit: 7 }) },
         {
           // the top 5 pending proposals when the extractor is at stage propose; an empty array otherwise (off, shadow, not registered)
           key: "noticings",
@@ -78,6 +82,8 @@ export const mind_orient = defineVerb<typeof schema, unknown>({
             return Array.isArray(r?.noticings) ? r.noticings : [];
           },
         },
+        // repairs waiting for the mind (a node it relied on was rewritten or retired); shown whatever the extractor's state
+        { key: "repairs", run: async (c) => ({ pending: await pendingRepairs(c) }) },
       );
     }
     if (full) {
@@ -100,7 +106,7 @@ export const mind_orient = defineVerb<typeof schema, unknown>({
           run: async (c) => {
             const r = await c.tx.query(
               `select id, seq, kind, context, created_at, payload
-               from events where mind_id = $1 and kind not like 'notice.%' order by seq desc limit $2`,
+               from events where mind_id = $1 and ${bookkeepingExcluded()} order by seq desc limit $2`,
               [c.mind_id, limits.recent],
             );
             return { events: r.rows };

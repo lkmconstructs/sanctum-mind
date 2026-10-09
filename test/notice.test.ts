@@ -499,9 +499,10 @@ describe("notice.expire", () => {
       (r) => r[0]!.passes.find((p) => p.pass === "notice.expire")!,
     );
 
-  it("is the eleventh deterministic pass, last in order", () => {
-    expect(PASSES).toHaveLength(11);
+  it("is the eleventh deterministic pass, followed by notice.repair as the twelfth", () => {
+    expect(PASSES).toHaveLength(12);
     expect(PASSES[10]!.name).toBe("notice.expire");
+    expect(PASSES[11]!.name).toBe("notice.repair");
   });
 
   it("expires due pending rows of either stage, writes a notice.expired event each, and touches nothing else", async () => {
@@ -766,9 +767,9 @@ describe("mind_orient and mind_health", () => {
     expect((await orient("quick", betaRead)).receipt.projection.sections.noticings).toHaveLength(5);
   });
 
-  it("health reports {enabled, stage, paused, pending, model_version, last_run} with zero defaults", async () => {
+  it("health reports {enabled, stage, paused, pending, model_version, repairs_pending, last_run} with zero defaults", async () => {
     const health = async (caller = alpha) => (await run(caller, "mind_health", { mind_id: "alpha" })).receipt.projection.extractor;
-    expect(await health()).toEqual({ enabled: false, stage: "off", paused: false, pending: 0, model_version: 0, last_run: null });
+    expect(await health()).toEqual({ enabled: false, stage: "off", paused: false, pending: 0, model_version: 0, repairs_pending: 0, last_run: null });
     const a = await mkNode("alpha", "one");
     const b = await mkNode("alpha", "two");
     await seedNoticing({ sources: [a, b] });
@@ -777,8 +778,8 @@ describe("mind_orient and mind_health", () => {
     await seedNoticing({ sources: [a, b], status: "rejected" });
     await setState("alpha", "propose", { paused: true });
     await admin.query("insert into extractor_models (mind_id, version, weights) values ('alpha', 1, '{}'), ('alpha', 2, '{}'), ('beta', 9, '{}')");
-    expect(await health()).toEqual({ enabled: true, stage: "propose", paused: true, pending: 2, model_version: 2, last_run: null });
-    expect(await health(betaRead)).toEqual({ enabled: true, stage: "propose", paused: true, pending: 2, model_version: 2, last_run: null });
+    expect(await health()).toEqual({ enabled: true, stage: "propose", paused: true, pending: 2, model_version: 2, repairs_pending: 0, last_run: null });
+    expect(await health(betaRead)).toEqual({ enabled: true, stage: "propose", paused: true, pending: 2, model_version: 2, repairs_pending: 0, last_run: null });
     // the orient health section carries it too
     expect((await run(alpha, "mind_orient", { mind_id: "alpha", depth: "orientation" })).receipt.projection.sections.health.extractor.model_version).toBe(2);
   });

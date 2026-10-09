@@ -5,6 +5,7 @@ import { z } from "zod";
 import { ok } from "../result.js";
 import { defineVerb } from "./types.js";
 import { mindIdSchema } from "./common.js";
+import { pendingRepairs } from "./mind_notice.js";
 
 export const mind_health = defineVerb({
   name: "mind_health",
@@ -50,7 +51,7 @@ export const mind_health = defineVerb({
       [ctx.mind_id],
     );
     const pend = await ctx.tx.query<{ n: string }>(
-      `select count(*) as n from noticings where mind_id = $1 and stage = 'propose' and status = 'pending' and expires_at > $2`,
+      `select count(*) as n from noticings where mind_id = $1 and kind <> 'repair' and stage = 'propose' and status = 'pending' and expires_at > $2`,
       [ctx.mind_id, ctx.now()],
     );
     const mv = await ctx.tx.query<{ v: number | null }>(`select max(version) as v from extractor_models where mind_id = $1`, [ctx.mind_id]);
@@ -67,6 +68,8 @@ export const mind_health = defineVerb({
       // what the mind could be shown: nothing unless the operator's stage is propose
       pending: ex.rows[0]?.stage === "propose" ? Number(pend.rows[0]!.n) : 0,
       model_version: mv.rows[0]?.v ?? 0,
+      // repair proposals waiting for the mind; they are shown whatever the stage, so they count whatever the stage
+      repairs_pending: await pendingRepairs(ctx),
       last_run: lr.rows[0] ? { pass: "notice.extract", started_at: lr.rows[0].started_at, ok: lr.rows[0].ok, skipped: lr.rows[0].skipped } : null,
     };
     return ok({ projection: { db: "up" as const, mind_id: input.mind_id, counts, last_daemon_run, outbox, extractor } });

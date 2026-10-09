@@ -14,11 +14,11 @@ export const MIN_PER_CLASS = 5;
 /** An expired proposal is a weak "no": the mind may simply not have looked. */
 export const EXPIRED_WEIGHT = 0.5;
 export const EPOCHS = 200;
-/** Step size of the full-batch gradient. Features are in 0..1, so the loss is smooth and 0.5 is stable with 12 of them. */
+/** Step size of the full-batch gradient. Features are in 0..1, so the loss is smooth and 0.5 is stable with 13 of them. */
 export const LEARNING_RATE = 0.5;
 /**
  * The L2 penalty, lambda * (w - w_prior)^2 / 2 on every weight (not the bias), against a mean loss. It pulls the fit
- * toward the hand-set prior rather than toward zero: with a few dozen decisions and twelve features, a mind's weights should
+ * toward the hand-set prior rather than toward zero: with a few dozen decisions and thirteen features, a mind's weights should
  * move only as far as its decisions push them. 0.05 means a weight moves a full point only if the data insists.
  */
 export const L2 = 0.05;
@@ -166,7 +166,7 @@ export const noticeTrain: DaemonPass = {
     const decided = await ctx.tx.query<DecidedRow>(
       `select n.status, n.features
          from noticings n left join events d on d.id = n.decided_event_id
-        where n.mind_id = $1 and n.stage = 'propose' and n.status in ('accepted', 'rejected', 'expired')
+        where n.mind_id = $1 and n.kind <> 'repair' and n.stage = 'propose' and n.status in ('accepted', 'rejected', 'expired')
           and n.features <> '{}'::jsonb and coalesce(d.payload->>'reason', '') <> 'imported'
         order by n.created_at, n.id`,
       [mind],

@@ -41,4 +41,9 @@ export const PRIOR_WEIGHTS: Record<FeatureName, number> = {
   kind_link: 0,
   kind_pattern: 0,
   kind_distillation: 0,
+  // Something the mind pinned, or that its heaviest open items rest on, is something it is already looking at: a little more worth
+  // a suggestion than a stray row. Mild, because attention is a hint about relevance and not evidence that two things belong together.
+  // Added after the first twelve weights. A model trained before it existed has no `attended` weight and the scorer reads a missing
+  // weight as 0 (parseWeights in scorer.ts), so such a model ignores the feature until it is refit; a refit starts from this prior.
+  attended: 0.3,
 };

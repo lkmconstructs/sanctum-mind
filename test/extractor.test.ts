@@ -175,12 +175,12 @@ const runsOf = (pass: string) => A(`select * from extractor_runs where pass = $1
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("the passes are registered, separately", () => {
-  it("notice.expire stays one of the eleven deterministic passes; extract and train are the model-backed ones, run after them", () => {
-    expect(PASSES).toHaveLength(11);
+  it("notice.expire and notice.repair are among the twelve deterministic passes; extract and train are the model-backed ones, run after them", () => {
+    expect(PASSES).toHaveLength(12);
     expect(PASSES.map((p) => p.name)).toContain("notice.expire");
     expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train"]);
-    expect(ALL_PASSES).toHaveLength(13);
-    expect(EXTRACTOR_PASSES.map((p) => p.name)).toEqual(["notice.expire", "notice.extract", "notice.train"]);
+    expect(ALL_PASSES).toHaveLength(14);
+    expect(EXTRACTOR_PASSES.map((p) => p.name)).toEqual(["notice.expire", "notice.repair", "notice.extract", "notice.train"]);
     expect(PASSES.some((p) => MODEL_PASSES.includes(p))).toBe(false);
   });
 });
@@ -629,9 +629,9 @@ describe("notice.extract: the stage 1 runtime guard still holds with everything 
     const kinds = (await A("select distinct kind from events where seq > $1", [maxSeq])).map((r) => r.kind);
     expect(kinds.length).toBeGreaterThan(0);
     for (const k of kinds) expect(WHITELISTED_KINDS).toContain(k);
-    // and the run goes through the same path as a normal tick: all thirteen passes, none failing
+    // and the run goes through the same path as a normal tick: all fourteen passes, none failing
     const tick = await runDaemonOnce({ pool, embedder: FAKE_EMBEDDER, reranker: byWords, now: () => at(DAY) }, { trigger: "manual", minds: ["alpha"] });
-    expect(tick[0]!.passes).toHaveLength(13);
+    expect(tick[0]!.passes).toHaveLength(14);
     expect(tick[0]!.ok).toBe(true);
   });
 });
@@ -828,8 +828,8 @@ describe("features and scorer", () => {
   const src = (o: Partial<{ created_at: Date; context: string | null; keys: string[]; charge: string[]; salience: number | null }> = {}) => ({
     created_at: clock, context: null, keys: [], charge: [], salience: null, ...o,
   });
-  it("names exactly the twelve features, all in 0..1", () => {
-    expect([...FEATURE_NAMES]).toEqual(["rerank", "rerank_missing", "cosine", "recency_days", "shared_context", "charge_overlap", "cooccurrence", "salience_mean", "source_count", "kind_link", "kind_pattern", "kind_distillation"]);
+  it("names exactly the thirteen features (the twelfth was joined by attended), all in 0..1", () => {
+    expect([...FEATURE_NAMES]).toEqual(["rerank", "rerank_missing", "cosine", "recency_days", "shared_context", "charge_overlap", "cooccurrence", "salience_mean", "source_count", "kind_link", "kind_pattern", "kind_distillation", "attended"]);
     const f = computeFeatures({ kind: "pattern", rerank: 0.4, cosine: 0.7, now: clock, sources: [src({ created_at: at(-10 * DAY) }), src({ created_at: at(-50 * DAY) }), src()] });
     expect(Object.keys(f)).toEqual([...FEATURE_NAMES]);
     for (const v of Object.values(f)) {
@@ -895,7 +895,7 @@ describe("candidate text helpers", () => {
     expect(termsLabel(["the and for"])).toBe("the and for"); // no terms: the opening of the first source
     expect(termsLabel(["x".repeat(500)]).length).toBeLessThanOrEqual(80);
     expect(termsLabel(Array.from({ length: 30 }, (_, i) => `veryveryverylongword${i}${"y".repeat(20)}`)).length).toBeLessThanOrEqual(80);
-    const item = (t: string): Item => ({ id: t.slice(0, 4), type: "event", text: t, vec: null, norm: 0, created_at: clock, context: null, keys: [], charge: [], salience: null, isNew: true });
+    const item = (t: string): Item => ({ id: t.slice(0, 4), type: "event", text: t, vec: null, norm: 0, created_at: clock, context: null, keys: [], charge: [], salience: null, isNew: true, attended: false });
     expect(summaryOf([item("a".repeat(300)), item("b b")])).toBe(`${"a".repeat(240)} / b b`);
     expect(summaryOf(Array.from({ length: 12 }, (_, i) => item(`${i}`.padEnd(400, "z")))).length).toBe(1000);
     expect(snippetOf("  many   spaces\n here ")).toBe("many spaces here");

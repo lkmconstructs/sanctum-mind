@@ -2,7 +2,7 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
 /**
- * The scorer's inputs: twelve named numbers per candidate, all in 0..1. They are stored on every noticing (`features`
+ * The scorer's inputs: thirteen named numbers per candidate, all in 0..1. They are stored on every noticing (`features`
  * jsonb), so a refit reads exactly what the scorer saw. The names are the model's vocabulary: weights are keyed by them.
  *
  *   rerank            cross-encoder score in 0..1; 0 when there is none
@@ -16,6 +16,9 @@
  *   salience_mean     mean salience of the sources: foundational 1, active 0.7, background 0.4, archive 0.1, unset 0.4
  *   source_count      number of sources, capped at 10, divided by 10
  *   kind_link, kind_pattern, kind_distillation   one-hot of the proposal kind
+ *   attended          1 when any source is something the mind is attending to (a node or event it pinned, or one that a top-12 attention
+ *                     item rests on; see src/verbs/attention.ts), else 0. Added after the first twelve: a stored row or a model
+ *                     from before it reads 0 for it (featureVector, parseWeights).
  */
 export const FEATURE_NAMES = [
   "rerank",
@@ -30,6 +33,7 @@ export const FEATURE_NAMES = [
   "kind_link",
   "kind_pattern",
   "kind_distillation",
+  "attended",
 ] as const;
 export type FeatureName = (typeof FEATURE_NAMES)[number];
 export type Features = Record<FeatureName, number>;
@@ -51,6 +55,8 @@ export interface SourceFacts {
   charge: string[];
   /** numeric salience, or null when unset */
   salience: number | null;
+  /** the mind is attending to this source (pinned, or under a top attention item) */
+  attended?: boolean;
 }
 
 export interface FeatureInput {
@@ -99,6 +105,7 @@ export function computeFeatures(i: FeatureInput): Features {
     kind_link: i.kind === "link" ? 1 : 0,
     kind_pattern: i.kind === "pattern" ? 1 : 0,
     kind_distillation: i.kind === "distillation" ? 1 : 0,
+    attended: i.sources.some((s) => s.attended === true) ? 1 : 0,
   };
 }
 

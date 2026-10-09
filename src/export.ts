@@ -61,6 +61,7 @@ const PROJECTIONS: TableSpec[] = [
   { key: "extractor_state", table: "extractor_state", where: mine, pk: ["mind_id"] },
   { key: "extractor_models", table: "extractor_models", where: mine, pk: ["version"] },
   { key: "extractor_runs", table: "extractor_runs", where: mine, pk: ["pass", "started_at"] },
+  { key: "attention_pins", table: "attention_pins", where: mine, pk: ["id"] },
   { key: "letters_sent", table: "letters", where: "t.from_mind = $1", pk: ["id"] },
   // a letter scheduled for later is not the recipient's to read yet, so it is not in the recipient's export either
   { key: "letters_received", table: "letters", where: "t.to_mind = $1 and t.from_mind <> $1 and (t.deliver_at is null or t.deliver_at <= now())", pk: ["id"] },

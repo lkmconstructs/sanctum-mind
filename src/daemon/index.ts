@@ -11,6 +11,7 @@ import { checkExtractorEnv } from "../extractor/config.js";
 import type { SinkConfig } from "../sinks/types.js";
 import { getDaemonConfig, resolveDaemonConfig, type DaemonConfig } from "./config.js";
 import { defaultCoolingMs } from "../verbs/cooling.js";
+import { attendedIds } from "../verbs/attention.js";
 import { ALL_PASSES, type AnyPass, type PassContext } from "./passes/index.js";
 import { isDetached } from "./passes/types.js";
 
@@ -88,6 +89,7 @@ async function runPass(
       coolingMs: deps.coolingMs ?? defaultCoolingMs(),
       actor: "daemon",
       config,
+      attendedIds: () => attendedIds({ tx, mind_id: mind, now }),
     });
     const inTx = <T>(mode: MindMode, fn: (ctx: PassContext) => Promise<T>): Promise<T> =>
       withMind(deps.pool, mind, mind, mode, async (tx) => {

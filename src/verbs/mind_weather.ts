@@ -5,6 +5,8 @@ import { z } from "zod";
 import { ok, type Result } from "../result.js";
 import { defineVerb } from "./types.js";
 import { mindIdSchema, text } from "./common.js";
+import { bookkeepingExcluded } from "../extractor/events.js";
+import { attentionLoad } from "./attention.js";
 
 const schema = z.strictObject({
   mind_id: mindIdSchema,
@@ -27,7 +29,7 @@ export const mind_weather = defineVerb({
   name: "mind_weather",
   description:
     "A deterministic read of recent texture: charge tags, salience, vividness, grip, somatic locations and event kinds " +
-    "over a lookback window, plus a one paragraph report. No model call and nothing is written.",
+    "over a lookback window, plus a one paragraph report and attention_load (how many things the mind is carrying, how many pinned, the top weight). No model call and nothing is written.",
   schema,
   scopeFor: () => "read",
   handler: async (ctx, input): Promise<Result<unknown>> => {
@@ -36,8 +38,8 @@ export const mind_weather = defineVerb({
     const ctxFilter = input.context ?? null;
 
     // Window: from <= created_at <= to. The empty string is the shared lane (context is null).
-    // notice.* events are bookkeeping about proposals, not memory, and never count here
-    const win = `mind_id = $1 and created_at >= $2 and created_at <= $3 and kind not like 'notice.%'
+    // notice.*, attend.* (pins and releases), repair.kept and repair.rethought are bookkeeping, not memory, and never count here (repair.retired is a change to memory and does; repair.rethought is paired with the rethink event)
+    const win = `mind_id = $1 and created_at >= $2 and created_at <= $3 and ${bookkeepingExcluded()}
        and ($4::text is null or context is not distinct from nullif($4, ''))`;
     const params = [ctx.mind_id, from, to, ctxFilter];
 
@@ -116,6 +118,8 @@ export const mind_weather = defineVerb({
         grip: toObject(ranked(grip)),
         somatic: toObject(ranked(somatic, 5)),
         report,
+        // what the mind is carrying now (not a window of the ledger: the set at this moment), from mind_attend's arithmetic
+        attention_load: await attentionLoad(ctx),
       },
     });
   },
