@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 import { DESIRE_NODE, defaultLabel, insertSelfNode } from "./self_common.js";
 
 const schema = z
@@ -15,7 +15,7 @@ const schema = z
     intensity: z.number().min(0).max(1).default(0.5),
     somatic: text(200).optional(),
     context: text(4000).optional(),
-    desire_id: z.uuid().optional(),
+    desire_id: uuidSchema.optional(),
     include_fulfilled: z.boolean().default(false),
     limit: z.number().int().min(1).max(200).default(50),
   })

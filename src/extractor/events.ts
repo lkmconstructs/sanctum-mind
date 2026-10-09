@@ -22,13 +22,13 @@ export const noticeProposedPayload = z.strictObject({
   model_version: z.number().int().min(0),
 });
 
-/** `reason: "imported"` is written by import-mind for a proposal it brings in expired; the pass writes the rest. */
+/** `reason: "imported"` is written by import-mind for a proposal it brings in expired; `"source_invalidated"` by the expiry pass for a pending proposal one of whose cited nodes was rewritten or retired; the pass writes the rest. */
 export const noticeExpiredPayload = z.strictObject({
   noticing_id: z.uuid(),
   noticing_kind: kindOfNoticing.optional(),
   stage: stageOfNoticing.optional(),
   expires_at: z.string().optional(),
-  reason: z.literal("imported").optional(),
+  reason: z.enum(["imported", "source_invalidated"]).optional(),
 });
 
 export const noticeModelTrainedPayload = z.strictObject({
@@ -39,13 +39,13 @@ export const noticeModelTrainedPayload = z.strictObject({
 
 /**
  * Events that are bookkeeping, not memory: `notice.*` (the extractor's proposals and decisions), `attend.*` (pins and
- * releases) and `repair.kept` / `repair.rethought` (paired with the ordinary rethink event; `repair.retired` is a change to
+ * releases) and `daemon.extractor.*` / `daemon.repair.backfill` (operator bookkeeping) and `repair.kept` / `repair.rethought` (paired with the ordinary rethink event; `repair.retired` is a change to
  * memory and stays). ONE definition, as a SQL predicate on the `kind` column of `events`, used wherever the ledger is read
  * as memory: mind_orient `recent`, mind_weather, the event side of search and surface, and belief repair's context events.
  * A new bookkeeping kind is added here and nowhere else. Use `bookkeepingExcluded("e.kind")` when the table is aliased.
  */
 export const bookkeepingExcluded = (col = "kind"): string =>
-  `${col} not like 'notice.%' and ${col} not like 'attend.%' and ${col} not in ('repair.kept', 'repair.rethought')`;
+  `${col} not like 'notice.%' and ${col} not like 'attend.%' and ${col} not like 'daemon.extractor.%' and ${col} not in ('repair.kept', 'repair.rethought', 'daemon.repair.backfill')`;
 
 export const EXTRACTOR_EVENT_SHAPES = {
   "notice.proposed": noticeProposedPayload,

@@ -5,8 +5,9 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { appPool, closePool, queryAs, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
+import { appPool, closePool, queryAs, queryLegacy, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
 import { upsertMinds } from "../src/auth.js";
 import { runMigrations } from "../src/db/migrate.js";
 import { createPool, withMind } from "../src/db/pool.js";
@@ -45,7 +46,7 @@ const run = (caller: Caller, name: string, input: unknown, at?: Date) =>
   runVerb({ pool, registry, now: () => at ?? fixed ?? new Date(), embedder: NONE_EMBEDDER }, caller, name, input) as Promise<any>;
 const V = (name: string, input: Record<string, unknown>, caller: Caller = alpha, mind = "alpha") => run(caller, name, { mind_id: mind, ...input });
 const attend = (input: Record<string, unknown>, caller: Caller = alpha, mind = "alpha") => run(caller, "mind_attend", { mind_id: mind, ...input });
-const list = async (input: Record<string, unknown> = {}, caller: Caller = alpha, mind = "alpha"): Promise<{ items: any[]; pins: number }> => {
+const list = async (input: Record<string, unknown> = {}, caller: Caller = alpha, mind = "alpha"): Promise<{ items: any[]; pins: any[]; stale_pins: number }> => {
   const r = await attend({ operation: "list", ...input }, caller, mind);
   expect(r.ok).toBe(true);
   return r.receipt.projection;
@@ -173,7 +174,7 @@ describe("the weight", () => {
     expect(p.items.map((i) => i.pinned)).toEqual([false, false, true]);
     expect(p.items[2].note).toBe("do not forget");
     expect(p.items[0]).not.toHaveProperty("note");
-    expect(p.pins).toBe(1);
+    expect(p.pins).toHaveLength(1);
     // the same numbers from the exported function, and the terms behind them
     expect(attentionWeight({ since: new Date(T.getTime() - 7 * DAY), now: T, charge: 1, type: "loop", pinned: false })).toBeCloseTo(wLoop, 4);
     expect(weightTerms({ since: new Date(T.getTime() - 14 * DAY), now: T, charge: 0.4, type: "task", pinned: true })).toEqual({ recency: Math.exp(-2), charge: 0.4, kind: 0.7, pin: 1 });
@@ -183,7 +184,7 @@ describe("the weight", () => {
     const after = await list();
     expect(after.items[2].weight).toBeCloseTo(wTask - 0.2, 4);
     expect(after.items[2].pinned).toBe(false);
-    expect(after.pins).toBe(0);
+    expect(after.pins).toHaveLength(0);
   });
 
   it("the kind priors are the specified table, and a weight stays within 0..1", () => {
@@ -312,7 +313,7 @@ describe("what is an item", () => {
     expect(event.id).toBe(ev);
     expect(event.label).toBe(`write: ${"x".repeat(80)}`); // kind and the first 80 characters
     expect(event.weight).toBeCloseTo(expected(new Date(event.since), now, 0.5, 0.5, 1), 4); // no salience: 0.5
-    expect(p.pins).toBe(2);
+    expect(p.pins).toHaveLength(2);
   });
 
   it("a pin on something already an item marks that item; it does not add a second", async () => {
@@ -403,7 +404,7 @@ describe("one thing is one item", () => {
     fixed = now;
     p = await list({ limit: 50 });
     expect(p.items).toHaveLength(3); // the desire, the vow's declaration, the plain node
-    expect(p.pins).toBe(4);
+    expect(p.pins).toHaveLength(4);
     expect(p.items.every((i) => i.pinned)).toBe(true);
     const d = p.items.find((i) => i.id === desire);
     expect(d.type).toBe("desire"); // desire > sit
@@ -445,7 +446,7 @@ describe("pin and release", () => {
     const pinned = await attend({ operation: "pin", item_type: "loop", item_id: loop, note: "mine" });
     expect(pinned.ok).toBe(true);
     const ev = (await q("alpha", "select * from events where id = $1", [pinned.receipt.event_id]))[0];
-    expect(ev).toMatchObject({ kind: "attend.pin", subject_id: loop, written_by: "alpha", payload: { item_type: "loop", item_id: loop, note: "mine" } });
+    expect(ev).toMatchObject({ kind: "attend.pin", subject_id: loop, written_by: "alpha", payload: { pin_id: pinned.receipt.projection.pin.id, item_type: "loop", item_id: loop, note: "mine" } });
     expect(pinned.receipt.projection.pin).toMatchObject({ item_type: "loop", item_id: loop, note: "mine", released_at: null, pinned_event_id: ev.id });
     expect((await list()).items[0]).toMatchObject({ pinned: true, note: "mine" });
 
@@ -486,9 +487,13 @@ describe("pin and release", () => {
     const loop = await mkLoop("x", "burning", new Date());
     expect((await attend({ operation: "pin", item_type: "loop", item_id: loop })).ok).toBe(true);
     expect((await V("mind_loop", { operation: "resolve", loop_id: loop })).ok).toBe(true);
-    expect(await list()).toMatchObject({ items: [], pins: 1 });
+    const l = await list();
+    expect(l.items).toEqual([]);
+    expect(l.pins).toHaveLength(1);
+    expect(l.pins[0]).toMatchObject({ item_type: "loop", item_id: loop, stale: true });
+    expect(l.stale_pins).toBe(1);
     expect((await attend({ operation: "release", item_type: "loop", item_id: loop })).ok).toBe(true);
-    expect((await list()).pins).toBe(0);
+    expect((await list()).pins).toHaveLength(0);
   });
 
   it("pinned items float: the pin term adds exactly 0.20", async () => {
@@ -514,69 +519,95 @@ describe("pin and release", () => {
   });
 });
 
-describe("the pin table guards itself (migration 0024)", () => {
+describe("the pin table guards itself (migrations 0024 and 0025)", () => {
   async function livePin() {
     const loop = await mkLoop("x", "burning", new Date());
     const r = await attend({ operation: "pin", item_type: "loop", item_id: loop });
     return { loop, pin: r.receipt.projection.pin, ev: r.receipt.event_id as string };
   }
-  const insertSql = `insert into attention_pins (mind_id, item_type, item_id, pinned_event_id, pinned_at) values ('alpha', 'loop', $1, $2, now())`;
+  const insertSql = `insert into attention_pins (id, mind_id, item_type, item_id, pinned_event_id, pinned_at) values ($3, 'alpha', 'loop', $1, $2, now())`;
+  const releasedSql = `insert into attention_pins (id, mind_id, item_type, item_id, pinned_event_id, pinned_at, released_event_id, released_at) values ($4, 'alpha', 'loop', $1, $2, now(), $3, now())`;
+  const id = () => randomUUID();
+  /** the attend.pin event of a pin, the way the verb writes it */
+  const pinEvent = (loop: string, pinId: string, over: Record<string, unknown> = {}) => mkEvent("attend.pin", { pin_id: pinId, item_type: "loop", item_id: loop, ...over }, loop);
+  const releaseEvent = (loop: string, pinId: string, over: Record<string, unknown> = {}) => mkEvent("attend.release", { pin_id: pinId, item_type: "loop", item_id: loop, ...over }, loop);
+  const PIN_MSG = "a pin must reference its own attend.pin event";
+  const REL_MSG = "a release must reference its own attend.release event";
 
   it("refuses a pin from anyone but the mind in a verb call: bare connection, no actor, a grantee's bearer, the daemon, the operator", async () => {
     const loop = await mkLoop("x", "burning", new Date());
-    const ev = await mkEvent("attend.pin", { item_type: "loop", item_id: loop }, loop);
-    await expect(admin.query(insertSql, [loop, ev])).rejects.toThrow(MSG);
+    const pid = id();
+    const ev = await pinEvent(loop, pid);
+    await expect(admin.query(insertSql, [loop, ev, pid])).rejects.toThrow(MSG);
     for (const [bearer, actor] of [["alpha", ""], ["beta", "verb"], ["alpha", "daemon"], ["alpha", "operator"]] as const) {
-      await expect(inTx(pool, "alpha", bearer, actor, insertSql, [loop, ev])).rejects.toThrow(MSG);
+      await expect(inTx(pool, "alpha", bearer, actor, insertSql, [loop, ev, pid])).rejects.toThrow(MSG);
     }
     // the mind in a verb call may (the verb does exactly this)
-    await inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, ev]);
+    await inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, ev, pid]);
     expect(await q("alpha", "select 1 from attention_pins")).toHaveLength(1);
   });
 
   it("refuses a pin whose event is not its own attend.pin event, and a pin that arrives released from a verb", async () => {
     const loop = await mkLoop("x", "burning", new Date());
+    const pid = id();
     const wrongKind = await mkEvent("write", { text: "x" }, loop);
-    const wrongSubject = await mkEvent("attend.pin", { item_type: "loop" }, "00000000-0000-4000-8000-000000000009");
-    const good = await mkEvent("attend.pin", { item_type: "loop" }, loop);
-    const wrongType = await mkEvent("attend.pin", { item_type: "thread" }, loop);
-    const rel = await mkEvent("attend.release", { item_type: "loop" }, loop);
-    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, wrongKind])).rejects.toThrow("a pin must reference its own attend.pin event");
-    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, wrongSubject])).rejects.toThrow("a pin must reference its own attend.pin event");
-    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, wrongType])).rejects.toThrow("a pin must reference its own attend.pin event"); // its payload names another item_type
-    await expect(inTx(pool, "alpha", "alpha", "verb",
-      `insert into attention_pins (mind_id, item_type, item_id, pinned_event_id, pinned_at, released_event_id, released_at) values ('alpha', 'loop', $1, $2, now(), $3, now())`,
-      [loop, good, rel])).rejects.toThrow("a new pin is live");
+    const wrongSubject = await mkEvent("attend.pin", { pin_id: pid, item_type: "loop", item_id: loop }, "00000000-0000-4000-8000-000000000009");
+    const good = await pinEvent(loop, pid);
+    const wrongType = await pinEvent(loop, pid, { item_type: "thread" }); // its payload names another item_type
+    const rel = await releaseEvent(loop, pid);
+    for (const bad of [wrongKind, wrongSubject, wrongType]) {
+      await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, bad, pid])).rejects.toThrow(PIN_MSG);
+    }
+    await expect(inTx(pool, "alpha", "alpha", "verb", releasedSql, [loop, good, rel, pid])).rejects.toThrow("a new pin is live");
     // the table's own check: released_at and released_event_id come together
     await expect(inTx(pool, "alpha", "alpha", "import",
-      `insert into attention_pins (mind_id, item_type, item_id, pinned_event_id, pinned_at, released_at) values ('alpha', 'loop', $1, $2, now(), now())`,
-      [loop, good])).rejects.toThrow();
+      `insert into attention_pins (id, mind_id, item_type, item_id, pinned_event_id, pinned_at, released_at) values ($3, 'alpha', 'loop', $1, $2, now(), now())`,
+      [loop, good, pid])).rejects.toThrow();
     // another mind's scope cannot insert alpha's row (row level security)
-    await expect(inTx(pool, "beta", "beta", "verb", insertSql, [loop, good])).rejects.toThrow();
+    await expect(inTx(pool, "beta", "beta", "verb", insertSql, [loop, good, pid])).rejects.toThrow();
+  });
+
+  it("binds the event to the pin: the cited attend.pin event must name this pin's id, this item and this type", async () => {
+    const loop = await mkLoop("x", "burning", new Date());
+    const other = await mkLoop("y", "burning", new Date());
+    const pid = id();
+    const noPinId = await mkEvent("attend.pin", { item_type: "loop", item_id: loop }, loop); // the old shape: no pin_id
+    const otherPinId = await pinEvent(loop, id()); // another pin's event
+    const otherItem = await pinEvent(loop, pid, { item_id: other }); // right subject, payload names a different item
+    const good = await pinEvent(loop, pid);
+    for (const bad of [noPinId, otherPinId, otherItem]) {
+      await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, bad, pid])).rejects.toThrow(PIN_MSG);
+      await expect(inTx(pool, "alpha", "alpha", "import", insertSql, [loop, bad, pid])).rejects.toThrow(PIN_MSG); // import has the same checks
+    }
+    // one event cannot serve two pins: it names exactly one pin id
+    await inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, good, pid]);
+    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, good, id()])).rejects.toThrow(PIN_MSG);
   });
 
   it("allows import to insert a pin, live or already released, citing its events; and nothing more", async () => {
     const loop = await mkLoop("x", "burning", new Date());
-    const ev = await mkEvent("attend.pin", { item_type: "loop" }, loop);
-    const rel = await mkEvent("attend.release", { item_type: "loop" }, loop);
-    await inTx(pool, "alpha", "alpha", "import", insertSql, [loop, ev]);
-    const ev2 = await mkEvent("attend.pin", { item_type: "loop" }, loop);
-    await inTx(pool, "alpha", "alpha", "import",
-      `insert into attention_pins (mind_id, item_type, item_id, pinned_event_id, pinned_at, released_event_id, released_at) values ('alpha', 'loop', $1, $2, now(), $3, now())`,
-      [loop, ev2, rel]);
-    // but not with a missing or wrong release event, a wrong bearer, or the import marker from a stranger's scope
-    await expect(inTx(pool, "alpha", "alpha", "import",
-      `insert into attention_pins (mind_id, item_type, item_id, pinned_event_id, pinned_at, released_event_id, released_at) values ('alpha', 'loop', $1, $2, now(), $2, now())`,
-      [loop, ev2])).rejects.toThrow("a release must reference its own attend.release event");
-    await expect(inTx(pool, "alpha", "beta", "import", insertSql, [loop, ev2])).rejects.toThrow(MSG);
+    const p1 = id();
+    const ev = await pinEvent(loop, p1);
+    const rel1 = await releaseEvent(loop, p1);
+    await inTx(pool, "alpha", "alpha", "import", insertSql, [loop, ev, p1]);
+    const p2 = id();
+    const ev2 = await pinEvent(loop, p2);
+    const rel = await releaseEvent(loop, p2);
+    await inTx(pool, "alpha", "alpha", "import", releasedSql, [loop, ev2, rel, p2]);
+    // but not with a missing or wrong release event, a release event of another pin or item, a wrong bearer, or the import marker from a stranger's scope
+    const p3 = id();
+    const ev3 = await pinEvent(loop, p3);
+    await expect(inTx(pool, "alpha", "alpha", "import", releasedSql, [loop, ev3, ev3, p3])).rejects.toThrow(REL_MSG);
+    await expect(inTx(pool, "alpha", "alpha", "import", releasedSql, [loop, ev3, await releaseEvent(loop, id()), p3])).rejects.toThrow(REL_MSG); // another pin's release
+    await expect(inTx(pool, "alpha", "alpha", "import", releasedSql, [loop, ev3, await releaseEvent(loop, p3, { item_id: ev3 }), p3])).rejects.toThrow(REL_MSG); // another item
+    await expect(inTx(pool, "alpha", "beta", "import", insertSql, [loop, ev3, p3])).rejects.toThrow(MSG);
     // import cannot release a live pin: an update is the verb's alone
-    const pin = (await q("alpha", "select id from attention_pins where released_at is null"))[0].id;
-    await expect(inTx(pool, "alpha", "alpha", "import", "update attention_pins set released_at = now(), released_event_id = $2 where id = $1", [pin, rel])).rejects.toThrow(MSG);
+    await expect(inTx(pool, "alpha", "alpha", "import", "update attention_pins set released_at = now(), released_event_id = $2 where id = $1", [p1, rel1])).rejects.toThrow(MSG);
   });
 
-  it("an update is a release and nothing else, once, by the mind in a verb call, citing its attend.release event", async () => {
+  it("an update is a release and nothing else, once, by the mind in a verb call, citing its own attend.release event", async () => {
     const { loop, pin } = await livePin();
-    const rel = await mkEvent("attend.release", { item_type: "loop" }, loop);
+    const rel = await releaseEvent(loop, pin.id);
     const release = "update attention_pins set released_at = now(), released_event_id = $2 where id = $1";
     await expect(admin.query(release, [pin.id, rel])).rejects.toThrow(MSG);
     await expect(inTx(pool, "alpha", "alpha", "", release, [pin.id, rel])).rejects.toThrow(MSG);
@@ -587,22 +618,26 @@ describe("the pin table guards itself (migration 0024)", () => {
       await expect(inTx(pool, "alpha", "alpha", "verb", `update attention_pins set ${set} where id = $1`, [pin.id])).rejects.toThrow();
     }
     await expect(inTx(pool, "alpha", "alpha", "verb", `update attention_pins set note = 'x', released_at = now(), released_event_id = $2 where id = $1`, [pin.id, rel])).rejects.toThrow("a pin is fixed once made; it can only be released");
-    // a release needs its own event, with both columns
-    const wrong = await mkEvent("attend.pin", { item_type: "loop" }, loop);
-    await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, wrong])).rejects.toThrow("a release must reference its own attend.release event");
+    // a release needs its own event (kind, this pin's id, this item), with both columns
+    const wrong = await pinEvent(loop, pin.id);
+    await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, wrong])).rejects.toThrow(REL_MSG);
+    await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, await releaseEvent(loop, id())])).rejects.toThrow(REL_MSG); // another pin's release event
+    await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, await mkEvent("attend.release", { item_type: "loop", item_id: loop }, loop)])).rejects.toThrow(REL_MSG); // no pin_id
+    await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, await releaseEvent(loop, pin.id, { item_id: "00000000-0000-4000-8000-0000000000dd" })])).rejects.toThrow(REL_MSG); // another item
     await expect(inTx(pool, "alpha", "alpha", "verb", "update attention_pins set released_at = now() where id = $1", [pin.id])).rejects.toThrow();
     await expect(inTx(pool, "alpha", "alpha", "verb", "update attention_pins set released_event_id = $2 where id = $1", [pin.id, rel])).rejects.toThrow();
     // the real thing passes, once; a released pin is final and never goes back
     await inTx(pool, "alpha", "alpha", "verb", release, [pin.id, rel]);
-    const rel2 = await mkEvent("attend.release", { item_type: "loop" }, loop);
+    const rel2 = await releaseEvent(loop, pin.id);
     await expect(inTx(pool, "alpha", "alpha", "verb", release, [pin.id, rel2])).rejects.toThrow("a released pin is final");
     await expect(inTx(pool, "alpha", "alpha", "verb", "update attention_pins set released_at = null, released_event_id = null where id = $1", [pin.id])).rejects.toThrow("a released pin is final");
   });
 
   it("allows one live pin per item (the index), and the app role cannot delete", async () => {
     const { loop } = await livePin();
-    const ev = await mkEvent("attend.pin", { item_type: "loop" }, loop);
-    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, ev])).rejects.toThrow(/attention_pins_one_live/);
+    const pid = id();
+    const ev = await pinEvent(loop, pid);
+    await expect(inTx(pool, "alpha", "alpha", "verb", insertSql, [loop, ev, pid])).rejects.toThrow(/attention_pins_one_live/);
     await expect(inTx(pool, "alpha", "alpha", "verb", "delete from attention_pins")).rejects.toThrow(/permission denied/);
   });
 
@@ -610,8 +645,8 @@ describe("the pin table guards itself (migration 0024)", () => {
     await livePin();
     expect(await q("alpha", "select 1 from attention_pins")).toHaveLength(1);
     expect(await q("beta", "select 1 from attention_pins")).toHaveLength(0);
-    expect((await list({}, beta, "beta")).pins).toBe(0);
-    expect((await list({}, betaRead, "alpha")).pins).toBe(1);
+    expect((await list({}, beta, "beta")).pins).toHaveLength(0);
+    expect((await list({}, betaRead, "alpha")).pins).toHaveLength(1);
   });
 });
 
@@ -622,7 +657,7 @@ describe("surfaces", () => {
     expect(new Set(registry.map((v) => v.name)).size).toBe(26);
   });
 
-  it("mind_orient quick and full carry attention (top 7, with the pin count) before noticings; orientation does not", async () => {
+  it("mind_orient quick and full carry attention (top 7, with the stale pin count) before noticings; orientation does not", async () => {
     for (let i = 0; i < 9; i++) await mkLoop(`loop ${i}`, "nagging", new Date(Date.now() - i * HOUR));
     const loop = await mkLoop("pinned one", "nagging", new Date(Date.now() - 20 * DAY));
     await attend({ operation: "pin", item_type: "loop", item_id: loop });
@@ -634,17 +669,18 @@ describe("surfaces", () => {
       const a = r.receipt.projection.sections.attention;
       expect(a).not.toHaveProperty("error");
       expect(a.items).toHaveLength(7);
-      expect(a.pins).toBe(1);
+      expect(a.stale_pins).toBe(0);
+      expect(a).not.toHaveProperty("pins"); // items only; the pins themselves are in mind_attend list
       expect(Object.keys(a.items[0]).sort()).toEqual(["id", "label", "pinned", "since", "type", "weight"]);
     }
     expect(Object.keys((await V("mind_orient", { depth: "orientation" })).receipt.projection.sections)).not.toContain("attention");
     // empty is a shape, not an error
     const empty = (await V("mind_orient", { depth: "quick" }, beta, "beta")).receipt.projection.sections.attention;
-    expect(empty).toEqual({ items: [], pins: 0 });
+    expect(empty).toEqual({ items: [], stale_pins: 0 });
   });
 
   it("mind_weather carries attention_load: items, pinned and the top weight", async () => {
-    expect((await V("mind_weather", {})).receipt.projection.attention_load).toEqual({ items: 0, pinned: 0, top_weight: 0 });
+    expect((await V("mind_weather", {})).receipt.projection.attention_load).toEqual({ items: 0, pinned: 0, top_weight: 0, repairs_pending: 0, repairs_not_shown: 0 });
     const T = new Date("2026-06-15T12:00:00.000Z");
     fixed = T;
     const a = await mkLoop("a", "burning", new Date(T.getTime() - 7 * DAY));
@@ -813,7 +849,7 @@ describe("export, import and purge", () => {
     // the pin events travelled with the ledger and the live pins still count: the imported mind carries them
     expect((await a2.query("select count(*)::int n from events where kind like 'attend.%'")).rows[0].n).toBe(4);
     const imported = (await runVerb({ pool: p2, registry, now: () => new Date() }, alpha, "mind_attend", { mind_id: "alpha", operation: "list" })) as any;
-    expect(imported.receipt.projection.pins).toBe(2);
+    expect(imported.receipt.projection.pins).toHaveLength(2);
     expect(imported.receipt.projection.items.filter((i: any) => i.pinned).map((i: any) => i.id).sort()).toEqual([s.loop, s.node].sort());
     // again: nothing new
     const events = (await a2.query("select count(*)::int n from events")).rows[0].n;
@@ -839,6 +875,23 @@ describe("export, import and purge", () => {
     expect((await a2.query("select count(*)::int n from attention_pins")).rows[0].n).toBe(2);
   });
 
+  /** give a pin in an export file a new id, consistently: its row and the pin_id its events name */
+  const reid = (doc: any, from: string, to: string) => {
+    const pin = doc.projections.attention_pins.find((p: any) => p.id === from);
+    pin.id = to;
+    // its events are renamed with it (new event ids, so an import into the same database does not find the old ones already there)
+    const rename = new Map<string, string>();
+    for (const e of doc.events) {
+      if (e.payload?.pin_id === from) {
+        e.payload.pin_id = to;
+        rename.set(e.id, randomUUID());
+      }
+    }
+    for (const e of doc.events) if (rename.has(e.id)) e.id = rename.get(e.id)!;
+    pin.pinned_event_id = rename.get(pin.pinned_event_id) ?? pin.pinned_event_id;
+    if (pin.released_event_id) pin.released_event_id = rename.get(pin.released_event_id) ?? pin.released_event_id;
+  };
+
   it("import keeps the cross-mind id check for pins, and tolerates only a clash on the partial unique index for the same mind", async () => {
     const s = await seedPins();
     const f = join(dir, `x${seq++}.json`);
@@ -847,19 +900,54 @@ describe("export, import and purge", () => {
     const bn = await mkNode("beta thing", { mind: "beta" });
     const bpin = (await attend({ operation: "pin", item_type: "node", item_id: bn }, beta, "beta")).receipt.projection.pin;
     const doc = JSON.parse(readFileSync(f, "utf8"));
-    doc.projections.attention_pins.find((p: any) => p.id === s.released.id).id = bpin.id;
+    reid(doc, s.released.id, bpin.id);
     const bad = join(dir, `x${seq++}.json`);
     writeFileSync(bad, JSON.stringify(doc));
     await expect(importMind(pool, bad, "alpha")).rejects.toThrow(/already exists in another mind/);
     // a re-id'd live pin on an item the target already holds a live pin on: not an error, not brought in
     const doc2 = JSON.parse(readFileSync(f, "utf8"));
-    doc2.projections.attention_pins.find((p: any) => p.id === s.live.id).id = "00000000-0000-4000-8000-0000000000aa";
+    reid(doc2, s.live.id, "00000000-0000-4000-8000-0000000000aa");
     const ok = join(dir, `x${seq++}.json`);
     writeFileSync(ok, JSON.stringify(doc2));
     const before = (await admin.query("select count(*)::int n from attention_pins where mind_id = 'alpha'")).rows[0].n;
     const rep = await importMind(pool, ok, "alpha");
     expect(rep.tables.attention_pins!.inserted).toBe(0);
     expect((await admin.query("select count(*)::int n from attention_pins where mind_id = 'alpha'")).rows[0].n).toBe(before);
+  });
+
+  it("a foreign pin id is refused BEFORE the same-item filter: a live pin that would be dropped as 'already held' cannot hide an id that belongs to another mind", async () => {
+    const s = await seedPins();
+    const f = join(dir, `x${seq++}.json`);
+    await exportMind(pool, "alpha", f);
+    const bn = await mkNode("beta thing", { mind: "beta" });
+    const bpin = (await attend({ operation: "pin", item_type: "node", item_id: bn }, beta, "beta")).receipt.projection.pin;
+    // alpha already holds a live pin on the loop (s.live), so the file's live pin for it would be filtered out; give it beta's pin id
+    const doc = JSON.parse(readFileSync(f, "utf8"));
+    reid(doc, s.live.id, bpin.id);
+    const bad = join(dir, `x${seq++}.json`);
+    writeFileSync(bad, JSON.stringify(doc));
+    const before = (await admin.query("select count(*)::int n from attention_pins where mind_id = 'alpha'")).rows[0].n;
+    await expect(importMind(pool, bad, "alpha")).rejects.toThrow(/attention_pins id .* already exists in another mind/);
+    expect((await admin.query("select count(*)::int n from attention_pins where mind_id = 'alpha'")).rows[0].n).toBe(before);
+    // the same file with the pin's own id imports as 'already present' and counts nothing new
+    const clean = await importMind(pool, f, "alpha");
+    expect(clean.tables.attention_pins!.inserted).toBe(0);
+  });
+
+  it("pins whose attend.pin event names no pin_id (from before 0025) are skipped with a note; the rest of the file imports", async () => {
+    const s = await seedPins();
+    const f = join(dir, `x${seq++}.json`);
+    await exportMind(pool, "alpha", f);
+    const doc = JSON.parse(readFileSync(f, "utf8"));
+    const old = doc.projections.attention_pins.find((p: any) => p.id === s.live.id);
+    for (const e of doc.events) if (e.id === old.pinned_event_id) delete e.payload.pin_id;
+    writeFileSync(f, JSON.stringify(doc));
+    const { a2, p2 } = await secondDb();
+    const rep = await importMind(p2, f, "alpha");
+    expect(rep.notes).toContain("1 pin(s) from before 0025 skipped; re-pin them");
+    expect(rep.tables.attention_pins).toMatchObject({ inserted: 2 });
+    expect((await a2.query("select id from attention_pins order by pinned_at")).rows.map((r) => r.id)).toEqual([s.released.id, s.liveNode.id]);
+    expect((await a2.query("select count(*)::int n from nodes")).rows[0].n).toBeGreaterThan(0);
   });
 
   it("purge removes the mind's pins and only that mind's", async () => {
@@ -892,5 +980,133 @@ describe("belief repair leaves pins out of its context", () => {
     const kinds = (await admin.query("select kind from events where id = any($1::uuid[])", [ids])).rows.map((r) => r.kind);
     expect(kinds.some((k) => String(k).startsWith("attend."))).toBe(false);
     expect((await admin.query("select 1 from events where kind = 'attend.pin' and subject_id = $1", [core])).rows).toHaveLength(1);
+  });
+});
+
+describe("integrity: pins are never lost, stale pins are visible, identity is typed, repairs are capped", () => {
+  it("anything pinned is literally in the set: 501 loops, the oldest pinned, appears (the 500 cap does not hide a pin)", async () => {
+    const ev = await mkEvent("loop.create", { label: "bulk" });
+    await admin.query(
+      `insert into loops (mind_id, label, urgency, created_event_id, created_at)
+       select 'alpha', 'loop ' || g, 'nagging', $1, now() - (g || ' minutes')::interval from generate_series(1, 501) g`,
+      [ev],
+    );
+    const oldest = (await admin.query("select id from loops order by created_at limit 1")).rows[0].id as string;
+    expect((await attend({ operation: "pin", item_type: "loop", item_id: oldest })).ok).toBe(true);
+    const p = await list({ limit: 50 });
+    expect(p.items.some((i) => i.id === oldest && i.pinned)).toBe(true);
+    expect(p.stale_pins).toBe(0);
+    expect((await V("mind_weather", {})).receipt.projection.attention_load.items).toBe(501);
+    // without the pin the oldest is past the cap and not carried
+    expect((await attend({ operation: "release", item_type: "loop", item_id: oldest })).ok).toBe(true);
+    expect((await V("mind_weather", {})).receipt.projection.attention_load.items).toBe(500);
+  });
+
+  it("the same holds for threads, tasks, desires and noticings pinned beyond their cap", async () => {
+    const ev = await mkEvent("bulk", {});
+    await stageState("propose");
+    await queryLegacy(admin,
+      `insert into threads (mind_id, label, priority, created_event_id, created_at, updated_at)
+       select 'alpha', 'thread ' || g, 'low', $1, now() - (g || ' minutes')::interval, now() - (g || ' minutes')::interval from generate_series(1, 501) g`, [ev]);
+    await queryLegacy(admin,
+      `insert into tasks (mind_id, title, priority, created_event_id, created_at, updated_at)
+       select 'alpha', 'task ' || g, 'low', $1, now() - (g || ' minutes')::interval, now() - (g || ' minutes')::interval from generate_series(1, 501) g`, [ev]);
+    await queryLegacy(admin,
+      `insert into nodes (mind_id, node_type, label, content, written_by, source_type, confidence, metadata, created_at)
+       select 'alpha', 'desire', 'wish ' || g, 'wish ' || g, 'alpha', 'extracted', 1.0, '{"intensity": 0.5}', now() - (g || ' minutes')::interval from generate_series(1, 501) g`);
+    await queryLegacy(admin,
+      `insert into noticings (mind_id, kind, sources, payload, score, stage, status, proposed_event_id, expires_at, created_at)
+       select 'alpha', 'link', array[gen_random_uuid(), gen_random_uuid()], '{"reason": "x"}', 0.5, 'propose', 'pending', $1, now() + interval '1 day', now() - (g || ' minutes')::interval from generate_series(1, 501) g`, [ev]);
+    const oldest = async (table: string, col = "created_at") => (await admin.query(`select id from ${table} order by ${col} limit 1`)).rows[0].id as string;
+    const targets: Array<[string, string]> = [
+      ["thread", await oldest("threads")],
+      ["task", await oldest("tasks")],
+      ["desire", (await admin.query("select id from nodes where node_type = 'desire' order by created_at limit 1")).rows[0].id],
+      ["noticing", await oldest("noticings")],
+    ];
+    const baseline = (await V("mind_weather", {})).receipt.projection.attention_load.items;
+    expect(baseline).toBe(2000); // each type is capped at its newest 500 (the oldest of 501 is outside)
+    for (const [type, id] of targets) expect((await attend({ operation: "pin", item_type: type, item_id: id })).ok).toBe(true);
+    const p = await list({ limit: 50 });
+    for (const [, id] of targets) expect(p.items.some((i) => i.id === id && i.pinned)).toBe(true);
+    expect((await V("mind_weather", {})).receipt.projection.attention_load.items).toBe(2004);
+  });
+
+  it("stale pins: list shows every pin with stale true when its thing is gone or no longer an item, orient counts them, and release by pin_id clears them", async () => {
+    const live = await mkLoop("still here", "burning", new Date());
+    const gone = await mkLoop("will resolve", "burning", new Date());
+    const pl = (await attend({ operation: "pin", item_type: "loop", item_id: live })).receipt.projection.pin;
+    const pg = (await attend({ operation: "pin", item_type: "loop", item_id: gone })).receipt.projection.pin;
+    const node = await mkNode("a memory");
+    const pn = (await attend({ operation: "pin", item_type: "node", item_id: node })).receipt.projection.pin;
+    await queryAs(pool, "alpha", "alpha", "update nodes set invalidated_at = now() where id = $1", [node]);
+    expect((await V("mind_loop", { operation: "resolve", loop_id: gone })).ok).toBe(true);
+    const l = await list();
+    expect(l.stale_pins).toBe(2);
+    expect(Object.fromEntries(l.pins.map((x) => [x.pin_id, x.stale]))).toEqual({ [pl.id]: false, [pg.id]: true, [pn.id]: true });
+    expect(l.pins.find((x) => x.pin_id === pg.id)).toMatchObject({ item_type: "loop", item_id: gone, note: null });
+    expect(Number.isNaN(new Date(l.pins[0].pinned_at).getTime())).toBe(false);
+    expect(l.pins.every((x) => Object.keys(x).sort().join() === "item_id,item_type,note,pin_id,pinned_at,stale")).toBe(true);
+    const orient = (await V("mind_orient", { depth: "quick" })).receipt.projection.sections.attention;
+    expect(orient.stale_pins).toBe(2);
+    expect(orient.items.map((i: any) => i.id)).toEqual([live]);
+    // a stale pin is released by its pin id (the thing it names is gone, so item_type + item_id would also work, but the id is what the list shows)
+    expect((await attend({ operation: "release", pin_id: pg.id })).ok).toBe(true);
+    expect((await attend({ operation: "release", pin_id: pn.id })).ok).toBe(true);
+    const after = await list();
+    expect(after.stale_pins).toBe(0);
+    expect(after.pins.map((x) => x.pin_id)).toEqual([pl.id]);
+  });
+
+  it("a loop whose id equals a node's id does not merge with it: attention merges by typed identity, never on a bare uuid collision", async () => {
+    const shared = "00000000-0000-4000-8000-0000000000c1";
+    await queryLegacy(admin,
+      `insert into nodes (id, mind_id, node_type, label, content, written_by, source_type, confidence, metadata)
+       values ($1, 'alpha', 'desire', 'a wish', 'a wish', 'alpha', 'extracted', 1.0, '{"intensity": 0.5}')`, [shared]);
+    await mkLoop("same id, different thing", "burning", new Date(), shared);
+    const p = await list({ limit: 50 });
+    expect(p.items.filter((i) => i.id === shared).map((i) => i.type).sort()).toEqual(["desire", "loop"]);
+    // a pin of one kind marks only that one
+    expect((await attend({ operation: "pin", item_type: "loop", item_id: shared })).ok).toBe(true);
+    const q2 = await list({ limit: 50 });
+    expect(q2.items.find((i) => i.id === shared && i.type === "loop").pinned).toBe(true);
+    expect(q2.items.find((i) => i.id === shared && i.type === "desire").pinned).toBe(false);
+    // while a desire that is also held by a sit is still one item (the same node)
+    expect((await V("mind_sit", { subject_id: shared, state: "processing" })).ok).toBe(true);
+    expect((await list({ limit: 50 })).items.filter((i) => i.id === shared).map((i) => i.type).sort()).toEqual(["desire", "loop"]);
+  });
+
+  it("repairs have their own query: 520 pending repairs do not push an older link proposal out, and repairs_pending is the count", async () => {
+    const ev = await mkEvent("bulk", {});
+    await stageState("propose");
+    await queryLegacy(admin,
+      `insert into noticings (mind_id, kind, sources, payload, score, stage, status, proposed_event_id, expires_at, created_at)
+       select 'alpha', 'repair', array[gen_random_uuid(), gen_random_uuid()], '{"relation": "derived_from"}', 1.0, 'propose', 'pending', $1, now() + interval '1 day', now() - (g || ' seconds')::interval
+         from generate_series(1, 520) g`, [ev]);
+    const link = await mkNoticing("link", [await mkNode("a"), await mkNode("b")], { reason: "older" }, { score: 0.6 });
+    await queryLegacy(admin, "update noticings set created_at = now() - interval '3 days' where id = $1", [link]);
+    const p = await list({ limit: 50 });
+    expect(p.items.some((i) => i.id === link && i.type === "noticing")).toBe(true);
+    expect(p.items.filter((i) => i.type === "repair")).toHaveLength(3);
+    expect(p.items.filter((i) => i.type === "repair").map((i) => i.id).sort()).toEqual(
+      (await admin.query("select id from noticings where kind = 'repair' order by score desc, created_at desc, id limit 3")).rows.map((r) => r.id).sort(),
+    );
+    const load = (await V("mind_weather", {})).receipt.projection.attention_load;
+    expect(load).toMatchObject({ repairs_pending: 520, repairs_not_shown: 517 });
+  });
+
+  it("repairs contribute at most three items; the rest are counted in attention_load.repairs_not_shown", async () => {
+    await stageState("propose");
+    const a = await mkNode("up");
+    for (let i = 0; i < 7; i++) {
+      const d = await mkNode(`dep ${i}`);
+      await mkNoticing("repair", [d, a], { dependant_type: "observation", relation: "derived_from", upstream_state: "superseded", dependant_id: d, upstream_id: a }, { score: 1.0 });
+    }
+    await mkLoop("a loop", "nagging", new Date());
+    const p = await list({ limit: 50 });
+    expect(p.items.filter((i) => i.type === "repair")).toHaveLength(3);
+    expect(p.items.filter((i) => i.type === "loop")).toHaveLength(1);
+    const load = (await V("mind_weather", {})).receipt.projection.attention_load;
+    expect(load).toMatchObject({ items: 4, repairs_pending: 7, repairs_not_shown: 4 });
   });
 });

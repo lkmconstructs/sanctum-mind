@@ -438,6 +438,19 @@ export async function importMind(
   });
   if (strippedBreaks > 0) notes.push(`${strippedBreaks} declared vow break(s) in the file were stripped on import`);
 
+  // pins from before migration 0025 (their attend.pin event names no pin_id) cannot satisfy the database's binding of a pin to its event:
+  // they are left out, with a note, and the rest of the file imports
+  const pinPayload = new Map(doc.events.map((e) => [lc(e.id), e.payload]));
+  const pinsBefore = (doc.projections.attention_pins ?? []).filter((p) => {
+    if (typeof p.pinned_event_id !== "string" || !pinPayload.has(lc(p.pinned_event_id))) return false; // an event outside the file is the foreign-reference check's business
+    const pl = pinPayload.get(lc(p.pinned_event_id));
+    return !(pl !== null && typeof pl === "object" && !Array.isArray(pl) && typeof (pl as Record<string, unknown>).pin_id === "string");
+  });
+  if (pinsBefore.length > 0) {
+    doc.projections.attention_pins = (doc.projections.attention_pins ?? []).filter((p) => !pinsBefore.includes(p));
+    notes.push(`${pinsBefore.length} pin(s) from before 0025 skipped; re-pin them`);
+  }
+
   const recvCount = (doc.projections.letters_received ?? []).length;
   if (recvCount > 0) {
     notes.push(`${recvCount} received letter(s) in the file were ignored: received letters belong to the sender's export and only the sender can re-send them`);
@@ -582,7 +595,36 @@ export async function importMind(
           // mind: a live pin the target already holds on the same item, under whatever id, so the file's live pin for it is not brought in.
           const live = await tx.query<{ item_type: string; item_id: string }>("select item_type, item_id from attention_pins where mind_id = $1 and released_at is null", [target]);
           const held = new Set(live.rows.map((x) => `${x.item_type}:${lc(x.item_id)}`));
-          const keep = rows.filter((r) => !(r.released_at === null || r.released_at === undefined ? held.has(`${String(r.item_type)}:${lc(r.item_id)}`) : false));
+          const isLive = (r: Row): boolean => r.released_at === null || r.released_at === undefined;
+          const drop = rows.filter((r) => isLive(r) && held.has(`${String(r.item_type)}:${lc(r.item_id)}`));
+          // Every incoming pin id is checked against other minds BEFORE the same-item filter, so a foreign id cannot hide behind a clash on
+          // the unique index: a pin that would be dropped is probed with an insert that conflicts only on its id (a foreign id is skipped
+          // silently there; a clash on the live index raises 23505 and means the id is free). A foreign id aborts the import.
+          const mine = new Set<string>();
+          for (const part of chunk(drop.map((r) => lc(r.id)), BATCH)) {
+            const r = await tx.query<{ id: string }>("select id from attention_pins where id = any($1::uuid[])", [part]);
+            for (const x of r.rows) mine.add(x.id);
+          }
+          const pinCols = await cols("attention_pins");
+          for (const r of drop.filter((x) => !mine.has(lc(x.id)))) {
+            const use = pinCols.filter((c) => c in r);
+            const list = use.map((c) => `"${c}"`).join(", ");
+            await tx.query("savepoint pin_probe");
+            try {
+              const res = await tx.query(
+                `insert into attention_pins (${list}) select ${list} from jsonb_populate_recordset(null::attention_pins, $1::jsonb) on conflict (id) do nothing returning id`,
+                [JSON.stringify([r])],
+              );
+              if ((res.rowCount ?? 0) === 0) throw new ImportError(`attention_pins id ${lc(r.id)} already exists in another mind; nothing was imported`);
+              throw new ImportError(`attention_pins id ${lc(r.id)} could not be checked; nothing was imported`);
+            } catch (e) {
+              if (e instanceof ImportError) throw e;
+              if ((e as { code?: string }).code !== "23505") throw e;
+              await tx.query("rollback to savepoint pin_probe");
+              await tx.query("release savepoint pin_probe");
+            }
+          }
+          const keep = rows.filter((r) => !drop.includes(r));
           pinsAlready = rows.length - keep.length;
           rows = keep;
         }

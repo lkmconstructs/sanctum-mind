@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, nonBlankText, text } from "./common.js";
+import { appendEvent, mindIdSchema, nonBlankText, text, uuidSchema } from "./common.js";
 
 const schema = z
   .strictObject({
@@ -13,7 +13,7 @@ const schema = z
     label: nonBlankText(512).optional(),
     priority: z.enum(["low", "normal", "high"]).optional(),
     tags: z.array(text(64)).max(32).optional(),
-    thread_id: z.uuid().optional(),
+    thread_id: uuidSchema.optional(),
     note: text(4000).optional(),
     status: z.enum(["active", "resolved", "archived", "all"]).default("active"),
     limit: z.number().int().min(1).max(200).default(20),

@@ -35,7 +35,7 @@ import { noticeTrain } from "./train.js";
 export { noticeExpire, noticeExtract, noticeRepair, noticeTrain };
 export {
   extractorTtlDays, noticingExpiresAt, DEFAULT_EXTRACTOR_TTL_DAYS,
-  extractorReproposeDays, DEFAULT_EXTRACTOR_REPROPOSE_DAYS, extractorMaxCandidates, DEFAULT_EXTRACTOR_MAX_CANDIDATES, extractorLookbackDays, DEFAULT_EXTRACTOR_LOOKBACK_DAYS, checkExtractorEnv,
+  extractorReproposeDays, DEFAULT_EXTRACTOR_REPROPOSE_DAYS, extractorMaxCandidates, DEFAULT_EXTRACTOR_MAX_CANDIDATES, extractorLookbackDays, DEFAULT_EXTRACTOR_LOOKBACK_DAYS, extractorRepairBudget, DEFAULT_EXTRACTOR_REPAIR_BUDGET, checkExtractorEnv,
 } from "./config.js";
 export { EXTRACTOR_EVENT_SHAPES } from "./events.js";
 export { FEATURE_NAMES, computeFeatures, type Features, type FeatureName } from "./features.js";

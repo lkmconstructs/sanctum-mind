@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 import {
   backwardConflict,
   canTransition,
@@ -17,7 +17,7 @@ import {
 
 const schema = z.strictObject({
   mind_id: mindIdSchema,
-  subject_id: z.uuid(),
+  subject_id: uuidSchema,
   state: z.enum(["active", "processing"]).default("active"),
   note: text(4000).optional(),
 });

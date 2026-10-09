@@ -45,7 +45,7 @@ commands:
                     import a Revien graph export (its public JSON format) into one mind (sanctum_app URL)
   grant add|revoke|list ...
                     manage grants between minds (ADMIN URL; see "grant" usage below)
-  extractor enable|disable|pause|resume|stage|report --mind <id> ...
+  extractor enable|disable|pause|resume|stage|report|repair-backfill --mind <id> ...
                     operate the optional extractor that proposes links, patterns and distillations (ADMIN URL; see "extractor" usage below)
   export-mind --mind <id> [--out <file>]
                     write one mind (ledger, graph, projections) to a JSON file (sanctum_app URL)
@@ -186,6 +186,10 @@ async function main(): Promise<void> {
         for (const r of reports) {
           const failed = r.passes.filter((p) => !p.ok).map((p) => `${p.pass}: ${p.error ?? "failed"}`);
           const changed = r.passes.reduce((n, p) => n + p.changed, 0);
+          if (r.deferred) {
+            console.log(`${r.mind_id}: deferred (${r.note ?? "tick budget spent"})`);
+            continue;
+          }
           console.log(`${r.mind_id}: ${r.ok ? "ok" : "FAILED"} (${r.passes.length} passes, ${changed} changes)${failed.length ? "\n  " + failed.join("\n  ") : ""}`);
           for (const p of r.passes) for (const n of p.notes ?? []) if (p.pass.startsWith("notice.") && p.pass !== "notice.expire") console.log(`  ${p.pass}: ${n}`);
         }

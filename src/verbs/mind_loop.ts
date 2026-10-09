@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 import { lockKeys } from "./charge.js";
 
 const schema = z
@@ -14,7 +14,7 @@ const schema = z
     label: text(512).optional(),
     urgency: z.enum(["burning", "nagging"]).default("nagging"),
     context: text(4000).optional(),
-    loop_id: z.uuid().optional(),
+    loop_id: uuidSchema.optional(),
     resolution: text(4000).optional(),
     include_resolved: z.boolean().default(false),
     limit: z.number().int().min(1).max(200).default(50),

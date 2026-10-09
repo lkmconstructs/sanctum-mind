@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 import { ANCHOR_NODE, insertSelfNode } from "./self_common.js";
 
 const schema = z
@@ -12,7 +12,7 @@ const schema = z
     mind_id: mindIdSchema,
     operation: z.enum(["create", "list", "check"]),
     trigger: text(200).optional(),
-    memory_id: z.uuid().optional(),
+    memory_id: uuidSchema.optional(),
     response: text(4000).optional(),
     text: text(12000).optional(),
     limit: z.number().int().min(1).max(200).default(50),

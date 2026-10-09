@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb, type VerbContext } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema, nodeLockKey, proposalLockKey } from "./common.js";
 import { IDENTITY_NODE, MIND_ONLY, identityDeclarations, insertSelfNode } from "./self_common.js";
 import { settleDueDeclarations } from "./settle.js";
 
@@ -15,8 +15,8 @@ const schema = z
     section: text(200).optional(),
     content: text(12000).optional(),
     lineage_note: text(4000).optional(),
-    target_node_id: z.uuid().optional(),
-    proposal_id: z.uuid().optional(),
+    target_node_id: uuidSchema.optional(),
+    proposal_id: uuidSchema.optional(),
     note: text(4000).optional(),
     include_settled: z.boolean().default(false),
   })
@@ -91,7 +91,7 @@ export const mind_identity = defineVerb<typeof schema, unknown>({
       // a steward accompanies the mind; the mind cannot end its own cooling by attesting to itself
       if (isMind) return err("forbidden", "a mind does not steward itself: it withdraws its own declarations");
       const proposal_id = input.proposal_id!;
-      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`proposal:${proposal_id}`]);
+      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [proposalLockKey(proposal_id)]);
       const cur = await ctx.tx.query<{ status: string; effective_at: Date | null; attestations: Array<{ by: string; stance: string }> }>(
         `select status, effective_at, attestations from proposals where id = $1 and mind_id = $2`,
         [proposal_id, ctx.mind_id],
@@ -140,7 +140,7 @@ export const mind_identity = defineVerb<typeof schema, unknown>({
     if (input.operation === "propose") {
       const target = input.target_node_id;
       if (target !== undefined) {
-        await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${target}`]);
+        await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(target)]);
         const t = await ctx.tx.query(
           `select 1 from nodes where id = $1 and mind_id = $2 and node_type = $3 and invalidated_at is null`,
           [target, ctx.mind_id, IDENTITY_NODE],
@@ -197,7 +197,7 @@ export const mind_identity = defineVerb<typeof schema, unknown>({
 
     if (input.operation === "retire") {
       const target = input.target_node_id!;
-      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${target}`]);
+      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(target)]);
       const t = await ctx.tx.query<{ label: string; content: string }>(
         `select label, content from nodes where id = $1 and mind_id = $2 and node_type = $3 and invalidated_at is null`,
         [target, ctx.mind_id, IDENTITY_NODE],
@@ -244,7 +244,7 @@ export const mind_identity = defineVerb<typeof schema, unknown>({
 
     // withdraw
     const proposal_id = input.proposal_id!;
-    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`proposal:${proposal_id}`]);
+    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [proposalLockKey(proposal_id)]);
     const cur = await ctx.tx.query<{ status: string }>(`select status from proposals where id = $1 and mind_id = $2`, [proposal_id, ctx.mind_id]);
     const p = cur.rows[0];
     if (!p) return err("not_found", "proposal not found", "proposal_id");

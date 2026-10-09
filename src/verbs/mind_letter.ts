@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 
 const schema = z
   .strictObject({
@@ -15,7 +15,7 @@ const schema = z
     subject: text(200).optional(),
     body: text(12000).optional(),
     deliver_at: z.iso.datetime().optional(),
-    letter_id: z.uuid().optional(),
+    letter_id: uuidSchema.optional(),
     include_read: z.boolean().default(false),
     limit: z.number().int().min(1).max(100).default(10),
   })

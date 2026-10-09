@@ -28,6 +28,11 @@ export interface DaemonDeps {
   sinks?: SinkConfig[];
   coolingMs?: number;
   now?: () => Date;
+  /**
+   * Where the last tick stopped, so the next one starts with the mind after it (fair rotation under a tick budget). `startDaemon`
+   * keeps one for its lifetime; without it every run starts from the first mind. Held in memory only.
+   */
+  rotation?: { last: string | null };
 }
 
 export interface RunOptions {
@@ -57,6 +62,9 @@ export interface RunReport {
   finished_at: Date;
   /** true when every pass of this mind was ok and the run was recorded */
   ok: boolean;
+  /** set when the tick budget (DAEMON_TICK_BUDGET_MS) ran out before this mind: it was not run and waits for the next tick */
+  deferred?: true;
+  note?: string;
   passes: PassReport[];
   error?: string;
 }
@@ -179,12 +187,26 @@ export async function runDaemonOnce(deps: DaemonDeps, opts: RunOptions): Promise
     const wanted = opts.minds ? new Set(opts.minds) : null;
     const minds = listed.rows.map((r) => r.mind_id).filter((m) => wanted === null || wanted.has(m));
     const reports: RunReport[] = [];
-    for (const mind of minds) {
+    // rotating order: start after the mind processed last tick, so a tick budget cannot always starve the same minds
+    const last = deps.rotation?.last ?? null;
+    const at = last === null ? -1 : minds.indexOf(last);
+    const start = at === -1 || minds.length === 0 ? 0 : (at + 1) % minds.length;
+    const order = [...minds.slice(start), ...minds.slice(0, start)];
+    const tickStart = now().getTime();
+    for (const [i, mind] of order.entries()) {
+      if (config.tickBudgetMs > 0 && i > 0 && now().getTime() - tickStart >= config.tickBudgetMs) {
+        const waiting = order.slice(i);
+        const note = `tick budget (${config.tickBudgetMs} ms) spent: ${waiting.length} mind(s) wait for the next tick, which starts at ${mind}`;
+        const when = now();
+        for (const m of waiting) reports.push({ mind_id: m, run_id: null, started_at: when, finished_at: when, ok: true, passes: [], deferred: true, note });
+        break;
+      }
       try {
         reports.push(await runMind(deps, mind, opts, config, now));
       } catch (e) {
         reports.push(...wholeRunFailure(e).map((r) => ({ ...r, mind_id: mind })));
       }
+      if (deps.rotation) deps.rotation.last = mind;
     }
     return reports;
   } catch (e) {
@@ -217,13 +239,14 @@ export function startDaemon(deps: DaemonDeps, opts: StartOptions = {}): DaemonHa
   checkExtractorEnv();
   resolveDaemonConfig(opts.config);
 
+  const rotation = deps.rotation ?? { last: null };
   let stopped = false;
   let inFlight: Promise<void> | null = null;
   let timer: NodeJS.Timeout | undefined;
 
   const tick = (): void => {
     if (stopped || inFlight) return; // previous tick still running: skip
-    inFlight = runDaemonOnce(deps, {
+    inFlight = runDaemonOnce({ ...deps, rotation }, {
       trigger: "timer",
       ...(opts.minds ? { minds: opts.minds } : {}),
       ...(opts.config ? { config: opts.config } : {}),

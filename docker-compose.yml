@@ -132,6 +132,8 @@ services:
       RERANK_URL: ${RERANK_URL:-}
       RERANK_API_KEY: ${RERANK_API_KEY:-}
       EXTRACTOR_LOOKBACK_DAYS: ${EXTRACTOR_LOOKBACK_DAYS:-30}
+      EXTRACTOR_REPAIR_BUDGET: ${EXTRACTOR_REPAIR_BUDGET:-50}
+      DAEMON_TICK_BUDGET_MS: ${DAEMON_TICK_BUDGET_MS:-0}
     volumes:
       - embed-cache:/data/embed-cache
     restart: unless-stopped

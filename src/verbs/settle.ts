@@ -1,7 +1,8 @@
 // sanctum-mind. Copyright 2026 LKM Constructs LLC.
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
-import { appendEvent } from "./common.js";
+import { appendEvent, nodeLockKey, proposalLockKey } from "./common.js";
+import { recordRepairWork } from "./repair_work.js";
 import { VOW_NODE, supersedeNode } from "./self_common.js";
 import type { VerbContext } from "./types.js";
 
@@ -42,7 +43,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     [mind, now],
   );
   for (const { id } of props.rows) {
-    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`proposal:${id}`]);
+    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [proposalLockKey(id)]);
     // re-read under the lock: a withdrawal that committed meanwhile wins
     const cur = await ctx.tx.query<{
       section: string;
@@ -62,7 +63,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     if (!p || p.target_node_id === null) continue;
     if (p.action === "retire") {
       // the core is invalidated, not replaced and not deleted; edges stay as they are (supersedeNode leaves the old node's edges too)
-      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${p.target_node_id}`]);
+      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(p.target_node_id)]);
       const ev = await appendEvent(ctx, {
         kind: "identity.retired",
         subject_id: id,
@@ -85,6 +86,8 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
         ],
       );
       if (upd.rowCount !== 1) throw new Error(`identity retire ${id}: core ${p.target_node_id} vanished under the lock`);
+      // belief repair: the work row is written in the same transaction as the retirement
+      await recordRepairWork(ctx.tx, { mind_id: mind, upstream_id: p.target_node_id, upstream_state: "retired", replacement_id: null, created_event_id: ev.id });
       await ctx.tx.query(
         `update proposals set status = 'settled', settled_at = $2, settled_event_id = $3 where id = $1 and mind_id = $4`,
         [id, ev.created_at, ev.id, mind],
@@ -128,7 +131,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     [mind, VOW_NODE, now],
   );
   for (const { id } of vows.rows) {
-    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${id}`]);
+    await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(id)]);
     const cur = await ctx.tx.query<{ metadata: Record<string, any> }>(
       `select metadata from nodes where id = $1 and mind_id = $2 and node_type = $3 and invalidated_at is null
          and jsonb_typeof(metadata->'break_declared') = 'object'`,

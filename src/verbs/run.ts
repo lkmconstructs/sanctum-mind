@@ -59,8 +59,10 @@ export async function runVerb(
     console.error(`verb ${name} embedText failed:`, e);
   }
 
-  try {
-    return await withMind(deps.pool, input.mind_id, caller.bearer, mode, async (tx: PoolClient) => {
+  // A deadlock (40P01) or serialization failure (40001) rolls the whole transaction back; running it again from scratch is safe because a
+  // handler has no effect outside its transaction: embedding happened above, before it opened, and sink deliveries are only queued in the
+  // outbox inside it. One retry; a second failure is a storage error like any other.
+  const attempt = () => withMind(deps.pool, input.mind_id, caller.bearer, mode, async (tx: PoolClient) => {
       const result = await verb.handler(
         {
           caller,
@@ -80,6 +82,15 @@ export async function runVerb(
       if (!result.ok) throw new VerbErrorSignal(result);
       return result;
     }, "verb");
+  try {
+    try {
+      return await attempt();
+    } catch (e) {
+      const code = typeof e === "object" && e !== null && "code" in e ? (e as { code: unknown }).code : undefined;
+      if (e instanceof VerbErrorSignal || (code !== "40P01" && code !== "40001")) throw e;
+      console.error(`verb ${name}: ${String(code)}, running it once more`);
+      return await attempt();
+    }
   } catch (e) {
     if (e instanceof VerbErrorSignal) return e.result;
     console.error(`verb ${name} failed:`, e);

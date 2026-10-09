@@ -103,6 +103,9 @@ const SQL_FORMS: Array<[RegExp, string]> = [
   [new RegExp(String.raw`\bdelete\s+from\s+(?:only\s+)?${T}`, "i"), "deletes from a memory table"],
   [new RegExp(String.raw`\btruncate\s+(?:table\s+)?(?:only\s+)?${T}`, "i"), "truncates a memory table"],
   [/\b(?:insert\s+into|merge\s+into|delete\s+from|update|copy|truncate)\s*(?:\$\{|["'`]\s*\+)/i, "writes to a table whose name is not a literal"],
+  // repair_work: the extractor may only claim and acknowledge (update); the rows are inserted by verbs in the invalidating transaction and by the operator's backfill
+  [/\b(?:insert\s+into|merge\s+into|copy)\s+(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "inserts into repair_work (only verbs and the operator backfill insert work)"],
+  [/\b(?:delete\s+from|truncate(?:\s+table)?)\s+(?:only\s+)?(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "deletes from repair_work"],
 ];
 const FORBIDDEN_IDENTIFIERS: Array<[RegExp, string]> = [
   [/\bregistry\b/, "uses the verb registry"],
@@ -187,6 +190,9 @@ describe("src/extractor never writes memory (static)", () => {
       ["copy", `copy nodes from stdin`],
       ["truncate", `truncate table edges`],
       ["a cte write", `with x as (insert into events (a) values (1) returning id) select * from x`],
+      ["insert into repair_work", `await tx.query("insert into repair_work (a) values (1)")`],
+      ["insert into repair_work, quoted and qualified", `await tx.query('INSERT INTO public."repair_work" (a)')`],
+      ["delete from repair_work", `await tx.query("delete from repair_work where true")`],
       ["split string", `await tx.query("insert " + "into nodes (a)")`],
       ["dynamic table by concatenation", `await tx.query("insert into " + table + " (a)")`],
       ["dynamic table by template", "await tx.query(`insert into ${table} (a)`)"],
@@ -238,6 +244,9 @@ describe("src/extractor never writes memory (static)", () => {
     }
     it("imports of appendEvent from common.js and types from types.js", () => {
       expect(violations(`import { appendEvent } from "../verbs/common.js";\nimport type { VerbContext } from "../verbs/types.js";`)).toEqual([]);
+    });
+    it("claiming and acknowledging repair_work (updates and reads)", () => {
+      expect(violations(`await tx.query("select id from repair_work where done_at is null"); await tx.query("update repair_work set next_offset = 1, done_at = now() where id = $1")`)).toEqual([]);
     });
     it("the noticing tables", () => {
       expect(violations(`await tx.query("insert into noticings (a) values (1)"); await tx.query("update noticings set status = 'expired'"); await tx.query("insert into extractor_models (a)")`)).toEqual([]);

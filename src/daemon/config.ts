@@ -29,6 +29,11 @@ export interface DaemonConfig {
   letterAgingDays: number;
   /** letters.expire: at most one event per letter in this many days */
   letterRenotifyDays: number;
+  /**
+   * Wall-clock budget for one tick across all minds, in milliseconds; 0 (the default) is unlimited. When the minds processed so far
+   * have used it up, the rest wait for the next tick, which starts after the mind processed last. At least one mind is always processed.
+   */
+  tickBudgetMs: number;
 }
 
 export const DEFAULT_DAEMON_CONFIG: Readonly<DaemonConfig> = Object.freeze({
@@ -43,6 +48,7 @@ export const DEFAULT_DAEMON_CONFIG: Readonly<DaemonConfig> = Object.freeze({
   backfillRows: 256,
   letterAgingDays: 90,
   letterRenotifyDays: 30,
+  tickBudgetMs: 0,
 });
 
 const ENV_NAMES: Record<keyof DaemonConfig, string> = {
@@ -57,14 +63,16 @@ const ENV_NAMES: Record<keyof DaemonConfig, string> = {
   backfillRows: "DAEMON_BACKFILL_ROWS",
   letterAgingDays: "DAEMON_LETTER_AGING_DAYS",
   letterRenotifyDays: "DAEMON_LETTER_RENOTIFY_DAYS",
+  tickBudgetMs: "DAEMON_TICK_BUDGET_MS",
 };
 
 const KEYS = Object.keys(ENV_NAMES) as Array<keyof DaemonConfig>;
 
 function positiveInt(label: string, v: unknown): number {
+  const zeroOk = label === "tickBudgetMs" || label === ENV_NAMES.tickBudgetMs; // 0 means unlimited
   const n = typeof v === "string" ? (/^\d+$/.test(v.trim()) ? Number(v.trim()) : NaN) : v;
-  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1 || n > 1_000_000) {
-    throw new Error(`${label} must be a positive integer (got ${JSON.stringify(v)})`);
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < (zeroOk ? 0 : 1) || n > (zeroOk ? 86_400_000 : 1_000_000)) {
+    throw new Error(`${label} must be ${zeroOk ? "a whole number of milliseconds, 0 for no limit" : "a positive integer"} (got ${JSON.stringify(v)})`);
   }
   return n;
 }

@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb, type VerbContext } from "./types.js";
-import { appendEvent, mindIdSchema, nonBlankText, text } from "./common.js";
+import { appendEvent, mindIdSchema, nonBlankText, text, uuidSchema } from "./common.js";
 
 const STATUSES = ["open", "in_progress", "blocked", "done", "cancelled"] as const;
 const TERMINAL = ["done", "cancelled"];
@@ -18,8 +18,8 @@ const schema = z
     priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
     status: z.enum(STATUSES).optional(),
     tags: z.array(text(64)).max(32).optional(),
-    depends_on: z.array(z.uuid()).max(32).optional(),
-    task_id: z.uuid().optional(),
+    depends_on: z.array(uuidSchema).max(32).optional(),
+    task_id: uuidSchema.optional(),
     filter_status: z.array(z.enum(STATUSES)).optional(),
     limit: z.number().int().min(1).max(200).default(20),
   })

@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { deriveLabel, mindIdSchema, nonBlankText, text } from "./common.js";
+import { deriveLabel, mindIdSchema, nonBlankText, text, uuidSchema } from "./common.js";
 import { OBSERVATION_NODE, RELATED_TO_EDGE, eventTime, instant, texture } from "./texture.js";
 import { appendEventWithTimes } from "./ledger.js";
 
@@ -13,7 +13,7 @@ const schema = z.strictObject({
   content: nonBlankText(12000),
   texture: texture.optional(),
   label: nonBlankText(200).optional(),
-  linked_to: z.array(z.uuid()).max(16).optional(),
+  linked_to: z.array(uuidSchema).max(16).optional(),
   context: text(64).optional(),
   recorded_at: instant.optional(),
   event_time: eventTime.optional(),

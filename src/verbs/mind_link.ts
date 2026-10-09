@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb, type VerbContext } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema, nodeLockKey } from "./common.js";
 
 export const LINK_EDGE_TYPES = [
   "related_to", "contradicts", "conflicts_with", "corrects", "derived_from",
@@ -13,8 +13,8 @@ export const LINK_EDGE_TYPES = [
 
 const schema = z.strictObject({
   mind_id: mindIdSchema,
-  source_id: z.uuid(),
-  target_id: z.uuid(),
+  source_id: uuidSchema,
+  target_id: uuidSchema,
   edge_type: z.enum(LINK_EDGE_TYPES).default("related_to"),
   weight: z.number().min(0).max(1).default(0.5),
   note: text(4000).optional(),
@@ -49,6 +49,10 @@ export async function linkNodes(
   if (input.source_id === input.target_id) {
     return err("invalid_input", "a node cannot be linked to itself", "target_id");
   }
+  // The per-node lock supersedeNode takes, in a fixed order, BEFORE the liveness check: a link cannot commit against a node that is
+  // being invalidated concurrently (either the rewrite waits for this transaction, and then repair finds the edge, or the node is
+  // already invalid here and the link is refused).
+  for (const key of [nodeLockKey(input.source_id), nodeLockKey(input.target_id)].sort()) await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [key]);
   for (const [field, id] of [["source_id", input.source_id], ["target_id", input.target_id]] as const) {
     const n = await ctx.tx.query(`select 1 from nodes where id = $1 and invalidated_at is null`, [id]);
     if (n.rows.length === 0) return err("not_found", `${field} is not a live node`, field);

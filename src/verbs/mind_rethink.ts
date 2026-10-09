@@ -4,14 +4,14 @@
 import { z } from "zod";
 import { err } from "../result.js";
 import { defineVerb } from "./types.js";
-import { mindIdSchema, text } from "./common.js";
+import { mindIdSchema, text, uuidSchema } from "./common.js";
 import { IDENTITY_NODE, VOW_NODE, supersedeNode } from "./self_common.js";
 
 const PROTECTED_NODE_TYPES: string[] = [IDENTITY_NODE, VOW_NODE];
 
 const schema = z.strictObject({
   mind_id: mindIdSchema,
-  node_id: z.uuid(),
+  node_id: uuidSchema,
   content: text(12000),
   label: text(200).optional(),
   node_type: text(64).optional(),

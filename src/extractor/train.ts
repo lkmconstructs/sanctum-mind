@@ -148,7 +148,7 @@ export function trainModel(rows: DecidedRow[], previous: Model): Trained {
 /**
  * `notice.train`: refits the mind's scorer from its own decisions, once a day after notice.extract (same schedule gate,
  * its own row in extractor_runs). Uses noticings that were shown to the mind (stage propose) and decided: accepted is 1,
- * rejected 0, expired 0 at half weight; imported expiries (a proposal from another life) and rows with no recorded
+ * rejected 0, expired 0 at half weight; imported expiries (a proposal from another life), expiries because a cited node was rewritten or retired (`source_invalidated`: the mind never had the chance to judge them) and rows with no recorded
  * features are left out. With fewer than 30 decided, or fewer than 5 of either class, it says why and the current model
  * stands. A refit is a NEW row in extractor_models (version = latest + 1; old rows are never changed or deleted) and a
  * `notice.model.trained` event with the held-out numbers. Deterministic: no randomness, no model call.
@@ -167,7 +167,7 @@ export const noticeTrain: DaemonPass = {
       `select n.status, n.features
          from noticings n left join events d on d.id = n.decided_event_id
         where n.mind_id = $1 and n.kind <> 'repair' and n.stage = 'propose' and n.status in ('accepted', 'rejected', 'expired')
-          and n.features <> '{}'::jsonb and coalesce(d.payload->>'reason', '') <> 'imported'
+          and n.features <> '{}'::jsonb and coalesce(d.payload->>'reason', '') not in ('imported', 'source_invalidated')
         order by n.created_at, n.id`,
       [mind],
     );

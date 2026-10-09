@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pool } from "pg";
-import { appPool, closePool, queryAs, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
+import { appPool, closePool, queryAs, queryLegacy, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
 import { upsertMinds } from "../src/auth.js";
 import { runMigrations } from "../src/db/migrate.js";
 import { createPool, withMind } from "../src/db/pool.js";
@@ -15,6 +15,8 @@ import { runVerb } from "../src/verbs/run.js";
 import { registry } from "../src/verbs/registry.js";
 import { runDaemonOnce, PASSES } from "../src/daemon/index.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
+import { noticeExpire } from "../src/extractor/expire.js";
+import { noticeTrain as ALL_MODEL_TRAIN } from "../src/extractor/train.js";
 import { FAKE_EMBEDDER } from "./fake-embedder.js";
 import { exportMind } from "../src/export.js";
 import { importMind } from "../src/import-mind.js";
@@ -1032,22 +1034,73 @@ describe("link sources and provenance edges", () => {
     expect(await countOf("events")).toBe(before);
   });
 
-  it("edges go only to live source nodes: an invalidated source is recorded in the metadata and gets no edge", async () => {
+  it("a source node that was rewritten or retired refuses the accept (conflict, the dead ids named, nothing written); events among the sources are fine", async () => {
     const n1 = await mkNode("alpha", "live one");
     const n2 = await mkNode("alpha", "live two");
     const n3 = await mkNode("alpha", "set aside");
     await queryAs(pool, "alpha", "alpha", "update nodes set invalidated_at = now() where id = $1", [n3]);
     const pat = await seedNoticing({ kind: "pattern", sources: [n1, n2, n3] });
-    const rp = await N(alpha, { operation: "accept", noticing_id: pat });
-    expect(rp.ok).toBe(true);
-    const pnode = rp.receipt.projection.node_id;
-    expect((await admin.query("select source_node_id from edges where target_node_id = $1 order by 1", [pnode])).rows.map((r) => r.source_node_id).sort()).toEqual([n1, n2].sort());
-    expect((await admin.query("select metadata from nodes where id = $1", [pnode])).rows[0].metadata.sources).toEqual([n1, n2, n3]);
-
     const dis = await seedNoticing({ kind: "distillation", sources: [n1, n3] });
-    const rd = await N(alpha, { operation: "accept", noticing_id: dis });
-    expect(rd.ok).toBe(true);
-    expect((await admin.query("select target_node_id from edges where source_node_id = $1", [rd.receipt.projection.node_id])).rows.map((r) => r.target_node_id)).toEqual([n1]);
+    const link = await seedNoticing({ sources: [n1, n3] });
+    const before = { nodes: (await admin.query("select count(*)::int n from nodes")).rows[0].n, edges: (await admin.query("select count(*)::int n from edges")).rows[0].n, events: (await admin.query("select count(*)::int n from events")).rows[0].n };
+    for (const id of [pat, dis, link]) {
+      const r = await N(alpha, { operation: "accept", noticing_id: id });
+      expect(r.ok).toBe(false);
+      expect(r.error.code).toBe("conflict");
+      expect(r.error.field).toBe("noticing_id");
+      expect(r.error.message).toContain("a source was rewritten or retired since this was proposed");
+      expect(r.error.message).toContain(n3);
+      expect(r.error.message).not.toContain(n1);
+      expect((await admin.query("select status from noticings where id = $1", [id])).rows[0].status).toBe("pending");
+    }
+    expect({ nodes: (await admin.query("select count(*)::int n from nodes")).rows[0].n, edges: (await admin.query("select count(*)::int n from edges")).rows[0].n, events: (await admin.query("select count(*)::int n from events")).rows[0].n }).toEqual(before);
+    // with every node source live, an event source is still recorded in the metadata and gets no edge
+    const ev = (await admin.query("select id from events limit 1")).rows[0].id;
+    const ok = await seedNoticing({ kind: "pattern", sources: [n1, n2, ev] });
+    const rp = await N(alpha, { operation: "accept", noticing_id: ok });
+    expect(rp.ok).toBe(true);
+    expect((await admin.query("select source_node_id from edges where target_node_id = $1 order by 1", [rp.receipt.projection.node_id])).rows.map((r) => r.source_node_id).sort()).toEqual([n1, n2].sort());
+    expect((await admin.query("select metadata from nodes where id = $1", [rp.receipt.projection.node_id])).rows[0].metadata.sources).toEqual([n1, n2, ev]);
+  });
+
+  it("a stale expiry (source_invalidated) is left out of training and out of the report's precision, and shown apart as stale", async () => {
+    await setState("alpha", "propose");
+    const n1 = await mkNode("alpha", "live one");
+    const n2 = await mkNode("alpha", "live two");
+    const n3 = await mkNode("alpha", "set aside");
+    await queryAs(pool, "alpha", "alpha", "update nodes set invalidated_at = now() where id = $1", [n3]);
+    const stale = await seedNoticing({ kind: "distillation", sources: [n1, n3] });
+    const rejected = await seedNoticing({ sources: [n1, n2] });
+    await queryLegacy(admin, "update noticings set features = '{\"cosine\": 0.5}'::jsonb");
+    await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => T0 }, { trigger: "manual", minds: ["alpha"], passes: [noticeExpire] });
+    expect((await N(alpha, { operation: "reject", noticing_id: rejected })).ok).toBe(true);
+    const rep = await extractorReport(admin, "alpha", () => T0);
+    expect(rep.stale).toBe(1);
+    expect(rep.precision).toMatchObject({ accepted: 0, decided: 1 }); // the rejection counts, the stale expiry does not
+    expect(rep.acceptance_by_kind).toEqual({ link: { accepted: 0, decided: 1, rate: 0 }, distillation: { accepted: 0, decided: 0, rate: null } });
+    expect(formatExtractorReport(rep)).toMatch(/stale .*: 1/);
+    await setExtractorState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    const t = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => T0 }, { trigger: "manual", minds: ["alpha"], passes: [ALL_MODEL_TRAIN] });
+    expect(t[0]!.passes[0]!.ok).toBe(true);
+    expect((await admin.query("select notes from extractor_runs where pass = 'notice.train' order by started_at desc limit 1")).rows[0].notes).toMatchObject({ trained: false, decided: 1 });
+    void stale;
+  });
+
+  it("the expiry pass expires a pending proposal that cites a dead node (reason source_invalidated, ids only) and leaves live ones and repairs alone", async () => {
+    const n1 = await mkNode("alpha", "live one");
+    const n2 = await mkNode("alpha", "live two");
+    const n3 = await mkNode("alpha", "set aside");
+    await queryAs(pool, "alpha", "alpha", "update nodes set invalidated_at = now() where id = $1", [n3]);
+    const stale = await seedNoticing({ kind: "distillation", sources: [n1, n3] });
+    const fine = await seedNoticing({ sources: [n1, n2] });
+    const reports = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => T0 }, { trigger: "manual", minds: ["alpha"], passes: [noticeExpire] });
+    expect(reports[0]!.passes[0]).toMatchObject({ ok: true, changed: 1 });
+    const rows = (await admin.query("select id, status, decided_event_id from noticings where id = any($1::uuid[])", [[stale, fine]])).rows;
+    expect(rows.find((r) => r.id === stale)).toMatchObject({ status: "expired" });
+    expect(rows.find((r) => r.id === fine)).toMatchObject({ status: "pending" });
+    const ev = (await admin.query("select payload from events where id = $1", [rows.find((r) => r.id === stale).decided_event_id])).rows[0].payload;
+    expect(ev).toMatchObject({ noticing_id: stale, noticing_kind: "distillation", reason: "source_invalidated" });
+    expect(JSON.stringify(ev)).not.toContain("set aside");
   });
 });
 

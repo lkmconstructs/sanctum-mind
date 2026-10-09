@@ -7,7 +7,7 @@ import { defineVerb } from "./types.js";
 import type { VerbContext } from "./types.js";
 import { mindIdSchema, text } from "./common.js";
 import { bookkeepingExcluded } from "../extractor/events.js";
-import { pendingRepairs } from "./mind_notice.js";
+import { listNoticings, pendingRepairs, repairsByUpstream } from "./mind_notice.js";
 
 const lim = (def: number, max = 100) => z.number().int().min(1).max(max).default(def);
 
@@ -73,17 +73,27 @@ export const mind_orient = defineVerb<typeof schema, unknown>({
         },
         { key: "anchors", run: (c) => compose(c, "mind_anchor", { operation: "list" }) },
         // what the mind is carrying: the seven heaviest things (mind_attend list), before the proposals
-        { key: "attention", run: (c) => compose(c, "mind_attend", { operation: "list", limit: 7 }) },
         {
-          // the top 5 pending proposals when the extractor is at stage propose; an empty array otherwise (off, shadow, not registered)
-          key: "noticings",
+          key: "attention",
           run: async (c) => {
-            const r = (await compose(c, "mind_notice", { operation: "list", limit: 5 })) as { noticings?: unknown } | null;
-            return Array.isArray(r?.noticings) ? r.noticings : [];
+            const r = (await compose(c, "mind_attend", { operation: "list", limit: 7 })) as { items?: unknown; stale_pins?: unknown } | null;
+            // items only (the pins themselves are in mind_attend list); stale_pins says how many pins mark nothing and could be released
+            return r !== null && Array.isArray(r.items) ? { items: r.items, stale_pins: typeof r.stale_pins === "number" ? r.stale_pins : 0 } : r;
           },
         },
-        // repairs waiting for the mind (a node it relied on was rewritten or retired); shown whatever the extractor's state
-        { key: "repairs", run: async (c) => ({ pending: await pendingRepairs(c) }) },
+        {
+          // the top 5 pending proposals the mind may see (the extractor's at stage propose, repairs whatever the stage). Repairs come first but at
+          // most 3 of them when any other proposal is pending, so a rewrite with many dependants cannot crowd out everything else.
+          key: "noticings",
+          run: async (c) => {
+            if (!c.registry.some((v) => v.name === "mind_notice")) return [];
+            const others = (await listNoticings(c, { limit: 5, noRepair: true })).noticings;
+            const reps = (await listNoticings(c, { kind: "repair", limit: others.length > 0 ? 3 : 5 })).noticings;
+            return [...reps, ...others.slice(0, 5 - reps.length)];
+          },
+        },
+        // repairs waiting for the mind (a node it relied on was rewritten or retired); shown whatever the extractor's state, with the top 5 upstreams by count
+        { key: "repairs", run: async (c) => ({ pending: await pendingRepairs(c), by_upstream: await repairsByUpstream(c, 5) }) },
       );
     }
     if (full) {

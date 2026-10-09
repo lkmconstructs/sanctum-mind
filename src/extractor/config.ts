@@ -50,10 +50,24 @@ export function extractorLookbackDays(env: NodeJS.ProcessEnv = process.env): num
   return Number(raw);
 }
 
+/**
+ * `EXTRACTOR_REPAIR_BUDGET`: the most new repair proposals `notice.repair` makes in one tick, across every upstream node it works through
+ * (a node with many dependants is continued on the next tick). A positive whole number up to 10000; default 50.
+ */
+export const DEFAULT_EXTRACTOR_REPAIR_BUDGET = 50;
+
+export function extractorRepairBudget(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.EXTRACTOR_REPAIR_BUDGET;
+  if (raw === undefined || raw === "") return DEFAULT_EXTRACTOR_REPAIR_BUDGET;
+  if (!/^[1-9][0-9]{0,4}$/.test(raw) || Number(raw) > 10000) throw new Error(`EXTRACTOR_REPAIR_BUDGET must be a whole number from 1 to 10000 (got "${raw}")`);
+  return Number(raw);
+}
+
 /** Validates every EXTRACTOR_* variable; throws on the first bad one. The daemon calls it at start so a typo stops the service, not a night's run. */
 export function checkExtractorEnv(env: NodeJS.ProcessEnv = process.env): void {
   extractorTtlDays(env);
   extractorReproposeDays(env);
   extractorMaxCandidates(env);
   extractorLookbackDays(env);
+  extractorRepairBudget(env);
 }

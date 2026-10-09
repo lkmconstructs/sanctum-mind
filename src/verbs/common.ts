@@ -15,6 +15,13 @@ export const mindIdSchema = z
 /** String.prototype.isWellFormed is Node 22 (ES2024); tsconfig targets ES2022 lib, so call it through a type. */
 const isWellFormed = (s: string): boolean => (s as string & { isWellFormed(): boolean }).isWellFormed();
 
+/** A uuid, lowercased at the schema boundary so every verb sees one spelling (z.uuid() accepts upper case, and ids are used in lock keys). */
+export const uuidSchema = z.uuid().transform((s) => s.toLowerCase());
+
+/** The advisory-lock keys for a node and for a proposal. The ONE place they are built, always lowercased: node:ABC and node:abc must be the same lock. */
+export const nodeLockKey = (id: string): string => `node:${id.toLowerCase()}`;
+export const proposalLockKey = (id: string): string => `proposal:${id.toLowerCase()}`;
+
 /** Bounded free text that Postgres can store: no NUL bytes. */
 export const text = (max = 4000) =>
   z

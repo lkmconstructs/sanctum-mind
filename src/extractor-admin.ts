@@ -26,16 +26,22 @@ export const EXTRACTOR_USAGE =
   "usage: sanctum-mind extractor enable --mind <id> [--stage shadow|propose] [--schedule HH:MM] [--json]\n" +
   "       sanctum-mind extractor disable|pause|resume --mind <id> [--json]\n" +
   "       sanctum-mind extractor stage --mind <id> --stage shadow|propose [--json]\n" +
-  "       sanctum-mind extractor report --mind <id> [--json]";
+  "       sanctum-mind extractor report --mind <id> [--json]\n" +
+  "       sanctum-mind extractor repair-backfill --mind <id> [--since <ISO date>] [--dry-run] [--json]";
 
-export type ExtractorAction = "enable" | "disable" | "pause" | "resume" | "stage" | "report";
-const ACTIONS: readonly ExtractorAction[] = ["enable", "disable", "pause", "resume", "stage", "report"];
+export type ExtractorAction = "enable" | "disable" | "pause" | "resume" | "stage" | "report" | "repair-backfill";
+const ACTIONS: readonly ExtractorAction[] = ["enable", "disable", "pause", "resume", "stage", "report", "repair-backfill"];
+/** The actions that change the extractor's switch (the others report or backfill). */
+type StateAction = Exclude<ExtractorAction, "report" | "repair-backfill">;
 
 export interface ExtractorArgs {
   action: ExtractorAction;
   mind: string;
   stage?: ExtractorStage;
   schedule?: string;
+  /** repair-backfill: only nodes invalidated on or after this date */
+  since?: Date;
+  dryRun?: boolean;
   json: boolean;
 }
 
@@ -48,7 +54,10 @@ export function parseExtractorArgs(argv: string[]): ExtractorArgs {
   try {
     parsed = parseArgs({
       args: argv,
-      options: { mind: { type: "string" }, stage: { type: "string" }, schedule: { type: "string" }, json: { type: "boolean" } },
+      options: {
+        mind: { type: "string" }, stage: { type: "string" }, schedule: { type: "string" }, since: { type: "string" },
+        "dry-run": { type: "boolean" }, json: { type: "boolean" },
+      },
       strict: true,
       allowPositionals: true,
     });
@@ -69,7 +78,16 @@ export function parseExtractorArgs(argv: string[]): ExtractorArgs {
   if (values.schedule !== undefined && action !== "enable") {
     throw new ArgError(`extractor ${action} does not take --schedule\n${EXTRACTOR_USAGE}`);
   }
+  if ((values.since !== undefined || values["dry-run"] === true) && action !== "repair-backfill") {
+    throw new ArgError(`extractor ${action} does not take --since or --dry-run\n${EXTRACTOR_USAGE}`);
+  }
   const out: ExtractorArgs = { action, mind: values.mind, json: values.json === true };
+  if (values.since !== undefined) {
+    const t = Date.parse(values.since);
+    if (!/^\d{4}-\d{2}-\d{2}/.test(values.since) || Number.isNaN(t)) throw new ArgError(`invalid --since "${values.since}" (use an ISO date such as 2026-01-31)`);
+    out.since = new Date(t);
+  }
+  if (values["dry-run"] === true) out.dryRun = true;
   if (action === "stage" && values.stage === undefined) throw new ArgError(`--stage shadow|propose is required\n${EXTRACTOR_USAGE}`);
   if (values.stage !== undefined) {
     if (!isExtractorStage(values.stage)) {
@@ -96,7 +114,7 @@ export interface ExtractorStateRow {
 
 export interface ExtractorChange {
   mind: string;
-  action: Exclude<ExtractorAction, "report">;
+  action: StateAction;
   /** false when the state already was as asked: nothing was written, no event */
   changed: boolean;
   state: { enabled: boolean; stage: ExtractorStage; schedule: string; paused: boolean };
@@ -135,7 +153,7 @@ const view = (r: ExtractorStateRow) => ({ enabled: r.enabled, stage: r.stage, sc
 export async function setExtractorState(
   pool: Pool,
   mind: string,
-  action: Exclude<ExtractorAction, "report">,
+  action: StateAction,
   opts: { stage?: string; schedule?: string } = {},
 ): Promise<ExtractorChange> {
   if (!isValidMindId(mind)) throw new ArgError(mindIdProblem(mind));
@@ -194,6 +212,8 @@ export interface ExtractorReport {
   last_30_days: Counts;
   /** Over noticings shown to the mind (stage propose): accepted / (accepted + rejected + expired); null until one is decided. Shadow noticings are never shown, so they are not scored. */
   precision: { value: number | null; accepted: number; decided: number; last_30_days: number | null };
+  /** Proposals shown to the mind that expired because a node they cite was rewritten or retired. Left out of precision, acceptance and training. */
+  stale: number;
   /** What the extractor recorded at stage shadow in the last 30 days, by kind: what it WOULD have proposed. The mind never saw these. */
   shadow_last_30_days: { total: number; by_kind: Record<string, number> };
   /** Acceptance by kind over noticings shown to the mind (stage propose, all time): accepted / decided. rate is null until one is decided. */
@@ -216,6 +236,9 @@ export interface RepairReport {
   rates: { keep: number | null; rethink: number | null; retire: number | null; rejected: number | null; expired: number | null };
   decided: number;
 }
+
+/** An expiry that is not "a cited node was rewritten or retired": those proposals were never the mind's to judge, so they are counted apart (`stale`). */
+const NOT_STALE = "coalesce(d.payload->>'reason', '') <> 'source_invalidated'";
 
 async function repairReport(c: PoolClient, mind: string, since: Date): Promise<RepairReport> {
   const st = await c.query<{ status: string; n: string; recent: string }>(
@@ -283,9 +306,10 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
     const since = new Date(now().getTime() - 30 * 86_400_000);
     const prec = async (from: Date | null) => {
       const r = await c.query<{ accepted: string; decided: string }>(
-        `select count(*) filter (where status = 'accepted') as accepted,
-                count(*) filter (where status in ('accepted', 'rejected', 'expired')) as decided
-           from noticings where mind_id = $1 and kind <> 'repair' and stage = 'propose' and ($2::timestamptz is null or created_at >= $2)`,
+        `select count(*) filter (where n.status = 'accepted') as accepted,
+                count(*) filter (where n.status in ('accepted', 'rejected') or (n.status = 'expired' and ${NOT_STALE})) as decided
+           from noticings n left join events d on d.id = n.decided_event_id
+          where n.mind_id = $1 and n.kind <> 'repair' and n.stage = 'propose' and ($2::timestamptz is null or n.created_at >= $2)`,
         [mind, from],
       );
       const a = Number(r.rows[0]!.accepted);
@@ -301,9 +325,10 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
     const shadowByKind: Record<string, number> = {};
     for (const r of shadow.rows) shadowByKind[r.kind] = Number(r.n);
     const kinds = await c.query<{ kind: string; accepted: string; decided: string }>(
-      `select kind, count(*) filter (where status = 'accepted') as accepted,
-              count(*) filter (where status in ('accepted', 'rejected', 'expired')) as decided
-         from noticings where mind_id = $1 and kind <> 'repair' and stage = 'propose' group by kind`,
+      `select n.kind, count(*) filter (where n.status = 'accepted') as accepted,
+              count(*) filter (where n.status in ('accepted', 'rejected') or (n.status = 'expired' and ${NOT_STALE})) as decided
+         from noticings n left join events d on d.id = n.decided_event_id
+        where n.mind_id = $1 and n.kind <> 'repair' and n.stage = 'propose' group by n.kind`,
       [mind],
     );
     const acceptance: ExtractorReport["acceptance_by_kind"] = {};
@@ -338,6 +363,11 @@ export async function extractorReport(pool: Pool, mind: string, now: () => Date 
       all_time: await counts(c, mind, null),
       last_30_days: await counts(c, mind, since),
       precision: { value: all.value, accepted: all.accepted, decided: all.decided, last_30_days: recent.value },
+      stale: Number((await c.query<{ n: string }>(
+        `select count(*) as n from noticings n join events d on d.id = n.decided_event_id
+          where n.mind_id = $1 and n.kind <> 'repair' and n.stage = 'propose' and n.status = 'expired' and d.payload->>'reason' = 'source_invalidated'`,
+        [mind],
+      )).rows[0]!.n),
     };
   });
 }
@@ -354,6 +384,7 @@ const runNote = (n: Record<string, unknown>): string => {
   if (typeof n.proposed_total === "number") return ` (${n.proposed_total} proposed from ${String(n.candidates ?? "?")} candidate(s), reranker ${String(n.reranker ?? "?")})`;
   if (n.trained === false) return ` (not trained: ${String(n.reason ?? "")})`;
   if (n.trained === true) return ` (trained version ${String(n.version)})`;
+  if (typeof n.work_done === "number") return ` (${String(n.proposed)} proposed, ${n.work_done} changed node(s) fully looked at${n.budget_hit === true ? ", budget spent" : ""})`;
   if (typeof n.upstreams === "number") return ` (${String(n.proposed)} proposed for ${String(n.dependants)} dependant(s) of ${n.upstreams} changed node(s))`;
   return "";
 };
@@ -366,6 +397,7 @@ export function formatExtractorReport(r: ExtractorReport): string {
     `all time:     ${fmtCounts(r.all_time)}`,
     `last 30 days: ${fmtCounts(r.last_30_days)}`,
     `precision (shown to the mind, accepted / decided): ${pct(r.precision.value)} (${r.precision.accepted} of ${r.precision.decided}); last 30 days ${pct(r.precision.last_30_days)}`,
+    `stale (expired because a cited node was rewritten or retired; not in precision or training): ${r.stale}`,
     `repairs (counted apart): ${fmtRepairs(r.repairs)}`,
     `acceptance by kind (shown to the mind): ${
       Object.entries(r.acceptance_by_kind).sort().map(([k, v]) => `${k} ${v.rate === null ? "n/a" : `${(v.rate * 100).toFixed(1)}%`} (${v.accepted} of ${v.decided})`).join(", ") || "nothing shown yet"
@@ -386,11 +418,85 @@ export function formatExtractorChange(r: ExtractorChange): string {
   return r.changed ? `extractor ${r.action} for ${r.mind}: now ${desc}` : `extractor for ${r.mind} already ${desc}; nothing changed`;
 }
 
+export interface RepairBackfillResult {
+  mind: string;
+  dry_run: boolean;
+  /** work rows inserted (or, in a dry run, that would be) */
+  count: number;
+  since: string | null;
+  /** the ledger event that caused rows whose invalidation left no event of its own (null when none was needed or in a dry run) */
+  event_id: string | null;
+}
+
+/**
+ * Belief repair's explicit backfill. Rewrites and retirements made before migration 0025 (and nodes brought in by an import) have no
+ * `repair_work` row, so the daemon never asks about what depended on them. This inserts one for every node that has `superseded_by` set or
+ * `metadata.retired = true` and no work row yet, oldest first (`--since` limits it to nodes invalidated on or after a date); the daemon
+ * then works through them under its per-tick budget. Idempotent: a second run finds nothing to add. Runs as the mind under actor
+ * `operator` (the insert guard accepts the actors verb, daemon and operator, as the mind's own scope). The cause of each row is the node's own `rethink`, `identity.retired` or
+ * `repair.retired` event when the ledger has one; otherwise one `daemon.repair.backfill` event written by this run.
+ */
+export async function repairBackfill(
+  pool: Pool,
+  mind: string,
+  opts: { since?: Date; dryRun?: boolean } = {},
+): Promise<RepairBackfillResult> {
+  if (!isValidMindId(mind)) throw new ArgError(mindIdProblem(mind));
+  const dry = opts.dryRun === true;
+  return inMind(pool, mind, async (c) => {
+    await c.query("select pg_advisory_xact_lock(hashtext($1))", [`daemon:${mind}`]);
+    const todo = await c.query<{ id: string; state: "superseded" | "retired"; replacement: string | null; cause: string | null; at: Date }>(
+      `select n.id, case when n.superseded_by is not null then 'superseded' else 'retired' end as state, n.superseded_by as replacement, n.invalidated_at as at,
+              (select e.id from events e
+                where e.mind_id = n.mind_id
+                  and ((e.subject_id = n.id and e.kind in ('rethink', 'repair.retired'))
+                       or (e.kind = 'identity.retired' and e.payload->>'target_node_id' = n.id::text))
+                order by e.seq desc limit 1) as cause
+         from nodes n
+        where n.mind_id = $1 and n.invalidated_at is not null
+          and (n.superseded_by is not null or n.metadata->>'retired' = 'true')
+          and ($2::timestamptz is null or n.invalidated_at >= $2)
+          and not exists (select 1 from repair_work w where w.mind_id = n.mind_id and w.upstream_id = n.id)
+        order by n.invalidated_at, n.id`,
+      [mind, opts.since ?? null],
+    );
+    const since = opts.since === undefined ? null : opts.since.toISOString();
+    if (dry || todo.rows.length === 0) return { mind, dry_run: dry, count: todo.rows.length, since, event_id: null };
+    let fallback: string | null = null;
+    for (const t of todo.rows) {
+      let cause = t.cause;
+      if (cause === null) {
+        fallback ??= (
+          await c.query<{ id: string }>(
+            `insert into events (mind_id, kind, payload, written_by, recorded_at, created_at)
+             values ($1, 'daemon.repair.backfill', $2::jsonb, $1, now(), clock_timestamp()) returning id`,
+            [mind, JSON.stringify({ since, nodes: todo.rows.length })],
+          )
+        ).rows[0]!.id;
+        cause = fallback;
+      }
+      await c.query(
+        // created_at is when the node was invalidated, so the daemon works through the backfill oldest first
+        `insert into repair_work (mind_id, upstream_id, upstream_state, replacement_id, created_event_id, created_at) values ($1, $2, $3, $4, $5, $6)
+         on conflict (mind_id, upstream_id, created_event_id) do nothing`,
+        [mind, t.id, t.state, t.replacement, cause, t.at],
+      );
+    }
+    return { mind, dry_run: false, count: todo.rows.length, since, event_id: fallback };
+  });
+}
+
 /** Runs a parsed `extractor` command against an admin pool and returns the text (or JSON) to print. */
 export async function runExtractorCommand(pool: Pool, args: ExtractorArgs): Promise<string> {
   if (args.action === "report") {
     const r = await extractorReport(pool, args.mind);
     return args.json ? JSON.stringify(r, null, 2) : formatExtractorReport(r);
+  }
+  if (args.action === "repair-backfill") {
+    const b = await repairBackfill(pool, args.mind, { ...(args.since === undefined ? {} : { since: args.since }), ...(args.dryRun ? { dryRun: true } : {}) });
+    return args.json
+      ? JSON.stringify(b, null, 2)
+      : `repair backfill for ${b.mind}: ${b.dry_run ? "would add" : "added"} ${b.count} repair work row(s)${b.since ? ` (invalidated since ${b.since})` : ""}; the daemon works through them under EXTRACTOR_REPAIR_BUDGET per tick`;
   }
   const r = await setExtractorState(pool, args.mind, args.action, {
     ...(args.stage === undefined ? {} : { stage: args.stage }),

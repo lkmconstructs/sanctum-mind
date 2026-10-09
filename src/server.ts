@@ -38,7 +38,7 @@ export function createMcpServer(deps: RunDeps, getCaller: () => Promise<Caller |
     { capabilities: { tools: {} } },
   );
   const tools = deps.registry.map((v) => {
-    const { $schema: _omit, ...inputSchema } = z.toJSONSchema(v.schema) as Record<string, unknown>;
+    const { $schema: _omit, ...inputSchema } = z.toJSONSchema(v.schema, { io: "input" }) as Record<string, unknown>;
     return { name: v.name, description: v.description, inputSchema: inputSchema as { type: "object" } };
   });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));

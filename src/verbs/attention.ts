@@ -117,6 +117,8 @@ export function attentionWeight(i: WeightInput): number {
 export const CAP_PER_TYPE = 500;
 /** How many of the top items count as "attended" for the extractor. */
 export const ATTENDED_TOP = 12;
+/** A rewrite can leave dozens of repairs; they must not take over the mind's attention. At most this many are items (a pinned repair always is); the rest are counted in `attention_load.repairs_not_shown`. */
+export const REPAIR_ITEMS_MAX = 3;
 
 export interface RawItem {
   type: ItemType;
@@ -243,17 +245,39 @@ const declarations: Collector = async (c, ids) => {
   });
 };
 
-/** The noticings the mind may see: pending, recorded at stage propose, not expired; repairs whatever the extractor's state, the rest only while the operator's stage is propose. */
+/**
+ * The noticings the mind may see: pending, recorded at stage propose, not expired; repairs whatever the extractor's state, the rest only
+ * while the operator's stage is propose. Without an id filter this is the extractor's own kinds only (newest 500): repairs have their own
+ * query and limit (`repairs` below), so a flood of repairs cannot push the other proposals out of the cap. With ids (a pin) any kind.
+ */
 const noticings: Collector = async (c, ids) => {
-  const r = await c.tx.query<{ id: string; kind: string; payload: Record<string, unknown> | null; score: number; sources: string[]; created_at: Date }>(
+  const r = await c.tx.query<NoticingRow>(
     `select n.id, n.kind, n.payload, n.score, n.sources, n.created_at from noticings n
       where n.mind_id = $1 and n.status = 'pending' and n.stage = 'propose' and n.expires_at > $3
         and (n.kind = 'repair' or exists (select 1 from extractor_state s where s.mind_id = n.mind_id and s.stage = 'propose'))
-        and ($2::uuid[] is null or n.id = any($2))
+        and ($2::uuid[] is null or n.id = any($2)) and ($2::uuid[] is not null or n.kind <> 'repair')
       order by n.created_at desc, n.id limit ${CAP_PER_TYPE}`,
     [c.mind_id, only(ids), c.now()],
   );
-  return r.rows.map((x) => {
+  return noticingItems(r.rows);
+};
+
+/** Repairs: the REPAIR_ITEMS_MAX best by score, then newest (their own query and limit). Pinned repairs come through `noticings` with their ids. */
+const repairs: Collector = async (c, ids) => {
+  if (ids !== null) return [];
+  const r = await c.tx.query<NoticingRow>(
+    `select n.id, n.kind, n.payload, n.score, n.sources, n.created_at from noticings n
+      where n.mind_id = $1 and n.kind = 'repair' and n.status = 'pending' and n.stage = 'propose' and n.expires_at > $2
+      order by n.score desc, n.created_at desc, n.id limit ${REPAIR_ITEMS_MAX}`,
+    [c.mind_id, c.now()],
+  );
+  return noticingItems(r.rows);
+};
+
+interface NoticingRow { id: string; kind: string; payload: Record<string, unknown> | null; score: number; sources: string[]; created_at: Date }
+
+const noticingItems = (rows: NoticingRow[]): RawItem[] => {
+  return rows.map((x) => {
     const p = x.payload !== null && typeof x.payload === "object" ? x.payload : {};
     const s = (k: string): string | null => (typeof p[k] === "string" && (p[k] as string).trim() !== "" ? (p[k] as string) : null);
     const repair = x.kind === "repair";
@@ -345,22 +369,49 @@ export async function livePins(c: AttentionCtx): Promise<PinRow[]> {
 const LABEL_RANK: Partial<Record<ItemType, number>> = { declaration: 4, desire: 3, sit: 2, node: 1, event: 1 };
 
 /**
+ * The identity of the THING an item stands for, by typed namespace. A node can be several kinds of item at once (a desire, a vow
+ * with a declared break, a held charge, a pinned node), so those share `node:<id>`; an event (a held or pinned event) is
+ * `event:<id>`. Every other kind of item has an id of its own table (a loop, thread, task or noticing id, or a proposal's id for a
+ * declaration) and is its own namespace: a uuid that happens to equal a node's id does NOT make them one thing. Merging across
+ * unrelated tables on a bare uuid collision would silently fold a loop into a desire.
+ */
+function thingKey(x: RawItem): string {
+  switch (x.type) {
+    case "desire":
+    case "node":
+      return `node:${x.id}`;
+    case "event":
+      return `event:${x.id}`;
+    case "sit":
+      return `${x.pin_types[0] ?? "node"}:${x.id}`; // a sit holds a node or an event; its pin type says which
+    case "declaration":
+      return x.pin_types.includes("node") ? `node:${x.id}` : `declaration:${x.id}`; // a vow with a declared break is a node; a proposal is not
+    case "repair":
+      return `noticing:${x.id}`;
+    default:
+      return `${x.type}:${x.id}`;
+  }
+}
+
+/**
  * One thing is one item. A desire, a vow with a declared break, a held charge and a pinned node or event can all be the same node
- * (or event), and they share its id; they are merged into one item. The type label is the highest of declaration > desire > sit, and
- * its label, with `since` the latest of the two (last touch wins), the charge and kind prior the higher of the two, the sources
- * and the pin types the union (so a pin of type `node` or of the item's own type marks it). Items with distinct ids are untouched.
- * (Proposal declarations, loops, threads, tasks and noticings have ids of their own tables and never collide.)
+ * (or event); they are merged into one item (by typed identity, see thingKey). The type label is the highest of declaration >
+ * desire > sit, and its label, with `since` the latest of the two (last touch wins), the charge and kind prior the higher of the
+ * two, the sources and the pin types the union (so a pin of type `node` or of the item's own type marks it). Items of unrelated
+ * kinds (a loop, a thread, a task, a noticing, a proposal declaration) are never merged with a node or with each other, whatever
+ * their ids.
  */
 function mergeByThing(raw: RawItem[]): RawItem[] {
   const out = new Map<string, RawItem>();
   for (const x of raw) {
-    const have = out.get(x.id);
+    const key = thingKey(x);
+    const have = out.get(key);
     if (!have) {
-      out.set(x.id, x);
+      out.set(key, x);
       continue;
     }
     const win = (LABEL_RANK[x.type] ?? 0) > (LABEL_RANK[have.type] ?? 0) ? x : have;
-    out.set(x.id, {
+    out.set(key, {
       ...win,
       since: x.since.getTime() > have.since.getTime() ? x.since : have.since,
       charge: Math.max(x.charge, have.charge),
@@ -378,34 +429,68 @@ export interface AttentionSet {
   items: AttentionItem[];
   /** live pins, whether or not the pinned thing is still an item */
   pins: PinRow[];
+  /** all pending repairs the mind may see, whether or not they are items */
+  repairs_pending: number;
+  /** the pending repairs left out of `items` because only REPAIR_ITEMS_MAX repairs (pinned ones always) are carried as items */
+  repairs_not_shown: number;
+  /** ids of the live pins that mark no item: the thing is gone, no longer live, or no longer an attention item. They stay until released. */
+  stale: Set<string>;
 }
+
+/** The typed collectors, each with the pin types whose ids it must always include (a pin is never lost to the per-type cap). */
+const TYPED: Array<[Collector, PinType[]]> = [
+  [loops, ["loop"]],
+  [threads, ["thread"]],
+  [tasks, ["task"]],
+  [desires, ["desire", "node"]],
+  [declarations, ["declaration", "node"]],
+  [noticings, ["noticing"]],
+  [repairs, []],
+  [sits, []],
+];
 
 /**
  * The whole attention set at the clock's `now`: one query per item type (loops, threads, tasks, desires, declarations,
- * noticings, sits), one for the live pins, and one each for a pinned node or event that is not already an item. Ordered by
- * weight desc, then `since` desc, then id. A pin names a thing; a pin whose thing is no longer live (a resolved loop, an
- * archived thread, a settled declaration, a decided noticing, an invalidated node) adds nothing: it stays in `pins` until released.
+ * noticings, sits), one for the live pins, one more for a type whose live pins fell outside its newest-500 cap, and one each for a
+ * pinned node or event that is not already an item. Every typed collector also returns the mind's live pinned ids of its type
+ * whatever the cap, so "anything pinned" is literally true. Ordered by weight desc, then `since` desc, then id. A pin names a
+ * thing; a pin whose thing is no longer live (a resolved loop, an archived thread, a settled declaration, a decided noticing, an
+ * invalidated node) adds nothing: it is `stale` and stays in `pins` until released.
  */
 export async function collectAttention(c: AttentionCtx): Promise<AttentionSet> {
   const now = c.now();
-  const raw: RawItem[] = [];
-  for (const col of [loops, threads, tasks, desires, declarations, noticings, sits]) raw.push(...(await col(c, null)));
-  const merged = mergeByThing(raw);
   const pins = await livePins(c);
-  const pinFor = new Map(pins.map((p) => [`${p.item_type}:${p.item_id}`, p]));
-  const have = new Set(merged.flatMap((x) => x.pin_types.map((t) => `${t}:${x.id}`)));
+  const raw: RawItem[] = [];
+  for (const [col, types] of TYPED) {
+    const rows = await col(c, null);
+    const have = new Set(rows.map((x) => x.id));
+    const want = [...new Set(pins.filter((p) => types.includes(p.item_type)).map((p) => p.item_id.toLowerCase()))].filter((id) => !have.has(id));
+    if (want.length > 0) rows.push(...(await col(c, want)));
+    raw.push(...rows);
+  }
+  const merged = mergeByThing(raw);
+  const pinFor = new Map(pins.map((p) => [`${p.item_type}:${p.item_id.toLowerCase()}`, p]));
+  const haveKey = new Set(merged.flatMap((x) => x.pin_types.map((t) => `${t}:${x.id}`)));
   // a pinned node or event that no other item already stands for is an item of its own
   for (const [type, col] of [["node", nodeItems], ["event", eventItems]] as const) {
-    const want = pins.filter((p) => p.item_type === type && !have.has(`${type}:${p.item_id}`)).map((p) => p.item_id);
+    const want = pins.filter((p) => p.item_type === type && !haveKey.has(`${type}:${p.item_id.toLowerCase()}`)).map((p) => p.item_id);
     if (want.length > 0) merged.push(...(await col(c, want)));
   }
-  const items: AttentionItem[] = merged.map((x) => {
+  const marked = new Set(merged.flatMap((x) => x.pin_types.map((t) => `${t}:${x.id}`)));
+  const stale = new Set(pins.filter((p) => !marked.has(`${p.item_type}:${p.item_id.toLowerCase()}`)).map((p) => p.id));
+  const all: AttentionItem[] = merged.map((x) => {
     const pin = x.pin_types.map((t) => pinFor.get(`${t}:${x.id}`)).find((p) => p !== undefined);
     const pinned = pin !== undefined;
     return { ...x, pinned, note: pin?.note ?? null, weight: attentionWeight({ since: x.since, now, charge: x.charge, type: x.type, pinned, ...(x.kind === undefined ? {} : { kind: x.kind }) }) };
   });
-  items.sort((a, b) => b.weight - a.weight || b.since.getTime() - a.since.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return { items, pins };
+  all.sort((a, b) => b.weight - a.weight || b.since.getTime() - a.since.getTime() || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // the total is a count, not the length of what was collected (which is capped)
+  const total = Number((await c.tx.query<{ n: string }>(
+    `select count(*) as n from noticings where mind_id = $1 and kind = 'repair' and status = 'pending' and stage = 'propose' and expires_at > $2`,
+    [c.mind_id, now],
+  )).rows[0]!.n);
+  const shown = all.filter((x) => x.type === "repair").length;
+  return { items: all, pins, stale, repairs_pending: total, repairs_not_shown: Math.max(0, total - shown) };
 }
 
 /**
@@ -423,7 +508,7 @@ export async function attendedIds(c: AttentionCtx): Promise<Set<string>> {
 }
 
 /** Weather's reading of the same set. */
-export async function attentionLoad(c: AttentionCtx): Promise<{ items: number; pinned: number; top_weight: number }> {
-  const { items } = await collectAttention(c);
-  return { items: items.length, pinned: items.filter((x) => x.pinned).length, top_weight: items[0]?.weight ?? 0 };
+export async function attentionLoad(c: AttentionCtx): Promise<{ items: number; pinned: number; top_weight: number; repairs_pending: number; repairs_not_shown: number }> {
+  const { items, repairs_pending, repairs_not_shown } = await collectAttention(c);
+  return { items: items.length, pinned: items.filter((x) => x.pinned).length, top_weight: items[0]?.weight ?? 0, repairs_pending, repairs_not_shown };
 }

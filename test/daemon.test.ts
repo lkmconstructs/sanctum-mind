@@ -228,6 +228,52 @@ describe("config", () => {
   });
 });
 
+describe("tick budget and fair rotation across minds", () => {
+  it("DAEMON_TICK_BUDGET_MS defaults to 0 (unlimited), accepts 0 and whole milliseconds, and refuses the rest", () => {
+    expect(loadDaemonConfig({}).tickBudgetMs).toBe(0);
+    expect(loadDaemonConfig({ DAEMON_TICK_BUDGET_MS: "0" }).tickBudgetMs).toBe(0);
+    expect(loadDaemonConfig({ DAEMON_TICK_BUDGET_MS: " 1500 " }).tickBudgetMs).toBe(1500);
+    for (const bad of ["-1", "1.5", "abc", "1e3", "90000000"]) expect(() => loadDaemonConfig({ DAEMON_TICK_BUDGET_MS: bad })).toThrow(/DAEMON_TICK_BUDGET_MS/);
+  });
+
+  it("with a budget the minds are processed in rotating order, the rest wait with a note, and the next tick starts after the last one processed (fake clock)", async () => {
+    await admin.query("insert into minds (mind_id, key_hash, display_name) values ('gamma', 'g', 'Gamma')");
+    let clock = new Date("2026-06-15T12:00:00.000Z");
+    const ran: string[] = [];
+    // a pass that takes one second of the fake clock
+    const slow: DaemonPass = { name: "test.slow", async run(ctx) { ran.push(ctx.mind_id); clock = new Date(clock.getTime() + 1000); return { changed: 0 }; } };
+    const rotation = { last: null as string | null };
+    const tick = () => runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => clock, rotation }, { trigger: "manual", passes: [slow], config: { tickBudgetMs: 1500 } });
+
+    const t1 = await tick();
+    expect(ran.splice(0)).toEqual(["alpha", "beta"]); // 1000 ms used after alpha, under 1500: beta runs; 2000 used: gamma waits
+    expect(t1.map((r) => [r.mind_id, r.deferred === true])).toEqual([["alpha", false], ["beta", false], ["gamma", true]]);
+    expect(t1[2]!.note).toMatch(/tick budget \(1500 ms\) spent: 1 mind\(s\) wait for the next tick, which starts at gamma/);
+    expect(t1[2]!.passes).toEqual([]);
+    expect(rotation.last).toBe("beta");
+
+    const t2 = await tick();
+    expect(ran.splice(0)).toEqual(["gamma", "alpha"]); // starts after beta
+    expect(t2.map((r) => [r.mind_id, r.deferred === true])).toEqual([["gamma", false], ["alpha", false], ["beta", true]]);
+
+    const t3 = await tick();
+    expect(ran.splice(0)).toEqual(["beta", "gamma"]);
+    expect(t3.filter((r) => r.deferred).map((r) => r.mind_id)).toEqual(["alpha"]);
+
+    // every mind ran in two of three ticks: nobody starves
+    // at least one mind always runs, however small the budget
+    const t4 = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => clock, rotation }, { trigger: "manual", passes: [slow], config: { tickBudgetMs: 1 } });
+    expect(t4.filter((r) => !r.deferred)).toHaveLength(1);
+    expect(t4.filter((r) => r.deferred)).toHaveLength(2);
+    ran.length = 0;
+
+    // no budget (the default), or no rotation object: everyone runs, in order, every time
+    const all = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, now: () => clock }, { trigger: "manual", passes: [slow] });
+    expect(all.map((r) => r.mind_id)).toEqual(["alpha", "beta", "gamma"]);
+    expect(all.some((r) => r.deferred)).toBe(false);
+  });
+});
+
 describe("drives.decay", () => {
   it("persists decay for lanes with a row older than an hour, one drive.decay event per lane; young lanes are untouched", async () => {
     await mkDrive("alpha", "", "play", 9, new Date(NOW.getTime() - 3 * HOUR));

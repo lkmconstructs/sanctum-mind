@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { err, ok } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema, nodeLockKey } from "./common.js";
 import { MIND_ONLY, VOW_NODE, defaultLabel, insertSelfNode } from "./self_common.js";
 
 const schema = z
@@ -15,7 +15,7 @@ const schema = z
     context: text(4000).optional(),
     reason: text(4000).optional(),
     note: text(4000).optional(),
-    vow_id: z.uuid().optional(),
+    vow_id: uuidSchema.optional(),
     limit: z.number().int().min(1).max(200).default(50),
   })
   .superRefine((v, c) => {
@@ -83,7 +83,7 @@ export const mind_vow = defineVerb<typeof schema, unknown>({
     }
 
     const loadVow = async (vow_id: string) => {
-      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${vow_id}`]);
+      await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(vow_id)]);
       const cur = await ctx.tx.query<{ metadata: VowMeta }>(
         `select metadata from nodes where id = $1 and mind_id = $2 and node_type = $3 and invalidated_at is null`,
         [vow_id, ctx.mind_id, VOW_NODE],

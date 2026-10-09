@@ -2,7 +2,8 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
 import { err, ok, type Result } from "../result.js";
-import { appendEvent, deriveLabel, NOT_EMBEDDED } from "./common.js";
+import { appendEvent, deriveLabel, nodeLockKey, NOT_EMBEDDED } from "./common.js";
+import { recordRepairWork } from "./repair_work.js";
 import type { VerbContext } from "./types.js";
 
 /** Node type literals of the Self region. */
@@ -59,7 +60,7 @@ export async function supersedeNode(
   nodeId: string,
   input: SupersedeInput,
 ): Promise<Result<{ event_id: string; node_id: string; superseded: string }>> {
-  await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${nodeId}`]);
+  await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(nodeId)]);
   const cur = await ctx.tx.query<{
     node_type: string;
     label: string;
@@ -121,6 +122,8 @@ export async function supersedeNode(
      values ($1, 'corrects', $2, $3, $4, 0.5, 1.0, $5::jsonb)`,
     [ctx.mind_id, ctx.caller.bearer, newId, nodeId, JSON.stringify({ event_id: ev.id })],
   );
+  // belief repair: the work is recorded in the transaction that invalidates the node (completeness does not depend on commit timing)
+  await recordRepairWork(ctx.tx, { mind_id: ctx.mind_id, upstream_id: nodeId, upstream_state: "superseded", replacement_id: newId, created_event_id: ev.id });
   return ok({ event_id: ev.id, projection: { event_id: ev.id, node_id: newId, superseded: nodeId } });
 }
 

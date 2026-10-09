@@ -1,10 +1,11 @@
 // sanctum-mind. Copyright 2026 LKM Constructs LLC.
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb } from "./types.js";
-import { appendEvent, mindIdSchema, text } from "./common.js";
+import { appendEvent, mindIdSchema, text, uuidSchema } from "./common.js";
 import { PIN_TYPES, collectAttention, liveItem, type PinType } from "./attention.js";
 
 /** The `forbidden` text for pinning or releasing when the caller is not the mind itself. */
@@ -18,11 +19,11 @@ const schema = z
     limit: z.number().int().min(1).max(50).default(12),
     /** pin; release (with item_id) */
     item_type: z.enum(PIN_TYPES).optional(),
-    item_id: z.uuid().optional(),
+    item_id: uuidSchema.optional(),
     /** pin: why the mind is keeping it in view */
     note: text(1000).optional(),
     /** release: the pin itself, instead of item_type and item_id */
-    pin_id: z.uuid().optional(),
+    pin_id: uuidSchema.optional(),
   })
   .superRefine((v, c) => {
     const need = (field: "item_type" | "item_id", present: boolean, doing: string) => {
@@ -64,20 +65,22 @@ export const mind_attend = defineVerb({
     "What the mind is carrying, and what it keeps in view. list: the heaviest things now (open loops, active threads, open tasks, live desires, " +
     "declarations still cooling, noticings and repairs waiting, held charges, anything pinned), each with a weight from 0 to 1 that is plain " +
     "arithmetic on recency, charge, kind and pin. pin and release are for the mind acting as itself: pinning keeps a thing in view and changes " +
-    "nothing about it; releasing drops the pin. list needs read scope (a steward grant alone is not enough); a grantee with read can list but cannot pin.",
+    "nothing about it; releasing drops the pin (list shows every pin, marking stale ones whose thing is gone; release those by pin_id). list needs read scope (a steward grant alone is not enough); a grantee with read can list but cannot pin.",
   schema,
   scopeFor: (input) => (input.operation === "list" ? "read" : "write"),
   mindOnly: (input) => input.operation === "pin" || input.operation === "release",
   mindOnlyMessage: ATTENTION_MIND_ONLY,
   handler: async (ctx, input): Promise<Result<unknown>> => {
     if (input.operation === "list") {
-      const { items, pins } = await collectAttention(ctx);
+      const { items, pins, stale } = await collectAttention(ctx);
       return ok({
         projection: {
           items: items.slice(0, input.limit).map((x) => ({
             type: x.type, id: x.id, label: x.label, weight: x.weight, since: x.since, pinned: x.pinned, ...(x.note === null ? {} : { note: x.note }),
           })),
-          pins: pins.length,
+          // every live pin, so a stale one (its thing is gone or no longer an attention item) can be found and released by pin_id
+          pins: pins.map((p) => ({ pin_id: p.id, item_type: p.item_type, item_id: p.item_id, note: p.note, pinned_at: p.pinned_at, stale: stale.has(p.id) })),
+          stale_pins: stale.size,
         },
       });
     }
@@ -93,10 +96,12 @@ export const mind_attend = defineVerb({
       const have = await ctx.tx.query(`select 1 from attention_pins where mind_id = $1 and item_type = $2 and item_id = $3 and released_at is null`, [ctx.mind_id, type, id]);
       if (have.rows.length > 0) return err("conflict", `${type} is already pinned`, "item_id");
       const note = input.note ?? null;
-      const ev = await appendEvent(ctx, { kind: "attend.pin", subject_id: id, payload: { item_type: type, item_id: id, note } });
+      // the pin's id is made first and written into its event: the database checks that the event names this very pin
+      const pin_id = randomUUID();
+      const ev = await appendEvent(ctx, { kind: "attend.pin", subject_id: id, payload: { pin_id, item_type: type, item_id: id, note } });
       const r = await ctx.tx.query<PinOut>(
-        `insert into attention_pins (mind_id, item_type, item_id, note, pinned_event_id, pinned_at) values ($1, $2, $3, $4, $5, $6) returning *`,
-        [ctx.mind_id, type, id, note, ev.id, ev.created_at],
+        `insert into attention_pins (id, mind_id, item_type, item_id, note, pinned_event_id, pinned_at) values ($1, $2, $3, $4, $5, $6, $7) returning *`,
+        [pin_id, ctx.mind_id, type, id, note, ev.id, ev.created_at],
       );
       return ok({ event_id: ev.id, projection: { pin: r.rows[0] } });
     }

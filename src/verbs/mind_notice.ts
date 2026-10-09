@@ -4,9 +4,10 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb, type VerbContext } from "./types.js";
-import { appendEvent, deriveLabel, mindIdSchema, text } from "./common.js";
+import { appendEvent, deriveLabel, mindIdSchema, text, uuidSchema, nodeLockKey } from "./common.js";
 import { DISTILLATION_NODE, IDENTITY_NODE, MEMORY_MIND_ONLY, PATTERN_NODE, VOW_NODE, insertSelfNode, supersedeNode } from "./self_common.js";
 import { LINK_EDGE_TYPES, linkNodes } from "./mind_link.js";
+import { recordRepairWork } from "./repair_work.js";
 import {
   REPAIR_DECISIONS, noticeAcceptedPayload, noticeRejectedPayload, repairKeptPayload, repairRethoughtPayload, repairRetiredPayload,
 } from "./notice_events.js";
@@ -21,7 +22,7 @@ const schema = z.strictObject({
   kind: z.enum(KINDS).optional(),
   limit: z.number().int().min(1).max(100).default(20),
   /** accept, reject: the proposal to decide */
-  noticing_id: z.uuid().optional(),
+  noticing_id: uuidSchema.optional(),
   /** accept (pattern, distillation): the mind's own wording of the proposed content; accept (repair, rethink): the new wording */
   content: text(12000).optional(),
   /** accept (repair, rethink): a label for the replacement; default the old one's */
@@ -74,6 +75,17 @@ export async function pendingRepairs(ctx: VerbContext): Promise<number> {
   return Number(r.rows[0]!.n);
 }
 
+/** The pending repairs grouped by the upstream node that caused them, most first (at most `limit` upstreams): what mind_orient shows beside the count. */
+export async function repairsByUpstream(ctx: VerbContext, limit = 5): Promise<Array<{ upstream_id: string; count: number }>> {
+  const r = await ctx.tx.query<{ upstream_id: string; n: string }>(
+    `select payload->>'upstream_id' as upstream_id, count(*) as n from noticings
+      where mind_id = $1 and kind = 'repair' and status = 'pending' and expires_at > $2
+      group by 1 order by count(*) desc, 1 limit $3`,
+    [ctx.mind_id, ctx.now(), limit],
+  );
+  return r.rows.map((x) => ({ upstream_id: x.upstream_id, count: Number(x.n) }));
+}
+
 /**
  * The pending noticings the mind may see, ranked by score, repairs first. Repairs are shown whenever they are pending and not
  * past their expiry, even with the extractor off or at stage shadow. Every other kind is shown only while the operator's stage
@@ -82,7 +94,7 @@ export async function pendingRepairs(ctx: VerbContext): Promise<number> {
  */
 export async function listNoticings(
   ctx: VerbContext,
-  opts: { kind?: string | undefined; limit: number },
+  opts: { kind?: string | undefined; limit: number; /** leave repairs out (orient reserves slots for the other kinds) */ noRepair?: boolean },
 ): Promise<{ noticings: ListedNoticing[]; stage: "off" | "shadow" | "propose" }> {
   const st = await ctx.tx.query<{ stage: "shadow" | "propose" }>(`select stage from extractor_state where mind_id = $1`, [ctx.mind_id]);
   const stage = st.rows[0]?.stage ?? "off";
@@ -90,9 +102,9 @@ export async function listNoticings(
   const rows = await ctx.tx.query<NoticingRow>(
     `select id, kind, sources, payload, score, stage, status, expires_at from noticings
       where mind_id = $1 and stage = 'propose' and status = 'pending' and expires_at > $4 and ($2::text is null or kind = $2)
-        and (kind = 'repair' or $5::boolean)
+        and (kind = 'repair' or $5::boolean) and (kind <> 'repair' or not $6::boolean)
       order by (kind = 'repair') desc, score desc, created_at asc, id limit $3`,
-    [ctx.mind_id, opts.kind ?? null, opts.limit, ctx.now(), stage === "propose"],
+    [ctx.mind_id, opts.kind ?? null, opts.limit, ctx.now(), stage === "propose", opts.noRepair === true],
   );
   const ids = [...new Set(rows.rows.flatMap((r) => r.sources))];
   const snippets = new Map<string, NoticingSource>();
@@ -132,6 +144,17 @@ async function decide(ctx: VerbContext, id: string, status: "accepted" | "reject
   await ctx.tx.query(`update noticings set status = $2, decided_event_id = $3, decided_at = $4 where id = $1 and mind_id = $5`, [
     id, status, ev.id, ev.created_at, ctx.mind_id,
   ]);
+}
+
+/** Locks every node among the sources (sorted, the per-node advisory lock supersedeNode takes) and returns the ids of those no longer live. Events are not nodes and are never dead. */
+async function deadSources(ctx: VerbContext, sources: string[]): Promise<string[]> {
+  const nodes = await ctx.tx.query<{ id: string }>(`select id from nodes where mind_id = $1 and id = any($2::uuid[]) order by id`, [ctx.mind_id, sources]);
+  for (const { id } of nodes.rows) await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(id)]);
+  const gone = await ctx.tx.query<{ id: string }>(
+    `select id from nodes where mind_id = $1 and id = any($2::uuid[]) and invalidated_at is not null order by id`,
+    [ctx.mind_id, sources],
+  );
+  return gone.rows.map((x) => x.id);
 }
 
 /** Live nodes among the sources (a source may be an event, or a node invalidated since; edges join live nodes only, the rest stay in the metadata). */
@@ -192,6 +215,12 @@ export const mind_notice = defineVerb({
     if (n.kind === "repair") return decideRepair(ctx, n, input);
     if (input.decision !== undefined) return err("invalid_input", "decision applies to repair proposals only", "decision");
     if (input.label !== undefined) return err("invalid_input", "label applies to repair proposals (rethink) only", "label");
+
+    // Every edge or node this accept creates cites its sources. Take the lock supersedeNode takes on each cited node, THEN check that it
+    // is still live, so an accept cannot commit against a node that is being invalidated concurrently (whichever commits first wins, and a
+    // dead source refuses the accept with nothing written).
+    const dead = await deadSources(ctx, n.sources);
+    if (dead.length > 0) return err("conflict", `a source was rewritten or retired since this was proposed: ${dead.join(", ")}`, "noticing_id");
 
     if (n.kind === "link") {
       if (input.content !== undefined) return err("invalid_input", "content applies to pattern and distillation proposals, not a link", "content");
@@ -308,6 +337,22 @@ async function insertProvenanceEdge(
 /** A node whose metadata is not a JSON object (legacy data) is treated as empty when a repair writes to it. */
 const OBJECT_METADATA = "(case when jsonb_typeof(metadata) = 'object' then metadata else '{}'::jsonb end)";
 const IDENTITY_REFUSAL = "identity belongs to the mind: use mind_identity propose (rewrite or retire)";
+/** The chain from a replacement along `superseded_by` (at most 64 hops), read without locks: every node id on it, and whether it ends live or retired. */
+async function readChain(ctx: VerbContext, start: string): Promise<{ ids: string[]; state: "live" | "retired" }> {
+  const ids = [start];
+  for (let hops = 0; hops < 64; hops++) {
+    const cur = ids[ids.length - 1]!;
+    const r = await ctx.tx.query<{ invalidated_at: Date | null; superseded_by: string | null }>(
+      `select invalidated_at, superseded_by from nodes where id = $1 and mind_id = $2`, [cur, ctx.mind_id],
+    );
+    const row = r.rows[0];
+    if (!row) return { ids, state: "retired" };
+    if (row.invalidated_at === null) return { ids, state: "live" };
+    if (row.superseded_by === null) return { ids, state: "retired" };
+    ids.push(row.superseded_by.toLowerCase());
+  }
+  return { ids, state: "retired" };
+}
 const uuidOrNull = (v: unknown): string | null => (typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v.toLowerCase() : null);
 
 /**
@@ -334,7 +379,19 @@ async function decideRepair(ctx: VerbContext, n: NoticingRow, input: z.infer<typ
     return err("conflict", "this repair proposal is malformed", "noticing_id");
   }
 
-  await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [`node:${dependant}`]);
+  // The keep or rethink must point at the CURRENT replacement, so the dependant is asked again when that one is invalidated. Read the
+  // chain from the proposed replacement along `superseded_by` WITHOUT locks, lock the dependant and every node on the chain in ONE sorted
+  // pass (the order linkNodes uses, so no deadlock between them), then read the chain again: if it moved while we waited (a node on it was
+  // rewritten) the call is a retryable conflict. A chain that ends in a retired node records that node with state 'retired'.
+  const proposed = uuidOrNull(n.payload.replacement_id);
+  const first = proposed === null ? null : await readChain(ctx, proposed);
+  const keys = [...new Set([dependant, ...(first?.ids ?? [])].map(nodeLockKey))].sort();
+  for (const key of keys) await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [key]);
+  const second = proposed === null ? null : await readChain(ctx, proposed!);
+  if (first !== null && second !== null && (first.ids.join() !== second.ids.join() || first.state !== second.state)) {
+    return err("conflict", "the replacement chain changed; try again", "noticing_id");
+  }
+  const repl = second === null ? null : { id: second.ids[second.ids.length - 1]!, state: second.state };
   const cur = await ctx.tx.query<{ node_type: string; invalidated_at: Date | null }>(
     `select node_type, invalidated_at from nodes where id = $1 and mind_id = $2`,
     [dependant, ctx.mind_id],
@@ -360,7 +417,7 @@ async function decideRepair(ctx: VerbContext, n: NoticingRow, input: z.infer<typ
               (case when jsonb_typeof(metadata->'repair_reviewed') = 'array' then metadata->'repair_reviewed' else '[]'::jsonb end) || $3::jsonb)
         where id = $1 and mind_id = $2`,
       // replacement_id lets the question come back if the replacement is itself superseded or retired later
-      [dependant, ctx.mind_id, JSON.stringify([{ upstream_id: upstream, replacement_id: uuidOrNull(n.payload.replacement_id), event_id: kept.id, at: kept.created_at }])],
+      [dependant, ctx.mind_id, JSON.stringify([{ upstream_id: upstream, replacement_id: repl?.id ?? null, ...(repl === null ? {} : { replacement_state: repl.state }), event_id: kept.id, at: kept.created_at }])],
     );
     const ev = await accepted({});
     return ok({ event_id: ev.id, projection: { noticing_id: id, status: "accepted", decision, node_id: dependant, repair_event_id: kept.id } });
@@ -371,7 +428,7 @@ async function decideRepair(ctx: VerbContext, n: NoticingRow, input: z.infer<typ
       content: input.content!,
       ...(input.label === undefined ? {} : { label: input.label }),
       reason: `repair of ${upstream}`,
-      provenance: { noticing_id: id, upstream_id: upstream, replacement_id: uuidOrNull(n.payload.replacement_id) },
+      provenance: { noticing_id: id, upstream_id: upstream, replacement_id: repl?.id ?? null, ...(repl === null ? {} : { replacement_state: repl.state }) },
     });
     if (!sup.ok) return sup;
     const node_id = sup.receipt.projection!.node_id as string;
@@ -391,6 +448,8 @@ async function decideRepair(ctx: VerbContext, n: NoticingRow, input: z.infer<typ
     [dependant, ctx.mind_id, re.created_at, JSON.stringify({ retired: true, retired_at: re.created_at, retired_reason: `repair of ${upstream}`, repair_noticing_id: id })],
   );
   if (upd.rowCount !== 1) throw new Error(`repair ${id}: dependant ${dependant} vanished under the lock`);
+  // the retired dependant is itself an upstream: its own dependants are asked next (work recorded with the retirement)
+  await recordRepairWork(ctx.tx, { mind_id: ctx.mind_id, upstream_id: dependant, upstream_state: "retired", replacement_id: null, created_event_id: re.id });
   const ev = await accepted({});
   return ok({ event_id: ev.id, projection: { noticing_id: id, status: "accepted", decision, node_id: dependant, repair_event_id: re.id } });
 }
