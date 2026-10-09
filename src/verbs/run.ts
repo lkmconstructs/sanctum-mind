@@ -39,7 +39,7 @@ export async function runVerb(
   }
   const input = parsed.data as { mind_id: string };
 
-  if (verb.mindOnly?.(input) === true && caller.bearer !== input.mind_id) return err("forbidden", MIND_ONLY);
+  if (verb.mindOnly?.(input) === true && caller.bearer !== input.mind_id) return err("forbidden", verb.mindOnlyMessage ?? MIND_ONLY);
   const scope = verb.scopeFor(input);
   if (!mayAct(caller, input.mind_id, scope, { stewardMayRead: verb.stewardMayRead === true })) {
     return err("forbidden", `bearer ${caller.bearer} may not act on mind ${input.mind_id}`);
@@ -71,6 +71,7 @@ export async function runVerb(
           embedder,
           sinks: deps.sinks ?? [],
           coolingMs: deps.coolingMs ?? defaultCoolingMs(),
+          actor: "verb",
           ...(embedded === undefined ? {} : { embedded }),
           ...(session_id === undefined ? {} : { session_id }),
         },
@@ -78,7 +79,7 @@ export async function runVerb(
       );
       if (!result.ok) throw new VerbErrorSignal(result);
       return result;
-    });
+    }, "verb");
   } catch (e) {
     if (e instanceof VerbErrorSignal) return e.result;
     console.error(`verb ${name} failed:`, e);

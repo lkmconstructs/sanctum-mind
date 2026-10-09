@@ -16,22 +16,31 @@ export function createPool(databaseUrl: string): Pool {
 
 export type MindMode = "read" | "write";
 
+/**
+ * Who is acting in a transaction, recorded as the per-transaction setting `app.actor` beside `app.mind_id` and
+ * `app.bearer`: a verb call (`verb`), a daemon pass (`daemon`), the operator CLI (`operator`) or import-mind (`import`).
+ * The database guards on the extractor's tables read it (migration 0021): only a verb call decides a proposal, only the
+ * daemon or an import expires one, only the operator enables the extractor. Unset (empty) for everything else.
+ */
+export type Actor = "verb" | "daemon" | "operator" | "import";
+
 export async function withMind<T>(
   pool: Pool,
   mind_id: string,
   bearer: string,
   mode: MindMode,
   fn: (tx: PoolClient) => Promise<T>,
+  actor?: Actor,
 ): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query("begin");
     // mode read makes the database itself refuse every write in this transaction
     if (mode === "read") await client.query("set transaction read only");
-    await client.query("select set_config('app.mind_id', $1, true), set_config('app.bearer', $2, true)", [
-      mind_id,
-      bearer,
-    ]);
+    await client.query(
+      "select set_config('app.mind_id', $1, true), set_config('app.bearer', $2, true), set_config('app.actor', $3, true)",
+      [mind_id, bearer, actor ?? ""],
+    );
     const result = await fn(client);
     await client.query("commit");
     return result;

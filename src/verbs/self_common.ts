@@ -10,6 +10,9 @@ export const IDENTITY_NODE = "identity";
 export const VOW_NODE = "vow";
 export const ANCHOR_NODE = "anchor";
 export const DESIRE_NODE = "desire";
+/** Node types an accepted noticing becomes (mind_notice accept). nodes.node_type is free text, so no schema change. */
+export const PATTERN_NODE = "pattern";
+export const DISTILLATION_NODE = "distillation";
 
 /** First 120 characters of a text, whitespace collapsed to single spaces. */
 export const defaultLabel = (s: string): string => deriveLabel(s);
@@ -120,6 +123,9 @@ export async function supersedeNode(
   );
   return ok({ event_id: ev.id, projection: { event_id: ev.id, node_id: newId, superseded: nodeId } });
 }
+
+/** The refusal for deciding what the extractor noticed (mind_notice accept and reject) when the caller is not the mind itself. */
+export const MEMORY_MIND_ONLY = "memory is authored by the mind";
 
 /** The refusal for any act that changes a mind's identity or vows when the caller is not the mind itself. */
 export const MIND_ONLY = "identity belongs to the mind";

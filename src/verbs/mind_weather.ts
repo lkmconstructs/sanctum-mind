@@ -36,7 +36,8 @@ export const mind_weather = defineVerb({
     const ctxFilter = input.context ?? null;
 
     // Window: from <= created_at <= to. The empty string is the shared lane (context is null).
-    const win = `mind_id = $1 and created_at >= $2 and created_at <= $3
+    // notice.* events are bookkeeping about proposals, not memory, and never count here
+    const win = `mind_id = $1 and created_at >= $2 and created_at <= $3 and kind not like 'notice.%'
        and ($4::text is null or context is not distinct from nullif($4, ''))`;
     const params = [ctx.mind_id, from, to, ctxFilter];
 

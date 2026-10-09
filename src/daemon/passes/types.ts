@@ -2,8 +2,10 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
 import type { Pool } from "pg";
+import type { MindMode } from "../../db/pool.js";
+import type { Reranker } from "../../rerank/types.js";
 import type { SinkConfig } from "../../sinks/types.js";
-import type { VerbContext } from "../../verbs/types.js";
+import type { Embedder, VerbContext } from "../../verbs/types.js";
 import type { DaemonConfig } from "../config.js";
 
 /** A pass runs inside one write transaction scoped to one mind, authored by that mind, with the advisory lock held. */
@@ -34,6 +36,15 @@ export interface DetachedPassContext {
   now: () => Date;
   sinks: SinkConfig[];
   config: DaemonConfig;
+  /** the configured embedder (the extractor only asks whether it is `none`) */
+  embedder: Embedder;
+  /** the configured reranker; the `none` reranker when unset */
+  reranker: Reranker;
+  /**
+   * One short transaction as the mind, marked actor `daemon`, with the same context a transactional pass gets. `write` mode
+   * also takes the per-mind daemon advisory lock first, so it never overlaps a transactional pass or another daemon.
+   */
+  inTx<T>(mode: MindMode, fn: (ctx: PassContext) => Promise<T>): Promise<T>;
 }
 
 export interface DetachedPass {

@@ -5,6 +5,7 @@ import type { z } from "zod";
 import type { Pool, PoolClient } from "pg";
 import type { Result } from "../result.js";
 import type { SinkConfig } from "../sinks/types.js";
+import type { Actor } from "../db/pool.js";
 
 /**
  * Who is calling, resolved from the bearer key by src/auth.ts before any verb runs.
@@ -39,6 +40,8 @@ export interface VerbContext {
   sinks: SinkConfig[];
   /** the cooling period for declared identity changes, in milliseconds (0 = none) */
   coolingMs: number;
+  /** who is acting in this transaction (also the database setting app.actor): `verb` for a verb call, `daemon` for a pass */
+  actor?: Actor;
   /**
    * The embedding of `verb.embedText(input)`, computed by the runner BEFORE the transaction opened
    * (so a slow embedder never holds a connection). Absent when the verb has no embedText, it returned
@@ -61,6 +64,8 @@ export interface Verb<S extends z.ZodTypeAny = z.ZodTypeAny, P = unknown> {
    * refuses any other bearer with `forbidden` ("identity belongs to the mind") before looking at grants.
    */
   mindOnly?: (input: z.infer<S>) => boolean;
+  /** the `forbidden` message for a mindOnly refusal; default MIND_ONLY ("identity belongs to the mind") */
+  mindOnlyMessage?: string;
   /**
    * True when a `steward` grant also satisfies a `read` scope for this verb's read operations (mind_identity, mind_vow).
    * No other verb opts in, so a steward-only grantee cannot read the rest of the mind.

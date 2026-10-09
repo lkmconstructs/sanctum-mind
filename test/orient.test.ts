@@ -17,7 +17,7 @@ import { mind_anchor } from "../src/verbs/mind_anchor.js";
 
 const ORDER = {
   orientation: ["identity", "vows", "state", "handoff", "health"],
-  quick: ["loops", "threads", "tasks", "relations", "drives", "inbox", "weather", "anchors"],
+  quick: ["loops", "threads", "tasks", "relations", "drives", "inbox", "weather", "anchors", "noticings"],
   full: ["desires", "holdings", "recent", "orphans"],
 };
 
@@ -90,7 +90,7 @@ describe("mind_orient", () => {
     expect(p.sections.handoff).toHaveProperty("handoff");
   });
 
-  it("quick is the default and adds the eight", async () => {
+  it("quick is the default and adds the nine", async () => {
     await seed();
     const r = await run(reg(), alpha, { mind_id: "alpha" });
     expect(r.ok).toBe(true);

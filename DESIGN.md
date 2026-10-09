@@ -123,7 +123,7 @@ failures.
 | Region | Verbs |
 | --- | --- |
 | Wake | `mind_orient` (depth: orientation, quick, full) |
-| Remember | `mind_observe`, `mind_write`, `mind_search`, `mind_surface` |
+| Remember | `mind_observe`, `mind_write`, `mind_search`, `mind_surface`, `mind_notice` |
 | Hold | `mind_sit`, `mind_resolve`, `mind_loop`, `mind_thread`, `mind_task` |
 | Self | `mind_identity` (read, read_section, affirm, propose, retire, withdraw, settle, attest, object), `mind_vow` (make, list, recall, break, withdraw_break, note), `mind_anchor`, `mind_desire`, `mind_rethink` |
 | Bond | `mind_relate`, `mind_letter`, `mind_link` |
@@ -132,7 +132,7 @@ failures.
 
 Deferred to their own design pass: `mind_dream`, `mind_unconscious`,
 `mind_maintain`. The daemon is implemented: deterministic passes over the ledger
-and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are ten passes, including `identity.settle`.
+and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are eleven passes, all deterministic, including `identity.settle` and `notice.expire`. The optional model-backed extractor passes (`notice.extract`, `notice.train`) are listed separately: they run only for a mind whose extractor the operator has enabled, once a day.
 
 ### Noticing
 
@@ -142,6 +142,8 @@ proposal-only by construction. A proposal becomes memory only when the mind acce
 memory it becomes is authored by the mind with provenance to its sources, which stay untouched.
 The operator can enable, schedule, pause or disable it and choose between two stages, scoring
 silently or presenting ranked proposals; no stage writes memory, and the schema admits no third.
+Stages 1 and 2 are built: storage, the `mind_notice` verb, the database guards, expiry, portability, and the
+passes that generate candidates, rerank and score them, and refit the scorer from the mind's own decisions.
 
 The scorer is a fixed reranker plus an interpretable per-mind logistic model trained on that mind's
 own accepts, rejects and expiries, with a documented prior until there is enough feedback. No

@@ -123,6 +123,15 @@ services:
       IDENTITY_COOLING_HOURS: ${IDENTITY_COOLING_HOURS:-24}
       SINKS: ${SINKS:-}
       SINKS_FILE: ${SINKS_FILE:-}
+      # The extractor (off until the operator enables it per mind). Only the daemon reads these. RERANKER=local is not available
+      # in the image (the optional package is not installed); use none or http.
+      EXTRACTOR_TTL_DAYS: ${EXTRACTOR_TTL_DAYS:-14}
+      EXTRACTOR_REPROPOSE_DAYS: ${EXTRACTOR_REPROPOSE_DAYS:-60}
+      EXTRACTOR_MAX_CANDIDATES: ${EXTRACTOR_MAX_CANDIDATES:-50}
+      RERANKER: ${RERANKER:-none}
+      RERANK_URL: ${RERANK_URL:-}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      EXTRACTOR_LOOKBACK_DAYS: ${EXTRACTOR_LOOKBACK_DAYS:-30}
     volumes:
       - embed-cache:/data/embed-cache
     restart: unless-stopped

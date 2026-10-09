@@ -8,6 +8,8 @@ import { assertRlsEnforced, createPool } from "./db/pool.js";
 import { runMigrations } from "./db/migrate.js";
 import { createHttpServer, DEFAULT_HOST, startStdio } from "./server.js";
 import { embedderFromEnv } from "./embed/index.js";
+import { rerankerFromEnv } from "./rerank/index.js";
+import { checkExtractorEnv } from "./extractor/config.js";
 import { backfillEmbeddings } from "./embed/backfill.js";
 import { formatInit, InitError, INIT_USAGE, parseInitArgs, runInit } from "./init.js";
 import { registry } from "./verbs/registry.js";
@@ -15,6 +17,7 @@ import { runDaemonOnce, startDaemon } from "./daemon/index.js";
 import { importRevien } from "./adapters/revien.js";
 import { ArgError, parseDaemonArgs, parseImportArgs } from "./cli-args.js";
 import { GRANT_USAGE, parseGrantArgs, runGrantCommand } from "./grants-admin.js";
+import { EXTRACTOR_USAGE, parseExtractorArgs, runExtractorCommand } from "./extractor-admin.js";
 import { exportMind, parseExportArgs } from "./export.js";
 import { importMind, parseImportMindArgs } from "./import-mind.js";
 import { formatPurge, parsePurgeArgs, purgeMind } from "./purge.js";
@@ -42,6 +45,8 @@ commands:
                     import a Revien graph export (its public JSON format) into one mind (sanctum_app URL)
   grant add|revoke|list ...
                     manage grants between minds (ADMIN URL; see "grant" usage below)
+  extractor enable|disable|pause|resume|stage|report --mind <id> ...
+                    operate the optional extractor that proposes links, patterns and distillations (ADMIN URL; see "extractor" usage below)
   export-mind --mind <id> [--out <file>]
                     write one mind (ledger, graph, projections) to a JSON file (sanctum_app URL)
   import-mind <file> --mind <target> [--dry-run] [--allow-core] [--strict] [--with-letters]
@@ -61,6 +66,8 @@ sanctum_app login, which cannot modify keys or grants.
 ${INIT_USAGE}
 
 ${GRANT_USAGE}
+
+${EXTRACTOR_USAGE}
 
 ${MINDS_ADMIN_USAGE}
 `;
@@ -167,17 +174,20 @@ async function main(): Promise<void> {
     }
     case "daemon": {
       defaultCoolingMs(); // fail fast on a bad IDENTITY_COOLING_HOURS
+      checkExtractorEnv(); // and on a bad EXTRACTOR_TTL_DAYS, EXTRACTOR_REPROPOSE_DAYS or EXTRACTOR_MAX_CANDIDATES
+      const reranker = rerankerFromEnv(process.env); // and on a bad RERANKER, or RERANKER=http without a valid RERANK_URL
       const args = argsOrFail(() => parseDaemonArgs(process.argv.slice(3)));
       const minds = args.mind ? [args.mind] : undefined;
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
       const embedder = embedderFromEnv(process.env);
       if (args.once) {
-        const reports = await runDaemonOnce({ pool, embedder, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
+        const reports = await runDaemonOnce({ pool, embedder, reranker, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
         for (const r of reports) {
           const failed = r.passes.filter((p) => !p.ok).map((p) => `${p.pass}: ${p.error ?? "failed"}`);
           const changed = r.passes.reduce((n, p) => n + p.changed, 0);
           console.log(`${r.mind_id}: ${r.ok ? "ok" : "FAILED"} (${r.passes.length} passes, ${changed} changes)${failed.length ? "\n  " + failed.join("\n  ") : ""}`);
+          for (const p of r.passes) for (const n of p.notes ?? []) if (p.pass.startsWith("notice.") && p.pass !== "notice.expire") console.log(`  ${p.pass}: ${n}`);
         }
         await pool.end();
         if (reports.length === 0) {
@@ -186,7 +196,7 @@ async function main(): Promise<void> {
         }
         process.exit(reports.every((r) => r.ok) ? 0 : 2);
       }
-      const handle = startDaemon({ pool, embedder, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
+      const handle = startDaemon({ pool, embedder, reranker, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
       console.error(`sanctum-mind: daemon running every ${args.interval} minute(s)${args.mind ? ` for ${args.mind}` : ""}`);
       let stopping = false;
       const stop = async () => {
@@ -224,6 +234,16 @@ async function main(): Promise<void> {
       const pool = createPool(requireDatabaseUrl());
       try {
         console.log(await runGrantCommand(pool, args));
+      } finally {
+        await pool.end();
+      }
+      process.exit(0);
+    }
+    case "extractor": {
+      const args = parseExtractorArgs(process.argv.slice(3));
+      const pool = createPool(requireDatabaseUrl());
+      try {
+        console.log(await runExtractorCommand(pool, args));
       } finally {
         await pool.end();
       }

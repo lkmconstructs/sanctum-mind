@@ -1,23 +1,28 @@
 // sanctum-mind. Copyright 2026 LKM Constructs LLC.
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
-import type { Pool } from "pg";
-import { withMind } from "../db/pool.js";
+import type { Pool, PoolClient } from "pg";
+import { withMind, type MindMode } from "../db/pool.js";
 import { registry } from "../verbs/registry.js";
 import type { Embedder } from "../verbs/types.js";
+import { NONE_RERANKER } from "../rerank/none.js";
+import type { Reranker } from "../rerank/types.js";
+import { checkExtractorEnv } from "../extractor/config.js";
 import type { SinkConfig } from "../sinks/types.js";
 import { getDaemonConfig, resolveDaemonConfig, type DaemonConfig } from "./config.js";
 import { defaultCoolingMs } from "../verbs/cooling.js";
-import { PASSES, type AnyPass, type PassContext } from "./passes/index.js";
+import { ALL_PASSES, type AnyPass, type PassContext } from "./passes/index.js";
 import { isDetached } from "./passes/types.js";
 
 export { getDaemonConfig, loadDaemonConfig, resolveDaemonConfig, type DaemonConfig } from "./config.js";
-export { PASSES, type AnyPass, type DaemonPass, type DetachedPass, type PassContext, type PassResult } from "./passes/index.js";
+export { PASSES, MODEL_PASSES, ALL_PASSES, type AnyPass, type DaemonPass, type DetachedPass, type PassContext, type PassResult } from "./passes/index.js";
 
 export interface DaemonDeps {
   /** the app-role pool (never a superuser: row level security must apply) */
   pool: Pool;
   embedder: Embedder;
+  /** the extractor's cross-encoder (notice.extract only); default none, scores null */
+  reranker?: Reranker;
   /** outbox sinks the outbox.deliver pass delivers to; default none */
   sinks?: SinkConfig[];
   coolingMs?: number;
@@ -72,25 +77,31 @@ async function runPass(
 ): Promise<PassReport> {
   const t0 = performance.now();
   try {
-    // a detached pass (outbox delivery) runs with no transaction and no advisory lock open
-    const result = isDetached(pass)
-      ? await pass.run({ pool: deps.pool, mind_id: mind, now, sinks: deps.sinks ?? [], config })
-      : await withMind(deps.pool, mind, mind, "write", async (tx) => {
-      // Two daemons never overlap on one mind; the second waits for the first pass to commit.
-      await tx.query("select pg_advisory_xact_lock(hashtext('daemon:' || $1::text))", [mind]);
-      const ctx: PassContext = {
-        caller: { bearer: mind, grants: {} },
-        mind_id: mind,
-        tx,
-        now,
-        registry,
-        embedder: deps.embedder,
-        sinks: deps.sinks ?? [],
-        coolingMs: deps.coolingMs ?? defaultCoolingMs(),
-        config,
-      };
-      return pass.run(ctx);
+    const passContext = (tx: PoolClient): PassContext => ({
+      caller: { bearer: mind, grants: {} },
+      mind_id: mind,
+      tx,
+      now,
+      registry,
+      embedder: deps.embedder,
+      sinks: deps.sinks ?? [],
+      coolingMs: deps.coolingMs ?? defaultCoolingMs(),
+      actor: "daemon",
+      config,
     });
+    const inTx = <T>(mode: MindMode, fn: (ctx: PassContext) => Promise<T>): Promise<T> =>
+      withMind(deps.pool, mind, mind, mode, async (tx) => {
+        // Two daemons never overlap on one mind; the second waits for the first pass to commit.
+        if (mode === "write") await tx.query("select pg_advisory_xact_lock(hashtext('daemon:' || $1::text))", [mind]);
+        return fn(passContext(tx));
+      }, "daemon");
+    // a detached pass (outbox delivery, the extractor's extract) runs with no transaction and no advisory lock open
+    const result = isDetached(pass)
+      ? await pass.run({
+          pool: deps.pool, mind_id: mind, now, sinks: deps.sinks ?? [], config,
+          embedder: deps.embedder, reranker: deps.reranker ?? NONE_RERANKER, inTx,
+        })
+      : await inTx("write", (ctx) => pass.run(ctx));
     return {
       pass: pass.name,
       ok: true,
@@ -120,14 +131,14 @@ async function runMind(
         [mind, started_at, opts.trigger],
       );
       return r.rows[0]!.id;
-    });
+    }, "daemon");
   } catch (e) {
     console.error(`daemon: could not record the run for mind ${mind}:`, e);
     return { mind_id: mind, run_id: null, started_at, finished_at: now(), ok: false, passes: [], error: sanitise(e) };
   }
 
   const passes: PassReport[] = [];
-  for (const pass of opts.passes ?? PASSES) passes.push(await runPass(deps, mind, pass, config, now));
+  for (const pass of opts.passes ?? ALL_PASSES) passes.push(await runPass(deps, mind, pass, config, now));
 
   const finished_at = now();
   const stored = passes.map(({ pass, ok, changed, ms, error }) => ({ pass, ok, changed, ms, ...(error ? { error } : {}) }));
@@ -139,7 +150,7 @@ async function runMind(
         JSON.stringify(stored),
         mind,
       ]);
-    });
+    }, "daemon");
   } catch (e) {
     console.error(`daemon: could not finish the run record for mind ${mind}:`, e);
     return { mind_id: mind, run_id, started_at, finished_at, ok: false, passes, error: sanitise(e) };
@@ -201,6 +212,7 @@ export function startDaemon(deps: DaemonDeps, opts: StartOptions = {}): DaemonHa
   const minutes = opts.intervalMinutes ?? 30;
   if (!Number.isFinite(minutes) || minutes <= 0) throw new Error("intervalMinutes must be a positive number");
   getDaemonConfig(); // fail fast on a bad environment, before the first tick
+  checkExtractorEnv();
   resolveDaemonConfig(opts.config);
 
   let stopped = false;

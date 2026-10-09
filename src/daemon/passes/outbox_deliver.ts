@@ -91,10 +91,10 @@ export const outboxDeliver: DetachedPass = {
         ]);
       }
       return rows;
-    });
+    }, "daemon");
     if (due.length === 0) return { changed: 0 };
 
-    const record = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> => withMind(pool, mind, mind, "write", fn);
+    const record = <T>(fn: (tx: PoolClient) => Promise<T>): Promise<T> => withMind(pool, mind, mind, "write", fn, "daemon");
     const release = async (rows: Due[]): Promise<void> => {
       if (rows.length === 0) return;
       await record((tx) =>

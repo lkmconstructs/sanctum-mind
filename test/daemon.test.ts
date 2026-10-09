@@ -9,7 +9,7 @@ import { runVerb } from "../src/verbs/run.js";
 import { registry } from "../src/verbs/registry.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
 import { FAKE_EMBEDDER } from "./fake-embedder.js";
-import { PASSES, loadDaemonConfig, runDaemonOnce, startDaemon, type DaemonPass, type RunReport } from "../src/daemon/index.js";
+import { ALL_PASSES, MODEL_PASSES, PASSES, loadDaemonConfig, runDaemonOnce, startDaemon, type DaemonPass, type RunReport } from "../src/daemon/index.js";
 import type { Caller, Embedder } from "../src/verbs/types.js";
 
 const alpha: Caller = { bearer: "alpha", grants: {} };
@@ -94,22 +94,24 @@ afterAll(async () => {
 });
 
 describe("runner", () => {
-  it("runs the ten passes in spec order and records a daemon_runs row per mind", async () => {
+  it("runs the eleven deterministic passes in spec order, then the two model-backed ones, and records a daemon_runs row per mind", async () => {
     expect(PASSES.map((p) => p.name)).toEqual([
       "drives.decay", "context.expire", "loops.stale", "holdings.settle",
-      "desires.fade", "identity.settle", "graph.orphans", "embeddings.backfill", "outbox.deliver", "letters.expire",
+      "desires.fade", "identity.settle", "graph.orphans", "embeddings.backfill", "outbox.deliver", "letters.expire", "notice.expire",
     ]);
+    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train"]);
+    expect(ALL_PASSES.map((p) => p.name)).toEqual([...PASSES, ...MODEL_PASSES].map((p) => p.name));
     const reports = await daemon({ trigger: "timer" });
     expect(reports.map((r) => r.mind_id)).toEqual(["alpha", "beta"]);
     for (const r of reports) {
       expect(r.ok).toBe(true);
-      expect(r.passes.map((p) => p.pass)).toEqual(PASSES.map((p) => p.name));
+      expect(r.passes.map((p) => p.pass)).toEqual(ALL_PASSES.map((p) => p.name));
     }
     const runs = await q("alpha", `select * from daemon_runs`);
     expect(runs).toHaveLength(1);
     expect(runs[0].trigger).toBe("timer");
     expect(runs[0].finished_at).not.toBeNull();
-    expect(runs[0].passes).toHaveLength(10);
+    expect(runs[0].passes).toHaveLength(13);
     expect(runs[0].passes.every((p: any) => p.ok === true && typeof p.ms === "number" && p.changed === 0)).toBe(true);
   });
 
@@ -490,16 +492,16 @@ describe("mind_health", () => {
     const boom: DaemonPass = { name: "test.boom", run: async () => { throw new Error("x"); } };
     await daemon({ trigger: "manual", minds: ["alpha"] });
     let h = (await health()).last_daemon_run;
-    expect(h).toMatchObject({ passes_ok: 10, passes_failed: 0 });
+    expect(h).toMatchObject({ passes_ok: 13, passes_failed: 0 });
     expect(h.started_at).toBeInstanceOf(Date);
     expect(h.finished_at).toBeInstanceOf(Date);
     const later = new Date(NOW.getTime() + HOUR);
     await daemon({ trigger: "manual", minds: ["alpha"], passes: [...PASSES, boom] }, NONE_EMBEDDER, later);
     h = (await health()).last_daemon_run;
-    expect(h).toMatchObject({ passes_ok: 10, passes_failed: 1 });
+    expect(h).toMatchObject({ passes_ok: 11, passes_failed: 1 });
     expect(h.started_at.getTime()).toBe(later.getTime());
     const orient = (await runVerb({ pool, registry, now: () => NOW }, alpha, "mind_orient", { mind_id: "alpha", depth: "orientation" })) as any;
-    expect(orient.receipt.projection.sections.health.last_daemon_run).toMatchObject({ passes_ok: 10, passes_failed: 1 });
+    expect(orient.receipt.projection.sections.health.last_daemon_run).toMatchObject({ passes_ok: 11, passes_failed: 1 });
     // beta's health says nothing of alpha's runs
     const bh = (await runVerb({ pool, registry, now: () => NOW }, { bearer: "beta", grants: {} }, "mind_health", { mind_id: "beta" })) as any;
     expect(bh.receipt.projection.last_daemon_run).toBeNull();

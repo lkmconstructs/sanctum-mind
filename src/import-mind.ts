@@ -1,6 +1,7 @@
 // sanctum-mind. Copyright 2026 LKM Constructs LLC.
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import type { Pool, PoolClient } from "pg";
@@ -8,6 +9,7 @@ import { isValidMindId, mindIdProblem } from "./auth.js";
 import { ArgError } from "./cli-args.js";
 import { withMind } from "./db/pool.js";
 import { EXPORT_FORMAT } from "./export.js";
+import { noticeExpiredPayload } from "./extractor/events.js";
 
 /**
  * Import reads the whole export into memory (JSON.parse) and refuses files over this size with a
@@ -99,6 +101,7 @@ interface Doc {
 
 const PROJECTION_ORDER = [
   "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
+  "noticings", "extractor_state", "extractor_models", "extractor_runs",
 ] as const;
 const PROJECTION_TABLE: Record<string, string> = Object.fromEntries(PROJECTION_ORDER.map((k) => [k, k]));
 
@@ -310,6 +313,15 @@ function dropForeignRefs(doc: Doc): Record<string, number> {
 
 const CORE_TYPES = ["identity", "vow"];
 
+/** A fixed event id per imported noticing, so re-running an import finds its own expiry event instead of writing another. */
+function importExpiryEventId(noticingId: string): string {
+  const h = createHash("sha256").update(`sanctum-mind:import-expired:${noticingId}`).digest();
+  h[6] = (h[6]! & 0x0f) | 0x40;
+  h[8] = (h[8]! & 0x3f) | 0x80;
+  const x = h.subarray(0, 16).toString("hex");
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`;
+}
+
 /** A proposal that is neither settled, withdrawn nor rejected: pending and accepted alike are still open. */
 const isOpenProposal = (p: Row): boolean => !["settled", "withdrawn", "rejected"].includes(String(p.status));
 
@@ -324,6 +336,11 @@ const isOpenProposal = (p: Row): boolean => !["settled", "withdrawn", "rejected"
  *  - identity and vow nodes are refused when the target has ever had any (live or retired), unless `allow_core`;
  *  - proposals.proposed_by is always the target (the original is counted in the notes); open declarations
  *    (any proposal not settled, withdrawn or rejected: pending or accepted) arrive withdrawn at import time, and attestations are cleared on every proposal;
+ *  - noticings (the extractor's proposals) get an explicit status: expired ones, and accepted or rejected ones that
+ *    carry their decision event, keep it (history and training signal); everything else (pending, missing, unknown, a
+ *    decision without its event) arrives `expired` with a `notice.expired` event written as the mind (reason
+ *    "imported"), counted in the notes; extractor_state arrives `enabled = false` at stage `shadow` whatever the file
+ *    said, and the target's own row is left alone if it has one; extractor_models and extractor_runs (the run history) arrive as they are;
  *  - a vow's declared break (metadata.break_declared) is stripped on import (counted in the notes);
  *  - letters_received are never imported (they belong to the sender's export, and only the sender can
  *    send them); the count is reported as ignored;
@@ -497,9 +514,86 @@ export async function importMind(
             };
           });
         }
+        if (key === "noticings") {
+          // Every imported noticing gets an explicit status. A decided one (accepted, rejected) keeps it only if it carries
+          // its decision event; an expired one keeps it. Anything else (pending, missing, unknown, or a decision without
+          // its event) arrives expired, with a notice.expired event written as the mind (reason "imported"): a proposal
+          // from another life is not shown again.
+          const expiry: Row[] = [];
+          let pendingCount = 0;
+          let undecidable = 0;
+          rows = rows.map((r) => {
+            const st = String(r.status);
+            if (st === "expired" || ((st === "accepted" || st === "rejected") && typeof r.decided_event_id === "string")) return { ...r, status: st };
+            if (typeof r.id !== "string") throw new ImportError("export file: a noticing has no id");
+            const nid = lc(r.id);
+            const evId = importExpiryEventId(nid);
+            expiry.push({
+              id: evId, mind_id: target, kind: "notice.expired", subject_id: nid,
+              payload: noticeExpiredPayload.parse({ noticing_id: nid, reason: "imported" }),
+              written_by: target, recorded_at: importedAt, created_at: importedAt,
+            });
+            if (st === "accepted" || st === "rejected") undecidable++;
+            else pendingCount++;
+            return { ...r, status: "expired", decided_event_id: evId, decided_at: importedAt };
+          });
+          if (expiry.length > 0) {
+            const evRep = await insertRows(tx, "events", expiry, await cols("events"), {
+              byId: true, skipExisting: true, ...(dryEvents ? { dryEvents } : {}),
+            });
+            tables.events!.inserted += evRep.inserted;
+            tables.events!.already_present += evRep.already_present;
+            notes.push(
+              `${expiry.length} noticing(s) in the file arrived expired, each with a notice.expired event (reason "imported"): ${pendingCount} were pending or of unknown status` +
+                (undecidable > 0 ? `, ${undecidable} were decided without a decision event` : "") +
+                "; a proposal from another life is not shown again",
+            );
+          }
+        }
+        if (key === "extractor_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
+        if (key === "extractor_runs") {
+          // run history is the history of another life: a row dated after this import cannot be real and is not brought in
+          // (it would hold a schedule gate shut), and every row is marked so the gate ignores it
+          const future = rows.filter((r) => !(Date.parse(String(r.started_at)) <= Date.parse(importedAt)));
+          if (future.length > 0) {
+            rows = rows.filter((r) => !future.includes(r));
+            notes.push(`${future.length} extractor_runs row(s) in the file were not imported: their started_at is after the time of this import`);
+          }
+          rows = rows.map((r) => ({ ...r, notes: { ...(r.notes !== null && typeof r.notes === "object" && !Array.isArray(r.notes) ? (r.notes as object) : {}), imported: true } }));
+        }
+        let modelsAlready = 0;
+        if (key === "extractor_models" && rows.length > 0) {
+          // versions are the scorer's order: renumber to continue after the target's latest, keep the original in the metrics, and
+          // recognise a row that an earlier import of the same file already brought in (same original version and created_at)
+          const have = await tx.query<{ v: number | null }>("select max(version) as v from extractor_models where mind_id = $1", [target]);
+          const done = await tx.query<{ ov: string; at: string }>(
+            "select metrics->>'imported_from_version' as ov, created_at::text as at from extractor_models where mind_id = $1 and metrics ? 'imported_from_version'",
+            [target],
+          );
+          const seen = new Set(done.rows.map((d) => `${d.ov}|${Date.parse(d.at)}`));
+          const sorted = [...rows].sort((a, b) => Number(a.version) - Number(b.version));
+          let next = (have.rows[0]?.v ?? 0) + 1;
+          const fresh: Row[] = [];
+          for (const r of sorted) {
+            if (seen.has(`${String(r.version)}|${Date.parse(String(r.created_at))}`)) {
+              modelsAlready++;
+              continue;
+            }
+            const m = r.metrics !== null && typeof r.metrics === "object" && !Array.isArray(r.metrics) ? (r.metrics as object) : {};
+            fresh.push({ ...r, version: next++, metrics: { ...m, imported_from_version: Number(r.version) } });
+          }
+          if (fresh.length > 0) notes.push(`${fresh.length} extractor model(s) were renumbered to continue after the target's latest version (versions ${fresh[0]!.version} to ${fresh[fresh.length - 1]!.version}); the original version is in metrics.imported_from_version`);
+          rows = fresh;
+        }
         const table = PROJECTION_TABLE[key]!;
         const byId = rows.length > 0 && rows.every((r) => typeof r.id === "string");
-        tables[key] = await insertRows(tx, table, rows, await cols(table), { byId });
+        tables[key] = rows.length === 0 && modelsAlready > 0 ? { inserted: 0, already_present: 0 } : await insertRows(tx, table, rows, await cols(table), { byId });
+        if (modelsAlready > 0) tables[key]!.already_present += modelsAlready;
+        if (key === "extractor_state" && rows.length > 0) {
+          const t = tables[key]!;
+          if (t.inserted > 0) notes.push("the extractor arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind extractor enable)");
+          if (t.already_present > 0) notes.push(`${t.already_present} extractor_state row(s) already existed in the target and were left as they were (the file's was not applied)`);
+        }
       }
       for (const k of Object.keys(doc.projections)) {
         if (!(PROJECTION_ORDER as readonly string[]).includes(k) && k !== "letters_sent" && k !== "letters_received") {
@@ -538,7 +632,7 @@ export async function importMind(
 
       // dry run: the same statements ran; abandon them
       if (dry) throw new DryRunRollback();
-    });
+    }, "import");
   } catch (e) {
     if (!(e instanceof DryRunRollback)) throw e;
   }

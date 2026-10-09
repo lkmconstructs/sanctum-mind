@@ -74,6 +74,7 @@ function filterSql(table: Table, f: Filters, params: unknown[]): string {
     return `$${params.length}`;
   };
   if (table === "events") {
+    out.push("kind not like 'notice.%'"); // bookkeeping about proposals, not memory
     if (f.kind !== undefined) out.push(`kind = ${bind(f.kind)}`);
     if (f.context !== undefined) out.push(`context = ${bind(f.context)}`);
   } else {

@@ -6,4 +6,5 @@ coverage/
 !.env.example
 *.log
 .embed-cache/
+.rerank-cache/
 exchange/

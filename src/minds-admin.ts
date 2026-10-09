@@ -64,7 +64,7 @@ export async function setMindDisabled(pool: Pool, mind: string, disabled: boolea
   try {
     await client.query("begin");
     // the mind's own scope, so row level security holds for an admin role that does not bypass it
-    await client.query("select set_config('app.mind_id', $1, true), set_config('app.bearer', $1, true)", [mind]);
+    await client.query("select set_config('app.mind_id', $1, true), set_config('app.bearer', $1, true), set_config('app.actor', 'operator', true)", [mind]);
     const cur = await client.query<{ disabled_at: Date | null }>("select disabled_at from minds where mind_id = $1 for update", [mind]);
     const row = cur.rows[0];
     if (!row) throw new ArgError(`mind "${mind}" does not exist`);
