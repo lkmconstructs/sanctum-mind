@@ -35,7 +35,7 @@ import { PRIOR_WEIGHTS, PRIOR_BIAS } from "../src/extractor/prior.js";
 import { PRIOR_MODEL, loadModel, parseWeights, scoreOf } from "../src/extractor/scorer.js";
 import { scheduledAt } from "../src/extractor/schedule.js";
 import { summaryOf, termsLabel, verdictFor, snippetOf, type Item } from "../src/extractor/candidates.js";
-import { EPOCHS, fitLogistic, split, trainModel } from "../src/extractor/train.js";
+import { EPOCHS, EXPIRED_WEIGHT, fitLogistic, split, trainModel } from "../src/extractor/train.js";
 
 /** the event kinds src/extractor may append (the static guard in test/extractor_guard.test.ts holds the same list) */
 const WHITELISTED_KINDS = ["notice.proposed", "notice.expired", "notice.model.trained"];
@@ -814,6 +814,19 @@ describe("notice.train", () => {
     it("an expired row weighs half a rejected one", () => {
       const ex = (w: number) => fitLogistic([{ x: [1], y: 0, w }, { x: [1], y: 1, w: 1 }], { bias: 0, weights: [0] });
       expect(ex(0.5).weights[0]!).toBeGreaterThan(ex(1).weights[0]!);
+    });
+    it("the weak no is pinned: EXPIRED_WEIGHT is 0.5 and trainModel applies it to expired rows, so a lapse pulls half as hard as a rejection", () => {
+      expect(EXPIRED_WEIGHT).toBe(0.5);
+      // same features, same labels; the only difference is whether the negatives lapsed or were rejected
+      const mk = (neg: "expired" | "rejected") =>
+        Array.from({ length: 40 }, (_, i) => ({ status: (i % 2 === 0 ? "accepted" : neg) as "accepted" | "rejected" | "expired", features: featuresFor(i, i % 2 === 0) }));
+      const lapsed = trainModel(mk("expired"), PRIOR_MODEL);
+      const rejected = trainModel(mk("rejected"), PRIOR_MODEL);
+      expect(lapsed.trained && rejected.trained).toBe(true);
+      if (lapsed.trained && rejected.trained) {
+        // with the negatives weighing less, the fit sits closer to "yes": a higher bias than the rejected fit
+        expect(lapsed.model.bias).toBeGreaterThan(rejected.model.bias);
+      }
     });
   });
 });

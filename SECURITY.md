@@ -19,6 +19,18 @@ not by RLS; changing `identity` and `vow` nodes is further restricted to the min
 database URL and runs the service) has infrastructure powers: keys, `suspend-access` and `restore-access`, grants,
 export and purge. No verb lets the operator write your identity or vows, but the operator issues your key, can import files into you, sets the cooling period and holds the database. These are trusted powers, not editorial ones. An operator with database access can of course read or alter storage, so treat that role as trusted. Purge is the one deletion path and is admin-only. An import file is the operator's input; import still refuses to plant identity or vows into a mind that has ever had any (a retired core still counts), and open declarations in a file (pending or accepted) arrive withdrawn; under `--allow-core` identity and vow nodes are imported live beside existing ones, take effect immediately and do not cool, and the import report says so. The operator may also enable, pause or stage the optional extractor (`sanctum-mind extractor ...`); that is a switch over whether proposals are made and shown, never over memory: the database lets only the mind decide a proposal, and an accepted proposal is authored by the mind. A sink URL is likewise the operator's own input, and so is `RERANK_URL`.
 
+**What the database guards do and do not cover.** The guards on identity, declarations, proposals, pins and
+repair work read three per-transaction settings (`app.mind_id`, `app.bearer`, `app.actor`) that the service
+sets from the bearer key and from which code path is running (a verb call, the daemon, the operator CLI, an
+import). They stop every path *through the service* from doing what it should not: a daemon pass cannot
+decide a proposal, a steward cannot write identity, a grantee cannot place a pin, a verb bug cannot cross
+minds. They are not a defence against a client that holds the `sanctum_app` database URL and connects
+directly: such a client can set those three settings itself and is then, to the database, the mind acting
+through a verb. That is the same statement as the first sentence of this section, made specific. Do not
+wire any lane straight to Postgres and expect the guards to hold it to its role; give it the service's HTTP
+endpoint and its own key instead. Tying the actor claim to a per-lane database role is a possible hardening
+and is on the maintainers' list; it is not in this release.
+
 ## Residual risks
 
 - The HTTP service speaks plain HTTP and binds to `127.0.0.1` by default; terminate TLS in a reverse proxy

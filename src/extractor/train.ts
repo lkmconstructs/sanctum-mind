@@ -11,7 +11,11 @@ import { PRIOR_MODEL, loadModel, scoreOf, sigmoid, weightsJson, type Model } fro
 /** At least this many decided noticings, and at least MIN_PER_CLASS accepted and MIN_PER_CLASS not accepted, or the prior stands. */
 export const MIN_DECIDED = 30;
 export const MIN_PER_CLASS = 5;
-/** An expired proposal is a weak "no": the mind may simply not have looked. */
+/**
+ * An expired proposal is a weak "no": the mind may simply not have looked. This is training policy, not a
+ * schema rule: the ledger records an expiry as an expiry, and only this weight turns it into a half-vote.
+ * test/extractor.test.ts pins the value and its effect so a later change to training cannot drop it quietly.
+ */
 export const EXPIRED_WEIGHT = 0.5;
 export const EPOCHS = 200;
 /** Step size of the full-batch gradient. Features are in 0..1, so the loss is smooth and 0.5 is stable with 13 of them. */
