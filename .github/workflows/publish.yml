@@ -22,4 +22,16 @@ jobs:
           ONNXRUNTIME_NODE_INSTALL_CUDA: skip
       - run: npm run typecheck && npm run build
       - run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.release.tag_name }}"
-      - run: npm publish --access public --provenance
+      # A version already on npm (for example the first one, published by hand to create the package
+      # before a trusted publisher could be linked) is left alone instead of failing the release.
+      - id: check
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if npm view "sanctum-mind@$v" version >/dev/null 2>&1; then
+            echo "sanctum-mind@$v is already on npm; nothing to publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.check.outputs.published == 'false'
+        run: npm publish --access public --provenance
