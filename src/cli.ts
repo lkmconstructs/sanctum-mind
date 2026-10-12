@@ -5,6 +5,7 @@
 import { parseArgs } from "node:util";
 import { seedMindsFromFile } from "./auth.js";
 import { assertRlsEnforced, createPool } from "./db/pool.js";
+import { LaneError, requireLane, type LaneRequirement } from "./db/lanes.js";
 import { runMigrations } from "./db/migrate.js";
 import { createHttpServer, DEFAULT_HOST, startStdio } from "./server.js";
 import { embedderFromEnv } from "./embed/index.js";
@@ -29,39 +30,41 @@ import { sinksRequeue, sinksStatus, sinksTest } from "./sinks/cli.js";
 const USAGE = `usage: sanctum-mind <command>
 
 commands:
-  init --mind <id>  one-step setup: migrate, sanctum_app login, a mind and its key, MCP client configs
+  init --mind <id>  one-step setup: migrate, the four lane logins and sanctum_app, a mind and its key, MCP client configs
                     (needs an ADMIN DATABASE_URL; see "init" options below)
   migrate           apply database migrations (needs an ADMIN DATABASE_URL)
   seed-keys <file>  upsert minds from a "<mind_id> <key>" file (needs an ADMIN DATABASE_URL)
-  http              serve HTTP and MCP Streamable HTTP (needs the sanctum_app DATABASE_URL; PORT default 8002,
+  http              serve HTTP and MCP Streamable HTTP (needs the sanctum_verb DATABASE_URL; PORT default 8002,
                     HOST default 127.0.0.1, MAX_CONNECTIONS default 256; plain HTTP, put TLS in front)
   embed-backfill [--batch N]
                     embed rows that have no vector yet (default batch 64); idempotent
-  stdio             serve MCP over stdio (needs the sanctum_app DATABASE_URL and SANCTUM_BEARER)
+  stdio             serve MCP over stdio (needs the sanctum_verb DATABASE_URL and SANCTUM_BEARER)
   daemon [--once] [--interval <minutes>] [--mind <id>]
-                    run the deterministic metabolism passes for every enabled mind (sanctum_app URL;
+                    run the deterministic metabolism passes for every enabled mind (sanctum_daemon URL;
                     default every 30 minutes; --once runs one pass set and exits 0 if all passes were ok, 2 otherwise or when no mind with active access matched)
   import-revien <file> --mind <id> [--source <id>]... [--dry-run]
-                    import a Revien graph export (its public JSON format) into one mind (sanctum_app URL)
+                    import a Revien graph export (its public JSON format) into one mind (sanctum_import URL)
   grant add|revoke|list ...
-                    manage grants between minds (ADMIN URL; see "grant" usage below)
+                    manage grants between minds (sanctum_operator or ADMIN URL; see "grant" usage below)
   extractor enable|disable|pause|resume|stage|report|repair-backfill --mind <id> ...
-                    operate the optional extractor that proposes links, patterns and distillations (ADMIN URL; see "extractor" usage below)
+                    operate the optional extractor that proposes links, patterns and distillations (sanctum_operator or ADMIN URL; see "extractor" usage below)
   export-mind --mind <id> [--out <file>]
-                    write one mind (ledger, graph, projections) to a JSON file (sanctum_app URL)
+                    write one mind (ledger, graph, projections) to a JSON file (sanctum_import URL)
   import-mind <file> --mind <target> [--dry-run] [--allow-core] [--strict] [--with-letters]
-                    load an export into a mind; idempotent by id; letters to other minds only with --with-letters (sanctum_app URL)
+                    load an export into a mind; idempotent by id; letters to other minds only with --with-letters (sanctum_import URL)
   suspend-access --mind <id> | restore-access --mind <id>
                     suspend access to a mind (its key stops working, grants from it stop applying) or restore it (ADMIN URL);
                     an infrastructure duty, not a power over the mind (disable-mind / enable-mind are deprecated aliases)
   purge-mind --mind <id> --confirm <id> [--sever-letters]
                     delete a mind completely; the only deletion path (ADMIN URL)
-  sinks test|status run every configured sink once, or show pending/failing/delivered counts (sanctum_app URL)
+  sinks test|status run every configured sink once, or show pending/failing/delivered counts (any lane URL)
   sinks requeue --sink <name>
                     reset the parked (gave-up) rows of one sink so the daemon retries them
 
-migrate and seed-keys run as the database admin; http and stdio run as the unprivileged
-sanctum_app login, which cannot modify keys or grants.
+migrate and seed-keys run as the database admin. The service runs as one of four unprivileged lane logins, none of
+which can modify keys (only sanctum_operator can change grants and the extractor's switch): http and stdio as sanctum_verb, daemon as sanctum_daemon, export-mind, import-mind,
+embed-backfill and sinks requeue as sanctum_import, extractor and grant as sanctum_operator (or the admin URL), import-revien as sanctum_import; sinks test and status take any lane.
+init prints the four lane URLs. The legacy shared sanctum_app login still works and warns.
 
 ${INIT_USAGE}
 
@@ -90,6 +93,24 @@ function requireDatabaseUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) fail("DATABASE_URL is not set");
   return url;
+}
+
+/**
+ * The startup lane check (CONTRACTS.md, "Per-lane database roles"): ask the database which login this process connected as and
+ * refuse on the wrong lane. The legacy sanctum_app login is allowed with one warning line; the admin connection only where
+ * the command takes the admin URL today.
+ */
+async function enforceLane(pool: ReturnType<typeof createPool>, req: LaneRequirement): Promise<void> {
+  try {
+    const v = await requireLane(pool, req);
+    if (v.warning !== null) console.error(`sanctum-mind: warning: ${v.warning}`);
+  } catch (e) {
+    if (e instanceof LaneError) {
+      await pool.end().catch(() => undefined);
+      fail(e.message);
+    }
+    throw e;
+  }
 }
 
 async function main(): Promise<void> {
@@ -130,6 +151,7 @@ async function main(): Promise<void> {
       defaultCoolingMs(); // fail fast on a bad IDENTITY_COOLING_HOURS
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
+      await enforceLane(pool, { command: "http", lanes: ["verb"] });
       const port = Number(process.env.PORT ?? 8002);
       if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`invalid PORT "${process.env.PORT}"`);
       const server = createHttpServer({ pool, registry, embedder: embedderFromEnv(process.env), sinks: loadSinks(process.env) });
@@ -154,6 +176,7 @@ async function main(): Promise<void> {
       defaultCoolingMs();
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
+      await enforceLane(pool, { command: "stdio", lanes: ["verb"] });
       await startStdio({ pool, registry, embedder: embedderFromEnv(process.env), sinks: loadSinks(process.env) }, process.env.SANCTUM_BEARER);
       return;
     }
@@ -164,6 +187,7 @@ async function main(): Promise<void> {
       const embedder = embedderFromEnv(process.env);
       if (embedder.name === "none") fail("no embedder configured (EMBEDDER=none); nothing to backfill");
       const pool = createPool(requireDatabaseUrl());
+      await enforceLane(pool, { command: "embed-backfill", lanes: ["import"] });
       try {
         const c = await backfillEmbeddings(pool, embedder, batch);
         console.log(`embedded ${c.events} event(s) and ${c.nodes} node(s) with ${embedder.name}; ${c.skipped} skipped`);
@@ -180,6 +204,7 @@ async function main(): Promise<void> {
       const minds = args.mind ? [args.mind] : undefined;
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
+      await enforceLane(pool, { command: "daemon", lanes: ["daemon"] });
       const embedder = embedderFromEnv(process.env);
       if (args.once) {
         const reports = await runDaemonOnce({ pool, embedder, reranker, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
@@ -219,6 +244,7 @@ async function main(): Promise<void> {
       const pool = createPool(requireDatabaseUrl());
       try {
         await assertRlsEnforced(pool);
+        await enforceLane(pool, { command: "import-revien", lanes: ["import"] });
         const found = await pool.query<{ disabled_at: Date | null }>("select disabled_at from minds where mind_id = $1", [args.mind]);
         if (found.rows.length === 0) fail(`mind "${args.mind}" does not exist (create it with init or seed-keys first)`);
         if (found.rows[0]!.disabled_at !== null) fail(`mind "${args.mind}" has access suspended; nothing was imported`);
@@ -236,6 +262,7 @@ async function main(): Promise<void> {
     case "grant": {
       const args = parseGrantArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
+      await enforceLane(pool, { command: "grant", lanes: ["operator"], allowAdmin: true });
       try {
         console.log(await runGrantCommand(pool, args));
       } finally {
@@ -246,6 +273,7 @@ async function main(): Promise<void> {
     case "extractor": {
       const args = parseExtractorArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
+      await enforceLane(pool, { command: "extractor", lanes: ["operator"], allowAdmin: true });
       try {
         console.log(await runExtractorCommand(pool, args));
       } finally {
@@ -257,6 +285,7 @@ async function main(): Promise<void> {
       const args = parseExportArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
+      await enforceLane(pool, { command: "export-mind", lanes: ["import"] });
       try {
         const r = await exportMind(pool, args.mind, args.out);
         console.log(`exported ${r.mind_id} to ${r.file}: ${Object.entries(r.counts).map(([k, v]) => `${k} ${v}`).join(", ")}`);
@@ -269,6 +298,7 @@ async function main(): Promise<void> {
       const args = parseImportMindArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
+      await enforceLane(pool, { command: "import-mind", lanes: ["import"] });
       try {
         const r = await importMind(pool, args.file, args.mind, { dry_run: args.dryRun, allow_core: args.allowCore, strict: args.strict, with_letters: args.withLetters });
         console.log(JSON.stringify(r, null, 2));
@@ -337,6 +367,7 @@ async function main(): Promise<void> {
         }
         if (sinkName === undefined || sinkName === "") fail("usage: sanctum-mind sinks requeue --sink <name>");
         const pool = createPool(requireDatabaseUrl());
+        await enforceLane(pool, { command: "sinks requeue", lanes: ["import"] });
         try {
           const r = await sinksRequeue(pool, sinkName);
           console.log(JSON.stringify({ sink: sinkName, requeued: r.total, minds: r.minds }));
@@ -353,4 +384,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => fail(e instanceof Error ? e.message : String(e)));
+main().catch((e) => {
+  const message = e instanceof Error ? e.message : String(e);
+  // a lane login that the database does not know (the lane logins are created by init; migration 0026 adds them)
+  const lane = /password authentication failed for user "(sanctum_(?:verb|daemon|operator|import))"|role "(sanctum_(?:verb|daemon|operator|import))" does not exist/.exec(message);
+  if (lane) {
+    fail(`lane login failed (${message}): run \`docker compose run --rm init\` (or, outside Docker, \`init\` with the admin DATABASE_URL; migration 0026 adds per-lane logins) and start again`);
+  }
+  fail(message);
+});

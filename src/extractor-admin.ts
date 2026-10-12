@@ -14,7 +14,7 @@ import { ArgError } from "./cli-args.js";
  */
 
 /** Printed when the connection is the unprivileged app role: changing the switch is an operator act on the admin URL. */
-export const NEEDS_ADMIN = "extractor commands need the admin DATABASE_URL (the sanctum_app login can only read the extractor's state)";
+export const NEEDS_ADMIN = "extractor commands need the admin DATABASE_URL (the sanctum_app login and the lane logins can only read the extractor's state)";
 
 export const EXTRACTOR_STAGES = ["shadow", "propose"] as const;
 export type ExtractorStage = (typeof EXTRACTOR_STAGES)[number];

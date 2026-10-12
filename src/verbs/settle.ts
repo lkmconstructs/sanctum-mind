@@ -22,6 +22,19 @@ export interface SettleResult {
 }
 
 /**
+ * Names the declaration (or the vow) being settled for the database: on the daemon lane the identity guards (migration 0026) let the
+ * daemon write an identity or vow node, or mark a declaration settled, only while `app.settling` names a due declaration of the mind
+ * that the write matches. Set immediately before each declaration's writes and cleared after; transaction-local. Verbs on the verb
+ * lane do not need it. `app.now` carries the caller's clock: the guards treat "due" as `effective_at <= greatest(clock_timestamp(),
+ * least(app.now, clock_timestamp() + 5 minutes))`, so a few minutes of drift between the application's clock and the database's
+ * cannot make a due settlement fail. A daemon can advance the clock by at most five minutes that way, so retirements and vow breaks
+ * still cool on the mind's own clock to within that margin.
+ */
+async function markSettling(ctx: VerbContext, id: string | null): Promise<void> {
+  await ctx.tx.query("select set_config('app.settling', $1, true), set_config('app.now', $2, true)", [id ?? "", id === null ? "" : ctx.now().toISOString()]);
+}
+
+/**
  * Settles declared identity changes whose cooling is over: a rewrite of a core (the accepted proposal's
  * supersede is performed), the retirement of a core (the node is invalidated, nothing replaces it) and the breaking of a vow (the declared break becomes a settled one). Everything
  * is written by the mind itself; it applies only declarations the mind made itself, whose time has passed.
@@ -43,6 +56,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     [mind, now],
   );
   for (const { id } of props.rows) {
+    await markSettling(ctx, null);
     await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [proposalLockKey(id)]);
     // re-read under the lock: a withdrawal that committed meanwhile wins
     const cur = await ctx.tx.query<{
@@ -61,6 +75,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     );
     const p = cur.rows[0];
     if (!p || p.target_node_id === null) continue;
+    await markSettling(ctx, id);
     if (p.action === "retire") {
       // the core is invalidated, not replaced and not deleted; edges stay as they are (supersedeNode leaves the old node's edges too)
       await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(p.target_node_id)]);
@@ -130,7 +145,9 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
      order by created_at, id`,
     [mind, VOW_NODE, now],
   );
+  await markSettling(ctx, null);
   for (const { id } of vows.rows) {
+    await markSettling(ctx, null);
     await ctx.tx.query("select pg_advisory_xact_lock(hashtext($1))", [nodeLockKey(id)]);
     const cur = await ctx.tx.query<{ metadata: Record<string, any> }>(
       `select metadata from nodes where id = $1 and mind_id = $2 and node_type = $3 and invalidated_at is null
@@ -139,6 +156,7 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     );
     const v = cur.rows[0];
     if (!v) continue;
+    await markSettling(ctx, id);
     const { break_declared: d, ...rest } = v.metadata;
     const ev = await appendEvent(ctx, {
       kind: "vow.break.settled",
@@ -152,5 +170,6 @@ export async function settleDueDeclarations(ctx: VerbContext, mind: string): Pro
     ]);
     declarations.push({ kind: "vow_break", vow_id: id, target_node_id: id });
   }
+  await markSettling(ctx, null);
   return { changed: declarations.length, declarations, notes };
 }

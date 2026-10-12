@@ -12,15 +12,28 @@
 #   docker compose run --rm -e DATABASE_URL="$ADMIN_DATABASE_URL" mind node dist/cli.js init --mind alpha --docker --public-db-host localhost:5432
 # ADMIN_DATABASE_URL defaults to the bundled db's postgres user.
 #
-# Export and import go through the "tools" service (same image, sanctum_app login, ./exchange mounted at /exchange):
+# Export and import go through the "tools" service (same image, sanctum_import login, ./exchange mounted at /exchange):
 #   mkdir -p exchange                      # must exist and be writable by uid 1000 (the container's "node" user)
 #   docker compose run --rm tools node dist/cli.js export-mind --mind alpha --out /exchange/alpha.json
 #   docker compose run --rm tools node dist/cli.js import-mind /exchange/alpha.json --mind alpha --dry-run
 # It also runs embed-backfill and "sinks requeue --sink <name>". Admin commands stay on the init service.
 #
-# The passwords below are for local use only. Override POSTGRES_PASSWORD and APP_PASSWORD
-# (environment or a .env file next to this one) before exposing anything. Use URL-safe
-# characters in them, since they are placed inside connection URLs.
+# Each service connects as its own lane login (migration 0026), and the database derives who is acting from the login:
+#   mind -> sanctum_verb, daemon -> sanctum_daemon, tools -> sanctum_import. init (admin URL) creates the logins.
+# The sanctum_operator lane (extractor and grant for an operator who does NOT hold the admin URL) has no service here:
+# the init service already runs operator commands under the admin URL. init prints the operator URL once; if you want it,
+# set OPERATOR_PASSWORD (passed to init below) and build the URL from it yourself.
+# sanctum_app is the legacy shared lane. APP_PASSWORD matters only when upgrading a database that already has a sanctum_app
+# login (init then checks it against this value); nothing in this file connects as sanctum_app.
+#
+# The passwords below are for local use only. Override POSTGRES_PASSWORD, VERB_PASSWORD, DAEMON_PASSWORD, IMPORT_PASSWORD
+# (OPERATOR_PASSWORD, and APP_PASSWORD when upgrading) (environment or a .env file next to this one) before exposing anything.
+# Use URL-safe characters in them, since they are placed inside connection URLs.
+#
+# UPGRADING a deployment that ran on sanctum_app (migration 0026): run `docker compose run --rm init` BEFORE
+# `docker compose up -d`. mind, daemon and tools now log in as lanes, and the lane logins exist only after init has run.
+# `docker compose up` alone, before init, leaves mind and daemon restarting with "password authentication failed"
+# (the message then says to run init); once init has run they recover. A fresh install gets no sanctum_app login at all.
 
 services:
   db:
@@ -49,6 +62,12 @@ services:
     environment:
       DATABASE_URL: ${ADMIN_DATABASE_URL:-postgresql://postgres:${POSTGRES_PASSWORD:-sanctum_local}@db:5432/sanctum_mind}
       SANCTUM_APP_PASSWORD: ${APP_PASSWORD:-sanctum_app_local}
+      # init creates the lane logins with these passwords (the same ones the services below connect with)
+      SANCTUM_LANE_PASSWORD_VERB: ${VERB_PASSWORD:-sanctum_verb_local}
+      SANCTUM_LANE_PASSWORD_DAEMON: ${DAEMON_PASSWORD:-sanctum_daemon_local}
+      SANCTUM_LANE_PASSWORD_IMPORT: ${IMPORT_PASSWORD:-sanctum_import_local}
+      # the operator lane is optional here; unset, init generates its password and prints it once
+      SANCTUM_LANE_PASSWORD_OPERATOR: ${OPERATOR_PASSWORD:-}
     # --public-db-host only changes the DATABASE_URL printed in the configs (your machine reaches the
     # database on localhost:5432); init itself connects to db:5432. --docker prints the HTTP and stdio (Docker)
     # configs and leaves out the host-path stdio config, which cannot work on the host.
@@ -65,7 +84,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://sanctum_app:${APP_PASSWORD:-sanctum_app_local}@db:5432/sanctum_mind
+      DATABASE_URL: postgresql://sanctum_verb:${VERB_PASSWORD:-sanctum_verb_local}@db:5432/sanctum_mind
       PORT: ${PORT:-8002}
       # Inside the container listen on every interface so other containers can reach it; the port is
       # published to the host's loopback only (below).
@@ -83,7 +102,7 @@ services:
       - embed-cache:/data/embed-cache
     restart: unless-stopped
 
-  # One-off export, import and maintenance as the sanctum_app login. Not started by `docker compose up`
+  # One-off export, import and maintenance as the sanctum_import login. Not started by `docker compose up`
   # (profile "tools"); name the command, as in the examples at the top. The container runs as
   # "node" (uid 1000), so ./exchange on the host must exist and be writable by that uid. export-mind refuses to
   # overwrite an existing file.
@@ -97,7 +116,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://sanctum_app:${APP_PASSWORD:-sanctum_app_local}@db:5432/sanctum_mind
+      DATABASE_URL: postgresql://sanctum_import:${IMPORT_PASSWORD:-sanctum_import_local}@db:5432/sanctum_mind
       EMBEDDER: ${EMBEDDER:-local}
       EMBED_CACHE_DIR: /data/embed-cache
       SINKS: ${SINKS:-}
@@ -115,7 +134,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://sanctum_app:${APP_PASSWORD:-sanctum_app_local}@db:5432/sanctum_mind
+      DATABASE_URL: postgresql://sanctum_daemon:${DAEMON_PASSWORD:-sanctum_daemon_local}@db:5432/sanctum_mind
       EMBEDDER: ${EMBEDDER:-local}
       EMBED_CACHE_DIR: /data/embed-cache
       # Cooling period for identity changes in hours (0 for solo use) and the outbox sinks (JSON inline, or a path

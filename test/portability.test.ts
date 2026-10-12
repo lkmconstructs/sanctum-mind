@@ -17,10 +17,17 @@ import { runVerb } from "../src/verbs/run.js";
 import { registry } from "../src/verbs/registry.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
 import { PurgeError, parsePurgeArgs, purgeMind } from "../src/purge.js";
-import { appPool, closePool, queryAs, queryLegacy, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
+import { appPool, closePool, lanePool, laneUrl, queryAs, queryLegacy, resetDatabase, testAppUrl, testDatabaseUrl } from "./helpers.js";
 
 let admin: Pool;
+/**
+ * The pool export and import run on. test/portability_lane.test.ts sets PORTABILITY_LANE=import and loads this file again, so the
+ * whole round trip also runs as the sanctum_import login (what the compose "tools" service uses). Otherwise it is the legacy lane.
+ * Tests that run verbs always use verbApp, the legacy pool: a verb on the import lane would (rightly) be refused by withMind.
+ */
+const ON_IMPORT_LANE = process.env.PORTABILITY_LANE === "import";
 let app: Pool;
+let verbApp: Pool;
 const extra: Pool[] = [];
 const dbs: string[] = [];
 /** Test keys must meet the 32 character minimum. */
@@ -30,7 +37,7 @@ let fileSeq = 0;
 const outFile = () => join(dir, `x${fileSeq++}.json`);
 
 const urlFor = (db: string, user?: string): string => {
-  if (user) return testAppUrl(db);
+  if (user) return ON_IMPORT_LANE ? laneUrl("import", db) : testAppUrl(db);
   const u = new URL(testDatabaseUrl());
   u.pathname = `/${db}`;
   return u.toString();
@@ -39,15 +46,18 @@ const urlFor = (db: string, user?: string): string => {
 beforeEach(async () => {
   for (const p of extra.splice(0)) await closePool(p);
   if (app) await closePool(app);
+  if (verbApp) await closePool(verbApp);
   if (admin) await closePool(admin);
   admin = await resetDatabase();
-  app = appPool();
+  app = ON_IMPORT_LANE ? lanePool("import") : appPool();
+  verbApp = appPool();
   await seed(admin, "alpha");
 });
 
 afterAll(async () => {
   for (const p of extra.splice(0)) await closePool(p);
   if (app) await closePool(app);
+  if (verbApp) await closePool(verbApp);
   if (admin) {
     for (const d of dbs) await admin.query(`drop database if exists ${d} with (force)`);
     await closePool(admin);
@@ -604,7 +614,7 @@ describe("import cannot bypass the mind's authorship of identity or fake authors
     await upsertMinds(admin, [{ mind_id: "gamma", key: K("g") }]);
     const gamma: any = { bearer: "gamma", grants: {} };
     const call = (input: Record<string, unknown>) =>
-      runVerb({ pool: app, registry, now: () => new Date(Date.now() + 1000), coolingMs: 0 }, gamma, "mind_identity", { mind_id: "gamma", ...input }) as Promise<any>;
+      runVerb({ pool: verbApp, registry, now: () => new Date(Date.now() + 1000), coolingMs: 0 }, gamma, "mind_identity", { mind_id: "gamma", ...input }) as Promise<any>;
     const old = (await call({ operation: "affirm", section: "core", content: "I was" })).receipt.projection.node_id as string;
     expect((await call({ operation: "retire", target_node_id: old })).ok).toBe(true);
     expect((await call({ operation: "settle" })).receipt.projection.settled).toBe(1);
@@ -839,7 +849,7 @@ describe("import does not carry live declarations", () => {
   });
   const settleGamma = async () =>
     (
-      await runDaemonOnce({ pool: app, embedder: NONE_EMBEDDER, now: () => new Date() }, { trigger: "manual", minds: ["gamma"] })
+      await runDaemonOnce({ pool: verbApp, embedder: NONE_EMBEDDER, now: () => new Date() }, { trigger: "manual", minds: ["gamma"] })
     )[0]!.passes.find((p) => p.pass === "identity.settle")!;
 
   it("the planted-proposal repro: a past-due accepted proposal in the file arrives withdrawn and the core is untouched after settle", async () => {
@@ -898,7 +908,7 @@ describe("import does not carry live declarations", () => {
     expect((await q("select status from proposals where id = $1", [settledProp]))[0].status).toBe("settled");
     expect((await q("select status from proposals where id = $1", [rejectedProp]))[0].status).toBe("rejected");
     // the mind's own rewrite of that core goes through
-    const r = (await runVerb({ pool: app, registry, now: () => new Date() }, { bearer: "gamma", grants: {} }, "mind_identity", {
+    const r = (await runVerb({ pool: verbApp, registry, now: () => new Date() }, { bearer: "gamma", grants: {} }, "mind_identity", {
       mind_id: "gamma",
       operation: "propose",
       section: "core",
@@ -957,7 +967,7 @@ describe("retire declarations cross a file boundary", () => {
   it("an open retire arrives withdrawn, the core stays live, and action survives export and import", async () => {
     const mind: any = { bearer: "alpha", grants: {} };
     const call = (input: Record<string, unknown>) =>
-      runVerb({ pool: app, registry, now: () => new Date(), coolingMs: 24 * 3_600_000 }, mind, "mind_identity", { mind_id: "alpha", ...input }) as Promise<any>;
+      runVerb({ pool: verbApp, registry, now: () => new Date(), coolingMs: 24 * 3_600_000 }, mind, "mind_identity", { mind_id: "alpha", ...input }) as Promise<any>;
     const core = (await call({ operation: "affirm", section: "core", content: "old self" })).receipt.projection.node_id as string;
     const p = (await call({ operation: "retire", target_node_id: core, lineage_note: "enough" })).receipt.projection.proposal;
     expect(p.action).toBe("retire");

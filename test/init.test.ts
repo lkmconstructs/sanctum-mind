@@ -10,11 +10,15 @@ import { parse as parsePgUrl } from "pg-connection-string";
 import pg from "pg";
 import { resolveCaller } from "../src/auth.js";
 import { assertRlsEnforced, createPool } from "../src/db/pool.js";
-import { deriveAppUrl, formatInit, InitError, parseInitArgs, runInit, verifierMatches, type InitOptions } from "../src/init.js";
+import { deriveAppUrl, deriveRoleUrl, formatInit, InitError, parseInitArgs, runInit, verifierMatches, type InitOptions } from "../src/init.js";
 import { testDatabaseUrl } from "./helpers.js";
 
-/** sanctum_app is cluster-wide: remember its login and password at the start and put them back at the end. */
-let savedRole: { rolpassword: string | null; rolcanlogin: boolean } | null = null;
+/**
+ * sanctum_app and the four lane logins are cluster-wide: remember each one's login and password at the start and put them
+ * back at the end (the harness gave the lanes random passwords other test files rely on).
+ */
+const ROLES = ["sanctum_app", "sanctum_verb", "sanctum_daemon", "sanctum_operator", "sanctum_import"] as const;
+const savedRoles = new Map<string, { rolpassword: string | null; rolcanlogin: boolean }>();
 const dirs: string[] = [];
 const pools: pg.Pool[] = [];
 
@@ -27,6 +31,7 @@ function opts(over: Partial<InitOptions> = {}): InitOptions {
     json: false,
     rotate: false,
     writeEnv: false,
+    legacyLogin: true, // most tests use the legacy sanctum_app login; "a fresh install" below leaves it out
     ...over,
   };
 }
@@ -37,15 +42,19 @@ function track(p: pg.Pool): pg.Pool {
 }
 
 async function resetRole(admin: pg.Pool): Promise<void> {
-  const has = await admin.query("select 1 from pg_roles where rolname = 'sanctum_app'");
-  if (has.rowCount) await admin.query("alter role sanctum_app nologin password null");
+  for (const role of ROLES) {
+    const has = await admin.query("select 1 from pg_roles where rolname = $1", [role]);
+    if (has.rowCount) await admin.query(`alter role ${role} nologin password null`);
+  }
 }
 
 beforeAll(async () => {
   const admin = createPool(testDatabaseUrl());
   try {
-    const r = await admin.query("select rolpassword, rolcanlogin from pg_authid where rolname = 'sanctum_app'");
-    savedRole = r.rows[0] ?? null;
+    for (const role of ROLES) {
+      const r = await admin.query("select rolpassword, rolcanlogin from pg_authid where rolname = $1", [role]);
+      if (r.rows[0]) savedRoles.set(role, r.rows[0]);
+    }
   } finally {
     await admin.end();
   }
@@ -65,15 +74,17 @@ beforeEach(async () => {
 afterAll(async () => {
   const admin = createPool(testDatabaseUrl());
   try {
-    const has = await admin.query("select 1 from pg_roles where rolname = 'sanctum_app'");
-    if (has.rowCount) {
-      if (savedRole === null) {
-        await admin.query("alter role sanctum_app nologin password null");
+    for (const role of ROLES) {
+      const has = await admin.query("select 1 from pg_roles where rolname = $1", [role]);
+      if (!has.rowCount) continue;
+      const saved = savedRoles.get(role);
+      if (saved === undefined) {
+        await admin.query(`alter role ${role} nologin password null`);
       } else {
         const stmt = await admin.query(
-          `select format('alter role sanctum_app %s password %s', case when $1::boolean then 'login' else 'nologin' end,
+          `select format('alter role %I %s password %s', $3::text, case when $1::boolean then 'login' else 'nologin' end,
                          coalesce(quote_literal($2::text), 'null')) as sql`,
-          [savedRole.rolcanlogin, savedRole.rolpassword],
+          [saved.rolcanlogin, saved.rolpassword, role],
         );
         await admin.query(stmt.rows[0].sql);
       }
@@ -166,7 +177,7 @@ describe("init", () => {
     expect(stdio.args).not.toContain("-y"); // args only: the random key may legitimately contain "-y"
     expect(stdio._note).toMatch(/not published yet/);
     expect(stdio.env.SANCTUM_BEARER).toBe(r.mind.bearer);
-    expect(stdio.env.DATABASE_URL).toContain("sanctum_app");
+    expect(stdio.env.DATABASE_URL).toContain("sanctum_verb"); // the MCP configs carry the verb lane URL, not the legacy one
     expect(stdio.env.DATABASE_URL).not.toContain("pw@"); // a supplied password is never echoed
     const http = parsed.mcp.http.mcpServers["sanctum-mind"];
     expect(http).toEqual({
@@ -221,18 +232,18 @@ describe("init", () => {
   it("writes .env only with --write-env and never overwrites", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sanctum-init-"));
     dirs.push(dir);
-    const without = await runInit(opts({ appPassword: "pw", envDir: dir }));
+    const without = await runInit(opts({ appPassword: "pw", lanePasswords: { verb: "verbpw" }, envDir: dir }));
     expect(without.env_file).toBeNull();
     await expect(readFile(join(dir, ".env"), "utf8")).rejects.toThrow();
 
-    const written = await runInit(opts({ appPassword: "pw", envDir: dir, writeEnv: true, rotate: true }));
+    const written = await runInit(opts({ appPassword: "pw", lanePasswords: { verb: "verbpw" }, envDir: dir, writeEnv: true, rotate: true }));
     expect(written.env_file?.status).toBe("written");
     const text = await readFile(join(dir, ".env"), "utf8");
-    expect(text).toContain(`DATABASE_URL=${deriveAppUrl(testDatabaseUrl(), "pw")}`);
+    expect(text).toContain(`DATABASE_URL=${deriveRoleUrl(testDatabaseUrl(), "sanctum_verb", "verbpw")}`);
     expect(text).toContain(`SANCTUM_BEARER=${written.mind.bearer}`);
 
     await writeFile(join(dir, ".env"), "KEEP=1\n");
-    const again = await runInit(opts({ appPassword: "pw", envDir: dir, writeEnv: true, rotate: true }));
+    const again = await runInit(opts({ appPassword: "pw", lanePasswords: { verb: "verbpw" }, envDir: dir, writeEnv: true, rotate: true }));
     expect(again.env_file?.status).toBe("exists");
     expect(await readFile(join(dir, ".env"), "utf8")).toBe("KEEP=1\n");
   });
@@ -248,6 +259,144 @@ describe("init", () => {
     await expect(runInit(opts({ databaseUrl: undefined }))).rejects.toThrow(/DATABASE_URL is not set/);
     await expect(runInit(opts({ mind: "bad id!" }))).rejects.toThrow(/invalid mind_id/);
     await expect(runInit(opts({ mind: "__proto__" }))).rejects.toThrow(/invalid mind_id/);
+  });
+});
+
+describe("init and the legacy login", () => {
+  it("a fresh install enables no sanctum_app login unless --legacy-login is passed; an existing login is left alone", async () => {
+    const admin = track(createPool(testDatabaseUrl()));
+    const fresh = await runInit(opts({ legacyLogin: false }));
+    expect(fresh.app_role).toEqual({ name: "sanctum_app", login: false, password: "none" });
+    expect(fresh.app_database_url).toBe("");
+    expect((await admin.query("select rolcanlogin from pg_roles where rolname = 'sanctum_app'")).rows[0].rolcanlogin).toBe(false);
+    const text = formatInit(fresh);
+    expect(text).toContain("no login");
+    expect(text).not.toContain("Legacy shared lane");
+    expect(JSON.stringify(fresh.mcp)).toContain("sanctum_verb");
+    const withIt = await runInit(opts({ legacyLogin: true }));
+    expect(withIt.app_role).toMatchObject({ login: true, password: "generated" });
+    expect(formatInit(withIt)).toContain("Legacy shared lane");
+    // an upgrade: the login exists, so a run without the flag leaves it alone (same password, still a login)
+    const again = await runInit(opts({ legacyLogin: false }));
+    expect(again.app_role).toMatchObject({ login: true, password: "unchanged" });
+    expect(parseInitArgs(["--mind", "a", "--legacy-login"], {}).legacyLogin).toBe(true);
+  });
+
+  it("recreates a lane role that is missing from a database that recorded 0026", async () => {
+    await runInit(opts());
+    const admin = track(createPool(testDatabaseUrl()));
+    await admin.query("drop owned by sanctum_import");
+    await admin.query("drop role sanctum_import");
+    const r = await runInit(opts()); // migrations are all recorded: only init can repair the role
+    expect(r.migrations.applied).toEqual([]);
+    expect(r.lane_roles.import).toMatchObject({ name: "sanctum_import", login: true, password: "generated" });
+    const member = await admin.query("select 1 from pg_auth_members where roleid = 'sanctum_app'::regrole and member = 'sanctum_import'::regrole");
+    expect(member.rowCount).toBe(1);
+    const pool = track(createPool(r.lanes.import));
+    expect((await pool.query("select sanctum_actor() as a")).rows[0].a).toBe("import");
+  });
+
+  it("repairs a missing sanctum_operator fully: membership and its direct grants on extractor_state and grants", async () => {
+    await runInit(opts());
+    const admin = track(createPool(testDatabaseUrl()));
+    await admin.query("drop owned by sanctum_operator");
+    await admin.query("drop role sanctum_operator");
+    const r = await runInit(opts());
+    expect(r.lane_roles.operator).toMatchObject({ name: "sanctum_operator", login: true });
+    const can = async (table: string, priv: string) => (await admin.query("select has_table_privilege('sanctum_operator', $1, $2) as ok", [table, priv])).rows[0].ok;
+    for (const [t, priv] of [["extractor_state", "update"], ["extractor_state", "insert"], ["grants", "insert"], ["grants", "update"]] as const) expect(await can(t, priv)).toBe(true);
+    expect((await admin.query("select 1 from pg_auth_members where roleid = 'sanctum_app'::regrole and member = 'sanctum_operator'::regrole")).rowCount).toBe(1);
+    expect(await can("events", "delete")).toBe(false);
+  });
+});
+
+describe("init and the lane logins", () => {
+  const LANE_LIST = ["verb", "daemon", "operator", "import"] as const;
+
+  it("creates the four lane logins, prints four labelled URLs plus the legacy one, and puts the verb URL in the MCP configs", async () => {
+    const r = await runInit(opts({ appPassword: "pw" }));
+    for (const lane of LANE_LIST) {
+      const role = `sanctum_${lane}`;
+      expect(r.lane_roles[lane]).toMatchObject({ name: role, login: true, password: "generated" });
+      const pw = r.lane_roles[lane].generated_password!;
+      expect(pw.length).toBeGreaterThanOrEqual(32);
+      expect(r.lanes[lane]).toContain(pw);
+      expect(parsePgUrl(r.lanes[lane]).user).toBe(role);
+      const pool = track(createPool(r.lanes[lane]));
+      await assertRlsEnforced(pool); // plain roles, not superuser or BYPASSRLS
+      expect((await pool.query("select session_user::text as u")).rows[0].u).toBe(role);
+      expect((await pool.query("select sanctum_actor() as a")).rows[0].a).toBe(lane);
+    }
+    expect(parsePgUrl(r.app_database_url).user).toBe("sanctum_app");
+    // the configs carry the verb URL (stdio), the HTTP config is unchanged
+    const stdio = r.mcp.stdio!.mcpServers["sanctum-mind"];
+    expect(stdio.env.DATABASE_URL).toBe(r.lanes.verb);
+    expect(JSON.stringify(r.mcp.http)).not.toContain("DATABASE_URL");
+    const text = formatInit(r);
+    for (const lane of LANE_LIST) expect(text).toContain(r.lanes[lane]);
+    expect(text).toMatch(/verb\s+http and stdio/);
+    expect(text).toMatch(/daemon\s+the daemon/);
+    expect(text).toMatch(/operator\s+extractor and grant/);
+    expect(text).toMatch(/import\s+export-mind, import-mind, embed-backfill, sinks requeue/);
+    expect(text).toContain("Legacy shared lane (works, warns");
+    // --json carries lanes: {verb, daemon, operator, import} as URLs
+    const parsed = JSON.parse(JSON.stringify(r));
+    expect(Object.keys(parsed.lanes).sort()).toEqual([...LANE_LIST].sort());
+    expect(parsed.lanes.daemon).toBe(r.lanes.daemon);
+  });
+
+  it("uses supplied lane passwords, keeps existing ones on a second run (placeholder, never echoed) and refuses a different one without --force", async () => {
+    const pws = { verb: "v-pw", daemon: "d-pw", operator: "o-pw", import: "i-pw" };
+    const first = await runInit(opts({ appPassword: "pw", lanePasswords: pws }));
+    for (const lane of LANE_LIST) {
+      expect(first.lane_roles[lane].password).toBe("set");
+      expect(first.lanes[lane]).toContain("<lane-password>");
+      const pool = track(createPool(deriveRoleUrl(testDatabaseUrl(), `sanctum_${lane}`, pws[lane])));
+      expect((await pool.query("select sanctum_actor() as a")).rows[0].a).toBe(lane);
+    }
+    const again = await runInit(opts({ appPassword: "pw", lanePasswords: pws }));
+    for (const lane of LANE_LIST) expect(again.lane_roles[lane].password).toBe("unchanged");
+    const bare = await runInit(opts({ appPassword: "pw" }));
+    for (const lane of LANE_LIST) expect(bare.lane_roles[lane].password).toBe("unchanged");
+    expect(bare.notes.join(" ")).toContain("--lane-password-verb");
+    expect(JSON.stringify(bare)).not.toContain("v-pw");
+    await expect(runInit(opts({ appPassword: "pw", lanePasswords: { ...pws, daemon: "other" } }))).rejects.toThrow(/sanctum_daemon login already exists and a different password/);
+    const forced = await runInit(opts({ appPassword: "pw", lanePasswords: { ...pws, daemon: "other" }, force: true }));
+    expect(forced.lane_roles.daemon.password).toBe("set");
+    expect(forced.notes.join(" ")).toContain("sanctum_daemon already had a login");
+    // the .env of a run that does not know the verb password is skipped, naming the flag
+    const dir = await mkdtemp(join(tmpdir(), "sanctum-init-"));
+    dirs.push(dir);
+    const skipped = await runInit(opts({ appPassword: "pw", envDir: dir, writeEnv: true }));
+    expect(skipped.env_file).toMatchObject({ status: "skipped" });
+    expect(skipped.env_file?.reason).toContain("--lane-password-verb");
+  });
+
+  it("--rotate-lanes issues new passwords for logins that already have one, shown once", async () => {
+    const pws = { verb: "v-pw", daemon: "d-pw", operator: "o-pw", import: "i-pw" };
+    await runInit(opts({ appPassword: "pw", lanePasswords: pws }));
+    const r = await runInit(opts({ appPassword: "pw", rotateLanes: true }));
+    for (const lane of LANE_LIST) {
+      expect(r.lane_roles[lane].password).toBe("generated");
+      const fresh = track(createPool(r.lanes[lane]));
+      expect((await fresh.query("select sanctum_actor() as a")).rows[0].a).toBe(lane);
+      // (the test cluster may use trust authentication, so compare the stored verifier rather than trying to log in)
+      const stored = (await track(createPool(testDatabaseUrl())).query("select rolpassword from pg_authid where rolname = $1", [`sanctum_${lane}`])).rows[0].rolpassword;
+      expect(verifierMatches(stored, `sanctum_${lane}`, pws[lane])).toBe(false);
+      expect(verifierMatches(stored, `sanctum_${lane}`, r.lane_roles[lane].generated_password!)).toBe(true);
+    }
+    expect(r.app_role.password).toBe("unchanged"); // sanctum_app is not a lane and is not rotated
+    expect(r.notes.join(" ")).toContain("sanctum_verb already had a login; its password was rotated");
+  });
+
+  it("reads lane passwords from flags and from SANCTUM_LANE_PASSWORD_<LANE>, flags first", () => {
+    const o = parseInitArgs(["--mind", "a", "--lane-password-daemon", "flag"], {
+      SANCTUM_LANE_PASSWORD_VERB: "ev", SANCTUM_LANE_PASSWORD_DAEMON: "ed", SANCTUM_LANE_PASSWORD_OPERATOR: "", SANCTUM_LANE_PASSWORD_IMPORT: "ei",
+    });
+    expect(o.lanePasswords).toEqual({ verb: "ev", daemon: "flag", import: "ei" });
+    expect(o.rotateLanes).toBe(false);
+    expect(parseInitArgs(["--mind", "a", "--rotate-lanes"], {}).rotateLanes).toBe(true);
+    expect(() => parseInitArgs(["--mind", "a", "--lane-password-verb", ""], {})).toThrow(/--lane-password-verb must not be empty/);
   });
 });
 

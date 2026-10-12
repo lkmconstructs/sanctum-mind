@@ -10,6 +10,7 @@ import { parseArgs } from "node:util";
 import pg from "pg";
 import { isValidMindId, mindIdProblem, upsertMinds } from "./auth.js";
 import { createPool } from "./db/pool.js";
+import { LANES, laneRole, type Actor } from "./db/lanes.js";
 import { runMigrations } from "./db/migrate.js";
 
 export interface InitOptions {
@@ -18,6 +19,10 @@ export interface InitOptions {
   mind: string;
   /** Password for the sanctum_app login. Generated on first setup when omitted. */
   appPassword?: string | undefined;
+  /** Passwords for the four lane logins (sanctum_verb, sanctum_daemon, sanctum_operator, sanctum_import). Generated on first setup when omitted. */
+  lanePasswords?: Partial<Record<Actor, string>>;
+  /** Issue new passwords for the four lane logins that already have one (shown once). */
+  rotateLanes?: boolean;
   port: number;
   httpUrl: string;
   json: boolean;
@@ -26,6 +31,8 @@ export interface InitOptions {
   writeEnv: boolean;
   /** Directory for the .env file. */
   envDir?: string;
+  /** Also enable a login on the legacy shared sanctum_app role (a fresh install does not need one; an existing login is left alone). */
+  legacyLogin?: boolean;
   /** Change the password of a sanctum_app login that already exists. */
   force?: boolean;
   /** host:port shown in the printed configs instead of the connection's own (Docker: the host-side address). */
@@ -39,15 +46,28 @@ export interface InitOptions {
 }
 
 export type MindStatus = "created" | "exists" | "rotated";
-export type PasswordStatus = "generated" | "set" | "unchanged";
+export type PasswordStatus = "generated" | "set" | "unchanged" | "none";
+
+export interface LaneRoleResult {
+  name: string;
+  login: true;
+  password: Exclude<PasswordStatus, "none">;
+  /** Present only on the run that generated this lane's password. */
+  generated_password?: string;
+}
 
 export interface InitResult {
   migrations: { applied: string[]; skipped: string[] };
-  app_role: { name: "sanctum_app"; login: true; password: PasswordStatus; generated_password?: string };
+  /** The legacy shared lane: it still works, and warns. */
+  app_role: { name: "sanctum_app"; login: boolean; password: PasswordStatus; generated_password?: string };
+  /** The four lane logins. */
+  lane_roles: Record<Actor, LaneRoleResult>;
+  /** One database URL per lane. A URL carries the real password only when it was generated this run; otherwise a placeholder. */
+  lanes: Record<Actor, string>;
   /** Present only on the run that generated the sanctum_app password. */
   generated_password?: string;
   mind: { id: string; status: MindStatus; bearer?: string };
-  /** Contains the real password only when it was generated this run; otherwise a placeholder. */
+  /** The legacy shared sanctum_app URL (works, warns); empty when sanctum_app has no login. Contains the real password only when it was generated this run; otherwise a placeholder. */
   app_database_url: string;
   mcp: {
     /** Host-path stdio for a clone; absent under --docker, where the path cannot exist on the host. */
@@ -64,6 +84,7 @@ export interface InitResult {
 export class InitError extends Error {}
 
 const APP_PW_PLACEHOLDER = "<app-password>";
+const LANE_PW_PLACEHOLDER = "<lane-password>";
 const BEARER_PLACEHOLDER = "<bearer-key>";
 /** Matches container_name of the mind service in docker-compose.yml. */
 export const DEFAULT_CONTAINER = "sanctum-mind";
@@ -76,6 +97,12 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
       options: {
         mind: { type: "string" },
         "app-password": { type: "string" },
+        "lane-password-verb": { type: "string" },
+        "lane-password-daemon": { type: "string" },
+        "lane-password-operator": { type: "string" },
+        "lane-password-import": { type: "string" },
+        "rotate-lanes": { type: "boolean", default: false },
+        "legacy-login": { type: "boolean", default: false },
         port: { type: "string" },
         "http-url": { type: "string" },
         json: { type: "boolean", default: false },
@@ -96,6 +123,13 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new InitError(`invalid --port "${values.port}"`);
   if (values["app-password"] === "") throw new InitError("--app-password must not be empty");
   const appPassword = values["app-password"] ?? (env.SANCTUM_APP_PASSWORD || undefined);
+  const lanePasswords: Partial<Record<Actor, string>> = {};
+  for (const lane of LANES) {
+    const flag = values[`lane-password-${lane}` as const];
+    if (flag === "") throw new InitError(`--lane-password-${lane} must not be empty`);
+    const pw = flag ?? (env[`SANCTUM_LANE_PASSWORD_${lane.toUpperCase()}`] || undefined);
+    if (pw !== undefined) lanePasswords[lane] = pw;
+  }
   const publicDbHost = values["public-db-host"];
   if (publicDbHost !== undefined) checkHostPort(publicDbHost);
   const container = values.container ?? DEFAULT_CONTAINER;
@@ -104,6 +138,9 @@ export function parseInitArgs(argv: string[], env: Record<string, string | undef
     databaseUrl: env.DATABASE_URL || undefined,
     mind: values.mind,
     appPassword,
+    lanePasswords,
+    rotateLanes: values["rotate-lanes"] ?? false,
+    legacyLogin: values["legacy-login"] ?? false,
     port,
     httpUrl: values["http-url"] ?? `http://localhost:${port}`,
     json: values.json ?? false,
@@ -131,11 +168,22 @@ export const INIT_USAGE = `usage: DATABASE_URL=<admin url> sanctum-mind init --m
 
 options:
   --mind <id>            mind to create (required; a-z A-Z 0-9 _ -, 1 to 64 chars)
-  --app-password <pw>    password for the sanctum_app login (default: generated on first setup;
+  --app-password <pw>    password for the legacy sanctum_app login, with --legacy-login or when it has one (default: generated;
                          SANCTUM_APP_PASSWORD is read when the flag is absent and is preferred,
                          because command-line arguments are visible to other users in ps)
-  --force                change the password of a sanctum_app login that already exists
-                         (the login is shared by every mind in the cluster)
+  --lane-password-<lane> <pw>
+                         password for a lane login: sanctum_verb (http, stdio), sanctum_daemon, sanctum_operator,
+                         sanctum_import (export-mind, import-mind, embed-backfill, sinks requeue); <lane> is verb,
+                         daemon, operator or import. Default: generated on first setup, shown once.
+                         SANCTUM_LANE_PASSWORD_VERB, _DAEMON, _OPERATOR and _IMPORT are read when the flag is absent
+                         and are preferred, because command-line arguments are visible to other users in ps
+  --rotate-lanes         issue new passwords for the four lane logins even though they already have one (shown once;
+                         the logins are shared by every sanctum-mind database in the cluster, so restart the services
+                         with the new URLs)
+  --legacy-login         also enable a login on the legacy shared sanctum_app role (a fresh install does not need one;
+                         a sanctum_app login that already exists is left alone either way)
+  --force                change the password of a sanctum_app or lane login that already exists and was given a
+                         different password here (the logins are shared by every mind in the cluster)
   --public-db-host <h:p> database host:port to print in the configs (the connection itself is unchanged;
                          use it when the service and your client reach the database at different addresses)
   --port <n>             HTTP port (default 8002)
@@ -191,16 +239,21 @@ async function assertAdmin(databaseUrl: string): Promise<void> {
  * credentials go in the user and password query parameters, which node-postgres reads.
  */
 export function deriveAppUrl(adminUrl: string, password: string): string {
+  return deriveRoleUrl(adminUrl, "sanctum_app", password);
+}
+
+/** The URL of any login for an admin URL (see deriveAppUrl). */
+export function deriveRoleUrl(adminUrl: string, role: string, password: string): string {
   const u = new URL(adminUrl);
   u.searchParams.delete("user");
   u.searchParams.delete("password");
   if (u.hostname === "") {
     u.username = "";
     u.password = "";
-    u.searchParams.set("user", "sanctum_app");
+    u.searchParams.set("user", role);
     u.searchParams.set("password", password);
   } else {
-    u.username = "sanctum_app";
+    u.username = role;
     u.password = encodeURIComponent(password);
   }
   return u.toString();
@@ -231,8 +284,8 @@ function withPublicHost(url: string, hostPort: string | undefined): string {
 
 const MASK_SENTINEL = "PWSENTINELx0x";
 
-function maskedAppUrl(adminUrl: string, hostPort: string | undefined): string {
-  return withPublicHost(deriveAppUrl(adminUrl, MASK_SENTINEL), hostPort).replace(MASK_SENTINEL, APP_PW_PLACEHOLDER);
+function maskedRoleUrl(adminUrl: string, role: string, hostPort: string | undefined, placeholder: string): string {
+  return withPublicHost(deriveRoleUrl(adminUrl, role, MASK_SENTINEL), hostPort).replace(MASK_SENTINEL, placeholder);
 }
 
 /** True when `password` is the one behind a pg_authid verifier (SCRAM-SHA-256 or md5). */
@@ -286,28 +339,35 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
 
   await assertAdmin(opts.databaseUrl);
 
-  // sanctum_app is one login for the whole cluster. Do not change its password behind another
+  // sanctum_app and the four lane logins are one login each for the whole cluster. Do not change a password behind another
   // deployment's back: check before anything else is touched.
   const pre = createPool(opts.databaseUrl);
-  let hadLogin = false;
-  let passwordMatches = false;
+  const had: Record<string, { hadLogin: boolean; matches: boolean }> = {};
   try {
-    const role = await pre.query<{ rolcanlogin: boolean }>("select rolcanlogin from pg_roles where rolname = 'sanctum_app'");
-    hadLogin = role.rows[0]?.rolcanlogin === true;
-    if (hadLogin && opts.appPassword !== undefined) {
-      try {
-        const v = await pre.query<{ rolpassword: string | null }>("select rolpassword from pg_authid where rolname = 'sanctum_app'");
-        passwordMatches = verifierMatches(v.rows[0]?.rolpassword, "sanctum_app", opts.appPassword);
-      } catch {
-        passwordMatches = false; // pg_authid is superuser-only; unknown counts as different
+    const wanted: { role: string; password: string | undefined; flag: string; rotating: boolean }[] = [
+      { role: "sanctum_app", password: opts.appPassword, flag: "--app-password", rotating: false },
+      ...LANES.map((lane) => ({ role: laneRole(lane), password: opts.lanePasswords?.[lane], flag: `--lane-password-${lane}`, rotating: opts.rotateLanes === true })),
+    ];
+    for (const w of wanted) {
+      const role = await pre.query<{ rolcanlogin: boolean }>("select rolcanlogin from pg_roles where rolname = $1", [w.role]);
+      const hadLogin = role.rows[0]?.rolcanlogin === true;
+      let matches = false;
+      if (hadLogin && w.password !== undefined) {
+        try {
+          const v = await pre.query<{ rolpassword: string | null }>("select rolpassword from pg_authid where rolname = $1", [w.role]);
+          matches = verifierMatches(v.rows[0]?.rolpassword, w.role, w.password);
+        } catch {
+          matches = false; // pg_authid is superuser-only; unknown counts as different
+        }
+        if (!matches && opts.force !== true && !w.rotating) {
+          throw new InitError(
+            `the ${w.role} login already exists and a different password was supplied. That login is shared by every ` +
+              "sanctum-mind database in this Postgres cluster, so changing its password would lock the others out. " +
+              "Nothing was changed. Re-run without a password to keep the current one, or add --force to change it.",
+          );
+        }
       }
-      if (!passwordMatches && opts.force !== true) {
-        throw new InitError(
-          "the sanctum_app login already exists and a different password was supplied. That login is shared by every " +
-            "sanctum-mind database in this Postgres cluster, so changing its password would lock the others out. " +
-            "Nothing was changed. Re-run without a password to keep the current one, or add --force to change it.",
-        );
-      }
+      had[w.role] = { hadLogin, matches };
     }
   } finally {
     await pre.end();
@@ -317,34 +377,63 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
 
   const pool = createPool(opts.databaseUrl);
   try {
-    // 1. app role login + password
-    let password: string | undefined = opts.appPassword;
-    let passwordStatus: PasswordStatus;
-    let generated: string | undefined;
-    let apply = true; // whether the role's password is written
-    if (password === undefined && !hadLogin) {
-      password = generated = newSecret(24);
-      passwordStatus = "generated";
-    } else if (password !== undefined && hadLogin && passwordMatches) {
-      passwordStatus = "unchanged"; // the supplied password is already the current one
-      apply = false;
-    } else if (password !== undefined) {
-      passwordStatus = "set";
-      if (hadLogin) notes.push("sanctum_app already had a login; its password was changed (--force)");
-    } else {
-      passwordStatus = "unchanged";
-      apply = false;
-    }
-    if (apply && password !== undefined) {
-      // ALTER ROLE cannot take bind parameters; quote the literal server side.
-      const stmt = await pool.query<{ sql: string }>("select format('alter role sanctum_app login password %L', $1::text) as sql", [password]);
-      await pool.query(stmt.rows[0]!.sql);
-    } else {
-      await pool.query("alter role sanctum_app login");
-      if (password === undefined) {
-        notes.push("sanctum_app already had a login; its password was left unchanged (pass --app-password to set one, with --force)");
+    // 1. logins + passwords: the legacy sanctum_app, then the four lanes
+    const provision = async (role: string, supplied: string | undefined, rotating: boolean) => {
+      const { hadLogin, matches } = had[role]!;
+      if (role === "sanctum_app" && !hadLogin && opts.legacyLogin !== true) {
+        return { password: undefined, status: "none" as PasswordStatus, generated: undefined }; // a fresh install runs on the lanes only
       }
-    }
+      if (role !== "sanctum_app") {
+        // a database that recorded 0026 without the roles (or lost one) is repaired here
+        await pool.query(
+          `do $$ begin
+             if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} nologin; end if;
+           end $$`,
+        );
+        await pool.query(`grant sanctum_app to ${role}`);
+        if (role === "sanctum_operator") {
+          // the operator lane also holds what the operator commands write (migration 0026); repair them with the role
+          await pool.query("grant select, insert, update on extractor_state to sanctum_operator");
+          await pool.query("grant select, insert, update on grants to sanctum_operator");
+        }
+      }
+      let password: string | undefined = supplied;
+      let status: PasswordStatus;
+      let generated: string | undefined;
+      let apply = true; // whether the role's password is written
+      if (password === undefined && (!hadLogin || rotating)) {
+        password = generated = newSecret(24);
+        status = "generated";
+        if (hadLogin) notes.push(`${role} already had a login; its password was rotated (shown below, once)`);
+      } else if (password !== undefined && hadLogin && matches) {
+        status = "unchanged"; // the supplied password is already the current one
+        apply = false;
+      } else if (password !== undefined) {
+        status = "set";
+        if (hadLogin) notes.push(`${role} already had a login; its password was changed (${rotating && opts.force !== true ? "--rotate-lanes" : "--force"})`);
+      } else {
+        status = "unchanged";
+        apply = false;
+      }
+      if (apply && password !== undefined) {
+        // ALTER ROLE cannot take bind parameters; quote the literal server side.
+        const stmt = await pool.query<{ sql: string }>("select format('alter role %I login password %L', $1::text, $2::text) as sql", [role, password]);
+        await pool.query(stmt.rows[0]!.sql);
+      } else {
+        await pool.query(`alter role ${role} login`); // role is one of the five fixed names above
+        if (password === undefined) {
+          const flag = role === "sanctum_app" ? "--app-password" : `--lane-password-${role.slice("sanctum_".length)}`;
+          notes.push(`${role} already had a login; its password was left unchanged (pass ${flag} to set one, with --force${role === "sanctum_app" ? "" : ", or --rotate-lanes to issue new ones"})`);
+        }
+      }
+      return { password, status, generated };
+    };
+    const app = await provision("sanctum_app", opts.appPassword, false);
+    const password = app.password;
+    const passwordStatus = app.status;
+    const generated = app.generated;
+    const laneProv = {} as Record<Actor, Awaited<ReturnType<typeof provision>>>;
+    for (const lane of LANES) laneProv[lane] = await provision(laneRole(lane), opts.lanePasswords?.[lane], opts.rotateLanes === true);
 
     // 2. the mind and its key, through the same upsert as seed-keys
     const exists = (await pool.query("select 1 from minds where mind_id = $1", [opts.mind])).rowCount === 1;
@@ -361,8 +450,20 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     }
 
     // 3. outputs
+    const appLogin = passwordStatus !== "none";
     const appUrlReal = password === undefined ? undefined : deriveAppUrl(opts.databaseUrl, password);
-    const appUrlShown = generated !== undefined ? withPublicHost(appUrlReal!, opts.publicDbHost) : maskedAppUrl(opts.databaseUrl, opts.publicDbHost);
+    const appUrlShown = !appLogin ? "" : generated !== undefined ? withPublicHost(appUrlReal!, opts.publicDbHost) : maskedRoleUrl(opts.databaseUrl, "sanctum_app", opts.publicDbHost, APP_PW_PLACEHOLDER);
+    const laneUrlReal = {} as Record<Actor, string | undefined>;
+    const lanes = {} as Record<Actor, string>;
+    const lane_roles = {} as Record<Actor, LaneRoleResult>;
+    for (const lane of LANES) {
+      const lp = laneProv[lane];
+      const role = laneRole(lane);
+      laneUrlReal[lane] = lp.password === undefined ? undefined : deriveRoleUrl(opts.databaseUrl, role, lp.password);
+      lanes[lane] =
+        lp.generated !== undefined ? withPublicHost(laneUrlReal[lane]!, opts.publicDbHost) : maskedRoleUrl(opts.databaseUrl, role, opts.publicDbHost, LANE_PW_PLACEHOLDER);
+      lane_roles[lane] = { name: role, login: true, password: lp.status as Exclude<PasswordStatus, "none">, ...(lp.generated ? { generated_password: lp.generated } : {}) };
+    }
     const bearerShown = bearer ?? BEARER_PLACEHOLDER;
     const httpBase = opts.httpUrl.replace(/\/+$/, "");
     const http = {
@@ -373,7 +474,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     const mcp: InitResult["mcp"] = opts.docker
       ? {
           http,
-          // The mind container already holds the sanctum_app DATABASE_URL. The key goes in the client's environment and
+          // The mind container already holds the sanctum_verb DATABASE_URL. The key goes in the client's environment and
           // `-e SANCTUM_BEARER` (no value) forwards it, so it never appears on the docker command line (ps, /proc).
           stdio_docker: {
             mcpServers: {
@@ -391,7 +492,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
               "sanctum-mind": {
                 _note: STDIO_NOTE,
                 ...stdioLaunch(opts.cliPath),
-                env: { DATABASE_URL: appUrlShown, SANCTUM_BEARER: bearerShown },
+                env: { DATABASE_URL: lanes.verb, SANCTUM_BEARER: bearerShown },
               },
             },
           },
@@ -404,11 +505,11 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     let env_file: InitResult["env_file"] = null;
     if (opts.writeEnv) {
       const path = `${opts.envDir ?? process.cwd()}/.env`;
-      if (appUrlReal === undefined) {
-        env_file = { path, status: "skipped", reason: "the sanctum_app password is not known on this run; pass --app-password" };
+      if (laneUrlReal.verb === undefined) {
+        env_file = { path, status: "skipped", reason: "the sanctum_verb password is not known on this run; pass --lane-password-verb" };
       } else {
         const body =
-          `DATABASE_URL=${appUrlReal}\nPORT=${opts.port}\nSANCTUM_BEARER=${bearer ?? ""}\nEMBEDDER=local\n`;
+          `DATABASE_URL=${laneUrlReal.verb}\nPORT=${opts.port}\nSANCTUM_BEARER=${bearer ?? ""}\nEMBEDDER=local\n`;
         try {
           await writeFile(path, body, { flag: "wx", mode: 0o600 });
           env_file = { path, status: "written" };
@@ -421,8 +522,10 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
 
     const result: InitResult = {
       migrations,
-      app_role: { name: "sanctum_app", login: true, password: passwordStatus, ...(generated ? { generated_password: generated } : {}) },
+      app_role: { name: "sanctum_app", login: appLogin, password: passwordStatus, ...(generated ? { generated_password: generated } : {}) },
       ...(generated ? { generated_password: generated } : {}),
+      lane_roles,
+      lanes,
       mind: { id: opts.mind, status, ...(bearer ? { bearer } : {}) },
       app_database_url: appUrlShown,
       mcp,
@@ -440,12 +543,14 @@ export function formatInit(r: InitResult): string {
   const L: string[] = [];
   L.push("sanctum-mind init");
   L.push(`  migrations   applied ${r.migrations.applied.length}, already applied ${r.migrations.skipped.length}`);
-  const pw = {
-    generated: "login enabled, password generated (shown below, once)",
-    set: "login enabled, password set (not shown)",
-    unchanged: "login enabled, password unchanged",
-  }[r.app_role.password];
-  L.push(`  sanctum_app  ${pw}`);
+  const pwText = (st: Exclude<PasswordStatus, "none">) =>
+    ({
+      generated: "login enabled, password generated (shown below, once)",
+      set: "login enabled, password set (not shown)",
+      unchanged: "login enabled, password unchanged",
+    })[st];
+  L.push(r.app_role.login ? `  sanctum_app  ${pwText(r.app_role.password as Exclude<PasswordStatus, "none">)} (legacy shared lane)` : "  sanctum_app  no login (the lanes are enough; --legacy-login adds one)");
+  for (const lane of LANES) L.push(`  ${r.lane_roles[lane].name.padEnd(16)} ${pwText(r.lane_roles[lane].password)}`);
   const ms = {
     created: "created, key shown below (once)",
     rotated: "key rotated, new key shown below (once)",
@@ -460,9 +565,25 @@ export function formatInit(r: InitResult): string {
     L.push("Generated sanctum_app password (shown once):");
     L.push(r.generated_password);
   }
+  for (const lane of LANES) {
+    const g = r.lane_roles[lane].generated_password;
+    if (g) {
+      L.push("");
+      L.push(`Generated ${r.lane_roles[lane].name} password (shown once):`);
+      L.push(g);
+    }
+  }
   L.push("");
-  L.push("Run the service with this DATABASE_URL (the unprivileged sanctum_app login):");
-  L.push(`  ${r.app_database_url}`);
+  L.push("Run each service with its own lane DATABASE_URL (unprivileged logins; the database derives who is acting from the login):");
+  L.push(`  verb      http and stdio (and the MCP configs below)   ${r.lanes.verb}`);
+  L.push(`  daemon    the daemon                                    ${r.lanes.daemon}`);
+  L.push(`  operator  extractor and grant, for an operator who does not hold the admin URL   ${r.lanes.operator}`);
+  L.push(`  import    export-mind, import-mind, embed-backfill, sinks requeue   ${r.lanes.import}`);
+  if (r.app_role.login) {
+    L.push("");
+    L.push("Legacy shared lane (works, warns; every service on it is trusted to claim any actor):");
+    L.push(`  ${r.app_database_url}`);
+  }
   if (r.mind.bearer) {
     L.push("");
     L.push("Bearer key for this mind (store it now; only its hash is kept):");

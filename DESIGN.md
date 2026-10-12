@@ -82,6 +82,13 @@ of the last event that touched it. Reads go here. Reads never go to recall.
   Injection is prevented one layer up, by parameterised queries only and strict
   schemas at the boundary. The service also refuses to run as a superuser or a
   `BYPASSRLS` role, since either would see every mind.
+- Who is acting is a property of the database login, not of a setting the client types. Each service connects as its own
+  lane role (`sanctum_verb`, `sanctum_daemon`, `sanctum_operator`, `sanctum_import`, migration 0026), every one a member of
+  `sanctum_app` so the grants and the row level security are shared, and `sanctum_actor()` (security definer, reading
+  `session_user`) answers the lane. The guards that decide who may decide a noticing, place a pin, record repair work or enable
+  the extractor read that function instead of `app.actor`; `withMind` still sets `app.actor` (for the legacy `sanctum_app`
+  login, where the function answers the setting, and for logs) and asserts on a lane that the two agree. The verb lane remains
+  one role for every mind, so `app.mind_id` and `app.bearer` stay settings: the lanes close the actor claim, not the mind claim.
 - A letter is one row, visible to both its sender and its recipient (a policy on the letters table), and
   written by the sender. Letters remain the only cross-mind channel.
 

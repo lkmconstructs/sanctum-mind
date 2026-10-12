@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import type { Pool } from "pg";
 import { runMigrations } from "../src/db/migrate.js";
 import { createPool } from "../src/db/pool.js";
+import { LANES, laneRole, type Actor } from "../src/db/lanes.js";
 
 export const TEST_KEYS = { alpha: "alpha-test-key", beta: "beta-test-key" } as const;
 
@@ -22,6 +23,33 @@ export function testAppUrl(db?: string): string {
   u.username = "sanctum_test_app";
   u.password = testAppPassword();
   return u.toString();
+}
+
+/** The password of a lane login (sanctum_verb ...): random per run, set by test/global-setup.ts. */
+export function testLanePassword(lane: Actor): string {
+  const pw = process.env[`SANCTUM_TEST_LANE_PASSWORD_${lane.toUpperCase()}`];
+  if (!pw) throw new Error(`SANCTUM_TEST_LANE_PASSWORD_${lane.toUpperCase()} is not set; it is created by test/global-setup.ts (run the suite through vitest)`);
+  return pw;
+}
+
+/** The login that stands in for a lane in the tests (a direct member of the real lane role): sanctum_test_verb ... */
+export function testLaneRole(lane: Actor): string {
+  return `sanctum_test_${lane}`;
+}
+
+/** A URL for `db` on the test cluster as a lane login (database defaults to TEST_DATABASE_URL's). */
+export function laneUrl(lane: Actor, db?: string): string {
+  const u = new URL(testDatabaseUrl());
+  if (db !== undefined) u.pathname = `/${db}`;
+  u.username = testLaneRole(lane);
+  u.password = testLanePassword(lane);
+  u.searchParams.set("application_name", `sanctum-test-${lane}`);
+  return u.toString();
+}
+
+/** A pool connected as a lane login (migration 0026): the database takes its connections to be that lane, whatever app.actor says. */
+export function lanePool(lane: Actor): Pool {
+  return createPool(laneUrl(lane));
 }
 
 /** The app-role URL is TEST_DATABASE_URL with the user swapped to the unprivileged test role. */
@@ -59,6 +87,16 @@ export async function resetDatabase(): Promise<Pool> {
   const have = await pool.query("select 1 from pg_roles where rolname = 'sanctum_test_app'");
   await pool.query(`${have.rowCount ? "alter" : "create"} role sanctum_test_app login password '${pw}'`);
   await pool.query("grant sanctum_app to sanctum_test_app");
+  // the four test lane logins: direct members of the real lane roles (created NOLOGIN by migration 0026, never touched here)
+  // and of sanctum_app, with this run's random passwords
+  for (const lane of LANES) {
+    const role = testLaneRole(lane);
+    const lpw = testLanePassword(lane).replaceAll("'", "''");
+    const exists = await pool.query("select 1 from pg_roles where rolname = $1", [role]);
+    await pool.query(`${exists.rowCount ? "alter" : "create"} role ${role} login password '${lpw}'`);
+    await pool.query(`grant ${laneRole(lane)} to ${role}`);
+    await pool.query(`grant sanctum_app to ${role}`);
+  }
   await pool.query(
     "insert into minds (mind_id, key_hash, display_name) values ('alpha', $1, 'Alpha'), ('beta', $2, 'Beta')",
     [sha256(TEST_KEYS.alpha), sha256(TEST_KEYS.beta)],
@@ -69,6 +107,11 @@ export async function resetDatabase(): Promise<Pool> {
   return pool;
 }
 
+/**
+ * A pool as sanctum_test_app, a member of sanctum_app: the LEGACY shared lane, where sanctum_actor() is whatever app.actor
+ * says. Existing tests use it so they keep their pre-0026 semantics (they set app.actor by hand to play each actor). Tests of
+ * the lanes themselves use lanePool(lane).
+ */
 export function appPool(): Pool {
   return createPool(appUrl());
 }

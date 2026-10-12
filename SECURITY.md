@@ -10,7 +10,7 @@ acknowledged on a best-effort basis; this is pre-release software.
 
 ## Threat model
 
-The `sanctum_app` `DATABASE_URL` is an all-minds credential: anyone holding it can act as any mind, so keep
+The lane `DATABASE_URL`s (`sanctum_verb` above all) and the legacy `sanctum_app` one are all-minds credentials: anyone holding the verb URL can act as any mind, so keep
 it as secret as every bearer key combined (this is why stdio hands that credential to every client and HTTP
 does not). Row level security confines each transaction to the one mind the service selected, so a verb bug
 cannot read or write another mind's rows through SQL, and the service refuses to run as a superuser or
@@ -19,17 +19,32 @@ not by RLS; changing `identity` and `vow` nodes is further restricted to the min
 database URL and runs the service) has infrastructure powers: keys, `suspend-access` and `restore-access`, grants,
 export and purge. No verb lets the operator write your identity or vows, but the operator issues your key, can import files into you, sets the cooling period and holds the database. These are trusted powers, not editorial ones. An operator with database access can of course read or alter storage, so treat that role as trusted. Purge is the one deletion path and is admin-only. An import file is the operator's input; import still refuses to plant identity or vows into a mind that has ever had any (a retired core still counts), and open declarations in a file (pending or accepted) arrive withdrawn; under `--allow-core` identity and vow nodes are imported live beside existing ones, take effect immediately and do not cool, and the import report says so. The operator may also enable, pause or stage the optional extractor (`sanctum-mind extractor ...`); that is a switch over whether proposals are made and shown, never over memory: the database lets only the mind decide a proposal, and an accepted proposal is authored by the mind. A sink URL is likewise the operator's own input, and so is `RERANK_URL`.
 
-**What the database guards do and do not cover.** The guards on identity, declarations, proposals, pins and
-repair work read three per-transaction settings (`app.mind_id`, `app.bearer`, `app.actor`) that the service
-sets from the bearer key and from which code path is running (a verb call, the daemon, the operator CLI, an
-import). They stop every path *through the service* from doing what it should not: a daemon pass cannot
-decide a proposal, a steward cannot write identity, a grantee cannot place a pin, a verb bug cannot cross
-minds. They are not a defence against a client that holds the `sanctum_app` database URL and connects
-directly: such a client can set those three settings itself and is then, to the database, the mind acting
-through a verb. That is the same statement as the first sentence of this section, made specific. Do not
-wire any lane straight to Postgres and expect the guards to hold it to its role; give it the service's HTTP
-endpoint and its own key instead. Tying the actor claim to a per-lane database role is a possible hardening
-and is on the maintainers' list; it is not in this release.
+**What the database guards do and do not cover.** The guards on declarations, noticings, pins, repair work and the
+extractor's switch read two things: three per-transaction settings (`app.mind_id`, `app.bearer`, `app.actor`) that
+the service sets from the bearer key and from which code path is running, and, for who is acting, the function
+`sanctum_actor()`. Since migration 0026 that function answers from the database login, never from a setting a
+client can type: each service connects as its own lane login (`sanctum_verb` for http and stdio, `sanctum_daemon`,
+`sanctum_operator`, `sanctum_import`), and `sanctum_actor()` reads `session_user`, so `set role` inside a session
+changes nothing. What now holds: a client with only the daemon lane's URL cannot decide a noticing, place a pin, declare a proposal or
+enable the extractor, whatever it sets (confirmed over raw `psql`, and tested); a client with the import lane's URL
+cannot act as the daemon; the verb lane cannot expire a noticing or work through repair work. `withMind` also
+asserts, on a lane login, that the actor the code path intends is the lane it connected as, and the commands
+refuse to start on the wrong lane. What does not hold: a client holding the verb lane's URL is still, to the
+database, any mind acting through a verb, because `app.mind_id` and `app.bearer` remain settings the client can set
+(inherent to one shared service role); keep that URL as secret as every bearer key combined, and give a client that
+should be one mind the service's HTTP endpoint and its own key instead. On a lane login, inserting a proposal (a declaration) also needs the verb or import lane, and inserting a noticing the daemon or import lane
+(`sanctum_lane()`), so the daemon lane cannot declare and the verb lane cannot propose a noticing; identity and vow nodes can be written
+only by the verb and import lanes, or by the daemon lane while it settles a due declaration of the mind, and then only the exact
+settlement of it (the declaration's own words, one tagged replacement, the target pointed at it; a retirement; a vow break into
+`broken` with the declared reason), never by the operator lane, and the daemon lane's only change to a declaration is to mark it
+settled with its own settlement event. A daemon that lies about the time can advance it by at most five minutes, so a retirement or a vow break still cools on the mind's own clock to within that margin.
+Columns that are not identity (a core's metadata, pins, confidence, embeddings, timestamps, counters) are not guarded on any lane.
+The lane functions use a fixed `pg_catalog, pg_temp` search path with schema-qualified names, and the lanes have no TEMP
+privilege, so a session cannot shadow the catalog with temporary tables. On the
+legacy and admin connections the update guard on proposals rests on the bearer setting alone. The legacy
+`sanctum_app` login still works so an upgraded deployment keeps running: on it `sanctum_actor()` answers the
+`app.actor` setting as it always did, so a holder of that URL can still claim any actor. Each process on it logs
+one warning at start; run `init` once after upgrading to create the lane logins and move the services to them.
 
 ## Residual risks
 
