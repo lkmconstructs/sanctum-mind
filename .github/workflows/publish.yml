@@ -17,6 +17,8 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 bundles npm 10.
+      - run: npm install -g npm@11
       - run: npm ci
         env:
           ONNXRUNTIME_NODE_INSTALL_CUDA: skip
