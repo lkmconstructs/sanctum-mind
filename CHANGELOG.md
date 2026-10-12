@@ -12,6 +12,7 @@ All notable changes to sanctum-mind are listed here, newest first. The format fo
 - `http`, `stdio`, `daemon` and the commands that write (`import-mind`, `embed-backfill`, `extractor`, `grant`, `sinks requeue`, `import-revien`) refuse to run on a database that is behind (or newer than the build):  "database is N migration(s) behind: run `sanctum-mind upgrade` with the admin URL". `export-mind` runs with a warning.
 - `mind_health` reports `version: {package, schema, pending}`, and `GET /health` reports `version` and `schema`.
 - UPGRADING.md and this file.
+- The package is publishable: metadata, the PolyForm license id, a `prepublishOnly` check, and a GitHub Actions workflow that publishes to npm with provenance when a release is published (npm trusted publishing; no token is stored). The name is claimed by the first published release.
 
 ### Fixed
 

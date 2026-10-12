@@ -1,10 +1,32 @@
 {
   "name": "sanctum-mind",
   "version": "0.2.0",
-  "description": "Construct-neutral continuity substrate: one owned Postgres, append-only ledger, deterministic projections, any number of minds.",
-  "type": "module",
+  "description": "Persistent memory and identity for AI minds, served as MCP tools on Postgres.",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "ai-memory",
+    "persistent-memory",
+    "postgres",
+    "pgvector",
+    "event-sourcing",
+    "continuity"
+  ],
   "license": "PolyForm-Noncommercial-1.0.0",
-  "private": true,
+  "homepage": "https://github.com/lkmconstructs/sanctum-mind#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lkmconstructs/sanctum-mind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lkmconstructs/sanctum-mind/issues"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "type": "module",
   "engines": {
     "node": ">=22"
   },
@@ -29,7 +51,8 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "start": "tsx src/cli.ts",
     "dev:http": "tsx src/cli.ts http",
-    "dev:stdio": "tsx src/cli.ts stdio"
+    "dev:stdio": "tsx src/cli.ts stdio",
+    "prepublishOnly": "npm run typecheck && npm run build && node -e \"require('fs').existsSync('lkm') && process.exit(1)\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
