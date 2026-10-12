@@ -5,7 +5,7 @@ name: publish
 on:
   release:
     types: [published]
-  workflow_dispatch: # runs the checks and prints the OIDC identity; publishes only on a release
+  workflow_dispatch: # publishes the current version if its release tag exists and it is not on npm yet
 permissions:
   contents: read
   id-token: write
@@ -14,10 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No registry-url here: setup-node would then write a placeholder auth token into .npmrc, and npm
+      # publishes with that token instead of the OIDC identity, which the registry refuses.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
       # Trusted publishing needs npm 11.5.1 or later; Node 22 bundles npm 10.
       - run: npm install -g npm@11
       - run: npm ci
@@ -29,8 +30,13 @@ jobs:
         run: |
           t="$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).value")"
           node -e "const c=JSON.parse(Buffer.from(process.argv[1].split('.')[1],'base64url').toString());for(const k of ['iss','aud','repository','repository_owner','repository_id','repository_visibility','workflow','workflow_ref','job_workflow_ref','environment','event_name','ref','ref_type','runner_environment','sub'])console.log(k+': '+JSON.stringify(c[k]))" "$t"
+      # On a release the tag must equal the package version. On a manual run the tag v<version> must
+      # already exist in the repository (a release was cut for it), so a manual run can only publish
+      # a version that was released.
       - if: github.event_name == 'release'
         run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.release.tag_name }}"
+      - if: github.event_name == 'workflow_dispatch'
+        run: git ls-remote --exit-code --tags origin "v$(node -p "require('./package.json').version")"
       # A version already on npm (for example the first one, published by hand to create the package
       # before a trusted publisher could be linked) is left alone instead of failing the release.
       - id: check
@@ -42,5 +48,5 @@ jobs:
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
-      - if: github.event_name == 'release' && steps.check.outputs.published == 'false'
+      - if: steps.check.outputs.published == 'false'
         run: npm publish --access public --provenance
