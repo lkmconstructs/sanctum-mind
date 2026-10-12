@@ -64,3 +64,5 @@ one warning at start; run `init` once after upgrading to create the lane logins 
 - The `local` reranker's model download from Hugging Face is not checksum-verified (mirror it with `HF_ENDPOINT`, or pre-populate `RERANK_CACHE_DIR`), the same as the embedder's.
 - Purge does not reach sinks: events already delivered to an external system stay there.
 - GitHub Actions in CI are referenced by tag and the Docker base images by tag, not by commit SHA or digest.
+
+`GET /health` is unauthenticated and exposes the package version and the name of the last applied migration only (no counts, no identifiers).

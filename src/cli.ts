@@ -26,6 +26,9 @@ import { defaultCoolingMs } from "./verbs/cooling.js";
 import { DEPRECATED_TOGGLE_ALIASES, formatMindToggle, isSuspendCommand, MINDS_ADMIN_USAGE, parseMindToggleArgs, setMindDisabled, type MindToggleCommand } from "./minds-admin.js";
 import { loadSinks } from "./sinks/config.js";
 import { sinksRequeue, sinksStatus, sinksTest } from "./sinks/cli.js";
+import { assertSchemaCurrent, schemaProblem, SchemaRefusal } from "./db/schema.js";
+import { parseUpgradeArgs, runUpgrade, UPGRADE_USAGE, UpgradeError } from "./upgrade.js";
+import { buildInfo, formatBuildInfo } from "./version.js";
 
 const USAGE = `usage: sanctum-mind <command>
 
@@ -33,6 +36,11 @@ commands:
   init --mind <id>  one-step setup: migrate, the four lane logins and sanctum_app, a mind and its key, MCP client configs
                     (needs an ADMIN DATABASE_URL; see "init" options below)
   migrate           apply database migrations (needs an ADMIN DATABASE_URL)
+  upgrade [--dry-run] [--no-backfill]
+                    bring an existing install to this version: pending migrations, lane role repair, missing repair
+                    work, and the steps that still need you (needs a superuser DATABASE_URL; exit 0 nothing left, 3 manual steps remain;
+                    see UPGRADING.md)
+  version [--json]  print the package version and build info
   seed-keys <file>  upsert minds from a "<mind_id> <key>" file (needs an ADMIN DATABASE_URL)
   http              serve HTTP and MCP Streamable HTTP (needs the sanctum_verb DATABASE_URL; PORT default 8002,
                     HOST default 127.0.0.1, MAX_CONNECTIONS default 256; plain HTTP, put TLS in front)
@@ -67,6 +75,8 @@ embed-backfill and sinks requeue as sanctum_import, extractor and grant as sanct
 init prints the four lane URLs. The legacy shared sanctum_app login still works and warns.
 
 ${INIT_USAGE}
+
+${UPGRADE_USAGE}
 
 ${GRANT_USAGE}
 
@@ -113,6 +123,22 @@ async function enforceLane(pool: ReturnType<typeof createPool>, req: LaneRequire
   }
 }
 
+/**
+ * The startup schema check (CONTRACTS.md, "Upgrade"): http, stdio and daemon refuse to run on a database that is missing migrations
+ * of this build, and say how to fix it. Runs before the other startup checks, which assume the current schema.
+ */
+async function enforceSchema(pool: ReturnType<typeof createPool>): Promise<void> {
+  try {
+    await assertSchemaCurrent(pool);
+  } catch (e) {
+    if (e instanceof SchemaRefusal) {
+      await pool.end().catch(() => undefined);
+      fail(e.message);
+    }
+    throw e;
+  }
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2];
   switch (cmd) {
@@ -126,6 +152,25 @@ async function main(): Promise<void> {
         if (e instanceof InitError) fail(e.message);
         throw e;
       }
+      process.exit(0);
+    }
+    case "upgrade": {
+      const opts = argsOrFail(() => parseUpgradeArgs(process.argv.slice(3), process.env));
+      let r;
+      try {
+        r = await runUpgrade(opts);
+      } catch (e) {
+        if (e instanceof UpgradeError) fail(e.message);
+        throw e;
+      }
+      process.exit(r.exitCode);
+    }
+    case "version":
+    case "--version":
+    case "-v": {
+      const json = process.argv.slice(3).includes("--json");
+      const b = buildInfo();
+      console.log(json ? JSON.stringify(b, null, 2) : formatBuildInfo(b));
       process.exit(0);
     }
     case "migrate": {
@@ -150,6 +195,7 @@ async function main(): Promise<void> {
     case "http": {
       defaultCoolingMs(); // fail fast on a bad IDENTITY_COOLING_HOURS
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await assertRlsEnforced(pool);
       await enforceLane(pool, { command: "http", lanes: ["verb"] });
       const port = Number(process.env.PORT ?? 8002);
@@ -175,6 +221,7 @@ async function main(): Promise<void> {
       }
       defaultCoolingMs();
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await assertRlsEnforced(pool);
       await enforceLane(pool, { command: "stdio", lanes: ["verb"] });
       await startStdio({ pool, registry, embedder: embedderFromEnv(process.env), sinks: loadSinks(process.env) }, process.env.SANCTUM_BEARER);
@@ -187,6 +234,7 @@ async function main(): Promise<void> {
       const embedder = embedderFromEnv(process.env);
       if (embedder.name === "none") fail("no embedder configured (EMBEDDER=none); nothing to backfill");
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await enforceLane(pool, { command: "embed-backfill", lanes: ["import"] });
       try {
         const c = await backfillEmbeddings(pool, embedder, batch);
@@ -203,6 +251,7 @@ async function main(): Promise<void> {
       const args = argsOrFail(() => parseDaemonArgs(process.argv.slice(3)));
       const minds = args.mind ? [args.mind] : undefined;
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await assertRlsEnforced(pool);
       await enforceLane(pool, { command: "daemon", lanes: ["daemon"] });
       const embedder = embedderFromEnv(process.env);
@@ -243,6 +292,7 @@ async function main(): Promise<void> {
       const args = argsOrFail(() => parseImportArgs(process.argv.slice(3)));
       const pool = createPool(requireDatabaseUrl());
       try {
+        await enforceSchema(pool);
         await assertRlsEnforced(pool);
         await enforceLane(pool, { command: "import-revien", lanes: ["import"] });
         const found = await pool.query<{ disabled_at: Date | null }>("select disabled_at from minds where mind_id = $1", [args.mind]);
@@ -262,6 +312,7 @@ async function main(): Promise<void> {
     case "grant": {
       const args = parseGrantArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await enforceLane(pool, { command: "grant", lanes: ["operator"], allowAdmin: true });
       try {
         console.log(await runGrantCommand(pool, args));
@@ -273,6 +324,7 @@ async function main(): Promise<void> {
     case "extractor": {
       const args = parseExtractorArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await enforceLane(pool, { command: "extractor", lanes: ["operator"], allowAdmin: true });
       try {
         console.log(await runExtractorCommand(pool, args));
@@ -286,6 +338,9 @@ async function main(): Promise<void> {
       const pool = createPool(requireDatabaseUrl());
       await assertRlsEnforced(pool);
       await enforceLane(pool, { command: "export-mind", lanes: ["import"] });
+      // a read-only snapshot may run on a database that is out of step with this build, but the file may lack what the build expects
+      const mismatch = await schemaProblem(pool).catch(() => null);
+      if (mismatch !== null) console.error(`sanctum-mind: warning: ${mismatch.message} (export-mind reads the schema as it is; the export may be incomplete)`);
       try {
         const r = await exportMind(pool, args.mind, args.out);
         console.log(`exported ${r.mind_id} to ${r.file}: ${Object.entries(r.counts).map(([k, v]) => `${k} ${v}`).join(", ")}`);
@@ -297,6 +352,7 @@ async function main(): Promise<void> {
     case "import-mind": {
       const args = parseImportMindArgs(process.argv.slice(3));
       const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
       await assertRlsEnforced(pool);
       await enforceLane(pool, { command: "import-mind", lanes: ["import"] });
       try {
@@ -367,6 +423,7 @@ async function main(): Promise<void> {
         }
         if (sinkName === undefined || sinkName === "") fail("usage: sanctum-mind sinks requeue --sink <name>");
         const pool = createPool(requireDatabaseUrl());
+        await enforceSchema(pool);
         await enforceLane(pool, { command: "sinks requeue", lanes: ["import"] });
         try {
           const r = await sinksRequeue(pool, sinkName);

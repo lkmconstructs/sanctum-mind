@@ -14,11 +14,12 @@ import { deriveAppUrl, deriveRoleUrl, formatInit, InitError, parseInitArgs, runI
 import { testDatabaseUrl } from "./helpers.js";
 
 /**
- * sanctum_app and the four lane logins are cluster-wide: remember each one's login and password at the start and put them
- * back at the end (the harness gave the lanes random passwords other test files rely on).
+ * sanctum_app and the four real lane roles are cluster-wide. Remember whether each could log in and put that back at the end.
+ * The passwords cannot be read back as the plaintext they were set from, so they are not restored: they are cleared (the test
+ * logins other files use are the test-prefixed roles with their own passwords; the real roles never carry one from the harness).
  */
 const ROLES = ["sanctum_app", "sanctum_verb", "sanctum_daemon", "sanctum_operator", "sanctum_import"] as const;
-const savedRoles = new Map<string, { rolpassword: string | null; rolcanlogin: boolean }>();
+const savedRoles = new Map<string, { rolcanlogin: boolean }>();
 const dirs: string[] = [];
 const pools: pg.Pool[] = [];
 
@@ -52,7 +53,7 @@ beforeAll(async () => {
   const admin = createPool(testDatabaseUrl());
   try {
     for (const role of ROLES) {
-      const r = await admin.query("select rolpassword, rolcanlogin from pg_authid where rolname = $1", [role]);
+      const r = await admin.query("select rolcanlogin from pg_roles where rolname = $1", [role]);
       if (r.rows[0]) savedRoles.set(role, r.rows[0]);
     }
   } finally {
@@ -78,16 +79,7 @@ afterAll(async () => {
       const has = await admin.query("select 1 from pg_roles where rolname = $1", [role]);
       if (!has.rowCount) continue;
       const saved = savedRoles.get(role);
-      if (saved === undefined) {
-        await admin.query(`alter role ${role} nologin password null`);
-      } else {
-        const stmt = await admin.query(
-          `select format('alter role %I %s password %s', $3::text, case when $1::boolean then 'login' else 'nologin' end,
-                         coalesce(quote_literal($2::text), 'null')) as sql`,
-          [saved.rolcanlogin, saved.rolpassword, role],
-        );
-        await admin.query(stmt.rows[0].sql);
-      }
+      await admin.query(`alter role ${role} ${saved?.rolcanlogin === true ? "login" : "nologin"} password null`);
     }
   } finally {
     await admin.end();

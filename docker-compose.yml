@@ -30,10 +30,12 @@
 # (OPERATOR_PASSWORD, and APP_PASSWORD when upgrading) (environment or a .env file next to this one) before exposing anything.
 # Use URL-safe characters in them, since they are placed inside connection URLs.
 #
-# UPGRADING a deployment that ran on sanctum_app (migration 0026): run `docker compose run --rm init` BEFORE
-# `docker compose up -d`. mind, daemon and tools now log in as lanes, and the lane logins exist only after init has run.
-# `docker compose up` alone, before init, leaves mind and daemon restarting with "password authentication failed"
-# (the message then says to run init); once init has run they recover. A fresh install gets no sanctum_app login at all.
+# UPDATING a running install (full steps: UPGRADING.md): git pull, docker compose build, then
+#   docker compose run --rm init node dist/cli.js upgrade      # migrations, lane roles, repair backfill; --dry-run changes nothing
+#   docker compose up -d
+# in that order: mind and daemon refuse to start on a database that is behind. Coming from before 0.2.0 (the lanes, migration 0026),
+# also run `docker compose run --rm init` once before `up -d`, because the lane logins exist only after init has run; until then
+# mind and daemon restart with "password authentication failed" (the message says to run init). A fresh install gets no sanctum_app login.
 
 services:
   db:
@@ -52,6 +54,8 @@ services:
       retries: 12
 
   # One-shot admin setup. Not started by `docker compose up` (profile "init"); run it explicitly.
+  # The default command is `init`. Name another admin command to run it instead, for example the updater:
+  #   docker compose run --rm init node dist/cli.js upgrade        (also: version, extractor ..., grant ..., suspend-access ...)
   init:
     build: .
     image: sanctum-mind:local

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 
 const LOCK_KEY = "7264938110245";
-const DEFAULT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../migrations");
+export const DEFAULT_MIGRATIONS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../migrations");
 
 /**
  * Checksums that databases recorded for a migration file when its comment-only header was briefly different.
@@ -29,7 +29,7 @@ export const SUPERSEDED_CHECKSUMS: Record<string, string[]> = {
 
 export async function runMigrations(
   databaseUrl: string,
-  dir: string = DEFAULT_DIR,
+  dir: string = DEFAULT_MIGRATIONS_DIR,
 ): Promise<{ applied: string[]; skipped: string[] }> {
   const client = new pg.Client({ connectionString: databaseUrl });
   await client.connect();
@@ -90,6 +90,18 @@ export async function runMigrations(
         throw new Error(`Migration ${file} failed: ${(err as Error).message}`, { cause: err });
       }
       applied.push(file);
+    }
+    // The services run on unprivileged logins. They read schema_migrations to learn which migrations are applied (the startup check,
+    // GET /health, mind_health), so that one table is readable by sanctum_app and by the lanes through it. Runs every time, so a
+    // database that was migrated before this grant existed gets it on its next migrate, init or upgrade.
+    try {
+      await client.query(
+        `do $$ begin
+           if exists (select 1 from pg_roles where rolname = 'sanctum_app') then grant select on schema_migrations to sanctum_app; end if;
+         end $$`,
+      );
+    } catch (err) {
+      console.error(`migrate: could not make schema_migrations readable to sanctum_app: ${(err as Error).message}`);
     }
     return { applied, skipped };
   } finally {

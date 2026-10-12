@@ -325,6 +325,57 @@ export function stdioLaunch(cliPath?: string): { command: string; args: string[]
   return { command: "node", args: [file, "stdio"] };
 }
 
+export type LaneRepair = "created" | "membership" | "grants";
+
+/** What is wrong with one lane role, read-only: missing ("created"), not a member of sanctum_app ("membership"), the operator missing its writes ("grants"). */
+export async function laneRoleProblems(pool: Pick<pg.Pool, "query">, role: string): Promise<LaneRepair[]> {
+  if (!LANES.some((l) => laneRole(l) === role)) throw new Error(`not a lane role: ${role}`);
+  if ((await pool.query("select 1 from pg_roles where rolname = $1", [role])).rowCount !== 1) return ["created"];
+  // asked only of a role that exists (has_table_privilege raises for an unknown one)
+  const r = await pool.query<{ member: boolean; extractor: boolean; grants: boolean }>(
+    `select exists (select 1 from pg_auth_members m join pg_roles r on r.oid = m.roleid join pg_roles u on u.oid = m.member
+                     where r.rolname = 'sanctum_app' and u.rolname = $1) as member,
+            has_table_privilege($1, 'extractor_state', 'INSERT') and has_table_privilege($1, 'extractor_state', 'UPDATE') as extractor,
+            has_table_privilege($1, 'grants', 'INSERT') and has_table_privilege($1, 'grants', 'UPDATE') as grants`,
+    [role],
+  );
+  const f = r.rows[0]!;
+  const out: LaneRepair[] = [];
+  if (!f.member) out.push("membership");
+  if (role === "sanctum_operator" && !(f.extractor && f.grants)) out.push("grants");
+  return out;
+}
+
+/**
+ * Makes one lane role exist and hold what its lane needs, without touching a password or a login: creates it NOLOGIN when missing
+ * (a database that recorded 0026 without the roles, or lost one), puts it in sanctum_app, and gives sanctum_operator what the operator
+ * commands write (migration 0026). Idempotent. Returns what had to change (see laneRoleProblems). `role` is one of the four lane roles.
+ */
+export async function repairLaneRole(pool: Pick<pg.Pool, "query">, role: string): Promise<LaneRepair[]> {
+  const changed = await laneRoleProblems(pool, role);
+  if (changed.includes("created")) await pool.query(`create role ${role} nologin`);
+  await pool.query(`grant sanctum_app to ${role}`);
+  if (role === "sanctum_operator") {
+    // the operator lane also holds what the operator commands write (migration 0026); repair them with the role
+    await pool.query("grant select, insert, update on extractor_state to sanctum_operator");
+    await pool.query("grant select, insert, update on grants to sanctum_operator");
+  }
+  return changed;
+}
+
+/** repairLaneRole for all four lanes. `created` names the roles that did not exist; `repaired` the ones whose membership or grants were restored. */
+export async function repairLaneRoles(pool: Pick<pg.Pool, "query">): Promise<{ created: string[]; repaired: string[] }> {
+  const created: string[] = [];
+  const repaired: string[] = [];
+  for (const lane of LANES) {
+    const role = laneRole(lane);
+    const changed = await repairLaneRole(pool, role);
+    if (changed.includes("created")) created.push(role);
+    else if (changed.length > 0) repaired.push(`${role} (${changed.join(", ")})`);
+  }
+  return { created, repaired };
+}
+
 export async function runInit(opts: InitOptions): Promise<InitResult> {
   if (!opts.databaseUrl) {
     throw new InitError("DATABASE_URL is not set; init needs an admin connection string");
@@ -383,20 +434,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
       if (role === "sanctum_app" && !hadLogin && opts.legacyLogin !== true) {
         return { password: undefined, status: "none" as PasswordStatus, generated: undefined }; // a fresh install runs on the lanes only
       }
-      if (role !== "sanctum_app") {
-        // a database that recorded 0026 without the roles (or lost one) is repaired here
-        await pool.query(
-          `do $$ begin
-             if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} nologin; end if;
-           end $$`,
-        );
-        await pool.query(`grant sanctum_app to ${role}`);
-        if (role === "sanctum_operator") {
-          // the operator lane also holds what the operator commands write (migration 0026); repair them with the role
-          await pool.query("grant select, insert, update on extractor_state to sanctum_operator");
-          await pool.query("grant select, insert, update on grants to sanctum_operator");
-        }
-      }
+      if (role !== "sanctum_app") await repairLaneRole(pool, role);
       let password: string | undefined = supplied;
       let status: PasswordStatus;
       let generated: string | undefined;

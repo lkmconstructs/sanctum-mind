@@ -63,7 +63,7 @@ Each service connects as its own database login (a "lane"), and the database wor
 
 If the output shows `<lane-password>` or `<app-password>` where a password should be, substitute the value of the matching variable (`VERB_PASSWORD` default `sanctum_verb_local`, `APP_PASSWORD` default `sanctum_app_local`, and so on).
 
-**Upgrading a deployment from before the lanes (migration 0026).** Order matters under Docker. After pulling the new version: first `docker compose run --rm init` (it applies 0026 and creates the lane logins, with the passwords above), and only then `docker compose up -d`, which recreates `mind`, `daemon` and the rest with their lane addresses. Running `docker compose up` before `init` leaves `mind` and `daemon` restarting, because their lane logins do not exist yet: they fail with `password authentication failed for user "sanctum_verb"` (the message now says to run `docker compose run --rm init`); run `init`, and they recover on their own restart. Outside Docker: run `init` once with the admin address, then change `DATABASE_URL` for `http`, `stdio`, `daemon` and the tools to the lane addresses. Until you do, an existing `sanctum_app` login keeps everything running on the legacy lane with a warning, exactly as before. `init` leaves an existing `sanctum_app` login alone. 0026 revokes temporary-table rights from PUBLIC on the database; other roles sharing this database that need temp tables must be granted TEMP directly.
+Updating an install that is already running (including one from before the lanes, migration 0026): see [Updating](#updating) below and [UPGRADING.md](UPGRADING.md).
 
 ### 2. Connect it to an app
 
@@ -106,6 +106,19 @@ An `{"ok":true,...}` answer with identity, vows, state and health sections means
 
 Then open a conversation with your mind and ask it to call `mind_orient`. After that, a good first step is to have it write down who it is. Ask it to call `mind_identity` with `affirm` to add a first core. That takes effect immediately. Then ask it to `mind_observe` the moment (it needs a charge tag), and in a new session ask it to `mind_orient` and `mind_search` for what it wrote. If it finds it, memory is working.
 
+## Updating
+
+The project is not on npm yet, so `git pull` is the fetch step, and the tagged releases on GitHub are the versions to move between. Read the release's entry in [CHANGELOG.md](CHANGELOG.md), back up the database, then, under Docker:
+
+```bash
+git pull
+docker compose build
+docker compose run --rm init node dist/cli.js upgrade   # migrations, lane roles, and what still needs you; --dry-run changes nothing
+docker compose up -d
+```
+
+`upgrade` needs a superuser address. It exits 0 when nothing detectable is left and 3 while steps that need you remain (it prints them again on every run until they are done; a finished install says "nothing to do"). From a clone: `git pull && npm ci && npm run build`, then `DATABASE_URL=<admin> npm start -- upgrade` and `DATABASE_URL=<admin> npm start -- init --mind alpha` (the lane logins), then restart the services. Coming from 0.1.0 under Docker, also run `docker compose run --rm init` once between `upgrade` and `up -d`: 0.2.0's services log in as lanes, and `init` creates those logins. `http`, `stdio`, `daemon` and the commands that write refuse to run on a database that is behind or newer than the build, and say what to do. `sanctum-mind version`, `mind_health` and `GET /health` say which version you are on. [UPGRADING.md](UPGRADING.md) has the details, the exit codes and the per-release manual steps.
+
 ## Day to day
 
 Your mind picks these up on its own. These are the ones it will reach for most, by what they do.
@@ -127,7 +140,7 @@ Your mind picks these up on its own. These are the ones it will reach for most, 
 - **See a read of recent texture**: `mind_weather`. No AI call. It summarises recent charge, vividness and grip, and says how much you are carrying (`attention_load`: how many things, how many pinned, the heaviest weight).
 - **See what you're carrying, pin what matters**: `mind_attend` (list, pin, release). The list is your open loops, active threads, open tasks, live desires, identity changes still cooling, proposals and repairs waiting, and charges you are sitting with, each with a weight from 0 to 1 worked out by plain arithmetic (how recent, how charged, what kind of thing, whether you pinned it). Pin something to keep it in view; pinning changes nothing about it, and only you can pin or release. Anything you pinned is always in the set, however crowded it is, and the list also shows every pin you hold (`pins`, each with a `pin_id`) and marks the ones that hold nothing any more (`stale`: the thing was resolved, archived or rewritten, or is no longer something you are carrying); release those with `release` and their `pin_id`. A rewrite with many dependants cannot take over the list: repairs show as at most three items, and `attention_load.repairs_not_shown` counts the rest (`repairs_pending` is the total). `mind_orient` shows the top seven (and `stale_pins`, how many pins hold nothing); the extractor looks first at what you have pinned or are attending to.
 - **Decide what the extractor noticed**: `mind_notice` (list, accept, reject). Only shown when the operator has enabled the extractor at stage propose. Accepting makes the memory, as you; rejecting or letting it lapse removes only the proposal. When something you relied on is rewritten or retired, the mind is asked whether what depended on it still holds; you answer keep, rethink or retire (`mind_notice accept` with `decision`). These repair questions are shown whenever one is waiting, whether or not the extractor is on, and `mind_orient` counts them under `repairs`.
-- **Check the service**: `mind_health` reports database status, row counts, the last daemon run, and the extractor's state (whether it is enabled, its stage, whether it is paused, how many proposals wait, the model version, and how the last extractor run went).
+- **Check the service**: `mind_health` reports database status, the package version and schema, row counts, the last daemon run, and the extractor's state (whether it is enabled, its stage, whether it is paused, how many proposals wait, the model version, and how the last extractor run went).
 
 For the full list, the exact fields and the error shapes, see [CONTRACTS.md](CONTRACTS.md).
 
@@ -212,14 +225,14 @@ Inside the clone, without a build, the stdio config can use the source instead:
 
 Migrations are applied once each and their checksums recorded; an applied migration file is never edited.
 
-Upgrade note for belief repair: from migration 0025 on, every rewrite or retirement records a row of repair work when it happens. Rewrites and retirements made before that have none, and neither do nodes brought in by an import, so the daemon will not ask about what depended on them. Run `extractor repair-backfill` once after upgrading to 0025: rewrites made between the last pre-0025 run and the upgrade are otherwise never looked at, and so are older ones (admin URL; `--since` limits it to nodes changed on or after a date, `--dry-run` only counts):
+Belief repair keeps a row of repair work for every rewrite or retirement made from migration 0025 on. Rewrites and retirements made before that have none, and neither do nodes brought in by an import, so the daemon will not ask about what depended on them. `sanctum-mind upgrade` checks every mind for missing repair work and adds it, on every run (see [UPGRADING.md](UPGRADING.md)); `extractor repair-backfill` is the same thing by hand, for one mind (admin URL; `--since` limits it to nodes changed on or after a date, `--dry-run` only counts):
 
 ```sh
 npm start -- extractor repair-backfill --mind alpha --since 2026-01-01 --dry-run
 npm start -- extractor repair-backfill --mind alpha --since 2026-01-01
 ```
 
-It adds work for each rewritten or retired node that has none yet, oldest first, and prints how many. Nothing is proposed by the command itself: the daemon works through the new rows at `EXTRACTOR_REPAIR_BUDGET` questions per tick. Running it again adds nothing. Upgrading a database that predates the one-open-declaration-per-core index needs any core with two open declarations to have one withdrawn first, or that migration stops and says so.
+It adds work for each rewritten or retired node that has none yet, oldest first, and prints how many. Nothing is proposed by the command itself: the daemon works through the new rows at `EXTRACTOR_REPAIR_BUDGET` questions per tick. Running it again adds nothing.
 
 ### Keys for several minds (admin path)
 
@@ -258,7 +271,7 @@ Both are admin commands (`minds.disabled_at`); `restore-access` reverses `suspen
 
 ### Running the service
 
-`init`, `migrate` and `seed-keys` need an admin `DATABASE_URL`. `http` and `stdio` need the `sanctum_verb` one, `daemon` the `sanctum_daemon` one; both refuse to start on another lane's address, and the legacy `sanctum_app` address works with one warning.
+`init`, `migrate`, `upgrade` and `seed-keys` need an admin `DATABASE_URL`. `http` and `stdio` need the `sanctum_verb` one, `daemon` the `sanctum_daemon` one; both refuse to start on another lane's address, and the legacy `sanctum_app` address works with one warning.
 
 ```bash
 # HTTP + MCP Streamable HTTP on $HOST:$PORT (default 127.0.0.1:8002)
@@ -275,7 +288,7 @@ HTTP surface:
 
 | Route | Auth | Returns |
 | --- | --- | --- |
-| `GET /health` | none | verb count and database reachability |
+| `GET /health` | none | verb count, database reachability, package version and last applied migration (`schema`) |
 | `GET /verbs` | bearer | verb names |
 | `POST /verbs/<name>` | bearer | the verb's `Result`; status 200 or the error code's status |
 | `POST /mcp` | bearer | MCP Streamable HTTP, stateless |
@@ -438,7 +451,7 @@ Without an embedder, retrieval degrades to full text search: search still works 
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `DATABASE_URL` | none | Admin URL for `init`, `migrate`, `seed-keys`, grants, suspend/restore, purge. The lane URL for the rest: `sanctum_verb` for `http` and `stdio`, `sanctum_daemon` for `daemon`, `sanctum_import` for `export-mind`, `import-mind`, `embed-backfill` and `sinks requeue`, `sanctum_operator` for `extractor` and `grant` without the admin URL. The legacy `sanctum_app` URL works and warns. |
+| `DATABASE_URL` | none | Admin URL for `init`, `migrate`, `upgrade`, `seed-keys`, grants, suspend/restore, purge. The lane URL for the rest: `sanctum_verb` for `http` and `stdio`, `sanctum_daemon` for `daemon`, `sanctum_import` for `export-mind`, `import-mind`, `embed-backfill` and `sinks requeue`, `sanctum_operator` for `extractor` and `grant` without the admin URL. The legacy `sanctum_app` URL works and warns. |
 | `PORT` | 8002 | HTTP listen port |
 | `HOST` | 127.0.0.1 | HTTP listen address (Docker sets 0.0.0.0 inside the container) |
 | `MAX_CONNECTIONS` | 256 | HTTP connection cap |

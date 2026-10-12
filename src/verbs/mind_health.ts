@@ -6,6 +6,8 @@ import { ok } from "../result.js";
 import { defineVerb } from "./types.js";
 import { mindIdSchema } from "./common.js";
 import { pendingRepairs } from "./mind_notice.js";
+import { schemaStatus } from "../db/schema.js";
+import { packageInfo } from "../version.js";
 
 export const mind_health = defineVerb({
   name: "mind_health",
@@ -72,6 +74,21 @@ export const mind_health = defineVerb({
       repairs_pending: await pendingRepairs(ctx),
       last_run: lr.rows[0] ? { pass: "notice.extract", started_at: lr.rows[0].started_at, ok: lr.rows[0].ok, skipped: lr.rows[0].skipped } : null,
     };
-    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, counts, last_daemon_run, outbox, extractor } });
+    // which build is running and how far the schema has come: pending > 0 means the database is behind this build.
+    // A login that cannot read schema_migrations (never migrated by this version) answers null, null; the savepoint keeps that
+    // failed read from aborting the verb's transaction.
+    let schema: string | null = null;
+    let pending: number | null = null;
+    await ctx.tx.query("savepoint health_schema");
+    try {
+      const s = await schemaStatus(ctx.tx);
+      schema = s.latest;
+      pending = s.pending.length;
+      await ctx.tx.query("release savepoint health_schema");
+    } catch {
+      await ctx.tx.query("rollback to savepoint health_schema");
+    }
+    const version = { package: packageInfo().version, schema, pending };
+    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, version, counts, last_daemon_run, outbox, extractor } });
   },
 });

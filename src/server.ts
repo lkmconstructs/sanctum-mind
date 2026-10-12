@@ -9,6 +9,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { resolveCaller } from "./auth.js";
+import { schemaStatus } from "./db/schema.js";
+import { packageInfo } from "./version.js";
 import { err, HTTP_STATUS, ok, type Result } from "./result.js";
 import { runVerb } from "./verbs/run.js";
 import type { Caller, RunDeps } from "./verbs/types.js";
@@ -173,6 +175,14 @@ async function dbIsUp(deps: RunDeps): Promise<boolean> {
   }
 }
 
+async function schemaLatest(deps: RunDeps): Promise<string | null> {
+  try {
+    return (await schemaStatus(deps.pool)).latest;
+  } catch {
+    return null;
+  }
+}
+
 /** Default listen address for the HTTP service: loopback only. Set HOST=0.0.0.0 to listen on every interface. */
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_MAX_CONNECTIONS = 256;
@@ -195,7 +205,9 @@ export function createHttpServer(deps: RunDeps): http.Server {
     if (path === "/health") {
       if (method !== "GET") return sendJson(res, 405, err("invalid_input", "method not allowed"), { allow: "GET" });
       const db = (await dbIsUp(deps)) ? "up" : "down";
-      return sendJson(res, db === "up" ? 200 : 503, ok({ projection: { verbs: deps.registry.length, db } }));
+      // the package version, and the last migration the database has recorded (null when it cannot be read)
+      const schema = db === "up" ? await schemaLatest(deps) : null;
+      return sendJson(res, db === "up" ? 200 : 503, ok({ projection: { verbs: deps.registry.length, db, version: packageInfo().version, schema } }));
     }
 
     const isVerbs = path === "/verbs";
