@@ -4,7 +4,7 @@ One command brings an existing install to the version you have checked out: `san
 
 ## Where new versions come from
 
-The project is not on npm yet, so `git pull` is the fetch step. Tagged releases on GitHub (`v0.1.0`, `v0.2.0`, ...) are the versions to move between: `git fetch --tags` then `git checkout v0.2.0` pins one, and `git pull` on the main branch follows the latest. Read the release's entry in [CHANGELOG.md](CHANGELOG.md) first; each one has an "Upgrading" part with anything you must do by hand.
+Each release is tagged on GitHub (`v0.1.0`, `v0.2.0`, ...) and published to npm as [`sanctum-mind`](https://www.npmjs.com/package/sanctum-mind) from that tag. Under Docker and from a clone `git pull` is the fetch step: `git fetch --tags` then `git checkout v0.2.0` pins one, and `git pull` on the main branch follows the latest. An npm install fetches with `npm update -g sanctum-mind` (`npm install -g sanctum-mind@0.2.0` pins one). Read the release's entry in [CHANGELOG.md](CHANGELOG.md) first; each one has an "Upgrading" part with anything you must do by hand.
 
 Back up before you start. A migration is never undone by a later version, and there is no downgrade: to go back, restore the backup and check out the older version. Under Docker: `docker compose exec -T db pg_dump -U postgres sanctum_mind > backup.sql` (`-T` keeps the dump free of terminal characters).
 
@@ -22,6 +22,16 @@ The order matters: build the new image, migrate the database with it, and only t
 `init` is still the service's default command (`docker compose run --rm init` sets up or repairs a mind and prints its keys); `upgrade` is the command you name after it.
 
 Coming from 0.1.0 under Docker you also need the lane logins that 0.2.0 introduced. After `upgrade`, run `docker compose run --rm init` once (it creates them with the passwords in `docker-compose.yml`), and then `docker compose up -d`. Until the logins exist, `upgrade` exits 3 and says so.
+
+## An npm install (no Docker)
+
+```bash
+npm update -g sanctum-mind
+DATABASE_URL=<admin url> sanctum-mind upgrade
+DATABASE_URL=<admin url> sanctum-mind init --mind alpha
+```
+
+Then restart the services with the lane addresses `init` printed, as below.
 
 ## A clone (no Docker)
 

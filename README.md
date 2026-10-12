@@ -108,7 +108,7 @@ Then open a conversation with your mind and ask it to call `mind_orient`. After 
 
 ## Updating
 
-The project is not on npm yet, so `git pull` is the fetch step, and the tagged releases on GitHub are the versions to move between. Read the release's entry in [CHANGELOG.md](CHANGELOG.md), back up the database, then, under Docker:
+Releases are tagged on GitHub and published to npm as [`sanctum-mind`](https://www.npmjs.com/package/sanctum-mind). The Docker image builds from the repository, so under Docker `git pull` is the fetch step; an npm install fetches with `npm update -g sanctum-mind`. Read the release's entry in [CHANGELOG.md](CHANGELOG.md), back up the database, then, under Docker:
 
 ```bash
 git pull
@@ -117,7 +117,7 @@ docker compose run --rm init node dist/cli.js upgrade   # migrations, lane roles
 docker compose up -d
 ```
 
-`upgrade` needs a superuser address. It exits 0 when nothing detectable is left and 3 while steps that need you remain (it prints them again on every run until they are done; a finished install says "nothing to do"). From a clone: `git pull && npm ci && npm run build`, then `DATABASE_URL=<admin> npm start -- upgrade` and `DATABASE_URL=<admin> npm start -- init --mind alpha` (the lane logins), then restart the services. Coming from 0.1.0 under Docker, also run `docker compose run --rm init` once between `upgrade` and `up -d`: 0.2.0's services log in as lanes, and `init` creates those logins. `http`, `stdio`, `daemon` and the commands that write refuse to run on a database that is behind or newer than the build, and say what to do. `sanctum-mind version`, `mind_health` and `GET /health` say which version you are on. [UPGRADING.md](UPGRADING.md) has the details, the exit codes and the per-release manual steps.
+`upgrade` needs a superuser address. It exits 0 when nothing detectable is left and 3 while steps that need you remain (it prints them again on every run until they are done; a finished install says "nothing to do"). From an npm install: `npm update -g sanctum-mind`, then `DATABASE_URL=<admin> sanctum-mind upgrade` and `DATABASE_URL=<admin> sanctum-mind init --mind alpha` (the lane logins), then restart the services. From a clone: `git pull && npm ci && npm run build`, then the same two commands as `npm start -- upgrade` and `npm start -- init --mind alpha`. Coming from 0.1.0 under Docker, also run `docker compose run --rm init` once between `upgrade` and `up -d`: 0.2.0's services log in as lanes, and `init` creates those logins. `http`, `stdio`, `daemon` and the commands that write refuse to run on a database that is behind or newer than the build, and say what to do. `sanctum-mind version`, `mind_health` and `GET /health` say which version you are on. [UPGRADING.md](UPGRADING.md) has the details, the exit codes and the per-release manual steps.
 
 ## Day to day
 
@@ -195,6 +195,18 @@ Read [DESIGN.md](DESIGN.md) for the why and [CONTRACTS.md](CONTRACTS.md) for the
 
 ### Without Docker
 
+From npm, with Node.js 22+ and a Postgres with pgvector:
+
+```bash
+ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install -g sanctum-mind   # skip onnxruntime's optional CUDA download (see Embeddings)
+createdb -U postgres sanctum_mind       # or: psql -U postgres -c 'create database sanctum_mind'
+SANCTUM_LANE_PASSWORD_VERB='choose-a-verb-password' \
+DATABASE_URL='postgresql://postgres@localhost:5432/sanctum_mind' sanctum-mind init --mind alpha
+DATABASE_URL='postgresql://sanctum_verb:choose-a-verb-password@localhost:5432/sanctum_mind' EMBEDDER=none sanctum-mind http
+```
+
+From a clone, the same steps run from the source:
+
 ```bash
 ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci   # skip onnxruntime's optional CUDA download (see Embeddings)
 createdb -U postgres sanctum_mind       # or: psql -U postgres -c 'create database sanctum_mind'
@@ -217,7 +229,7 @@ Inside the clone, without a build, the stdio config can use the source instead:
 {"mcpServers":{"sanctum-mind":{"command":"npx","args":["tsx","/absolute/path/to/sanctum-mind/src/cli.ts","stdio"],"env":{"DATABASE_URL":"<sanctum_verb URL>","SANCTUM_BEARER":"<key>"}}}}
 ```
 
-`init` prints the first form with the real path of the checkout it runs from (the second when run through `tsx`). The package is not published to npm yet, so there is no `npx sanctum-mind`.
+`init` prints the first form with the real path of the checkout it runs from (the second when run through `tsx`). From an npm install it prints the installed path. `npx sanctum-mind stdio` works as the command as well, with the same `env`, but it resolves the package on each start; a global install (`npm install -g sanctum-mind`) with the printed path is the faster form.
 
 ### Database and roles
 

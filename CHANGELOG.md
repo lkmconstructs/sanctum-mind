@@ -2,6 +2,16 @@
 
 All notable changes to sanctum-mind are listed here, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Moving between versions is described in [UPGRADING.md](UPGRADING.md).
 
+## [0.2.1] - 2026-10-12
+
+### Changed
+
+- The package is on npm as `sanctum-mind`, published from the tagged GitHub release with provenance. The README and UPGRADING.md describe the npm install and update path (`npm install -g sanctum-mind`, `npm update -g sanctum-mind`) beside Docker and the clone. No code change.
+
+### Upgrading
+
+From 0.2.0: nothing to do by hand. No migration.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added
