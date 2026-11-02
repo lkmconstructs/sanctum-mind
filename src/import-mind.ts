@@ -10,6 +10,7 @@ import { ArgError } from "./cli-args.js";
 import { withMind } from "./db/pool.js";
 import { EXPORT_FORMAT } from "./export.js";
 import { noticeExpiredPayload } from "./extractor/events.js";
+import { dreamFadedPayload } from "./dream/events.js";
 
 /**
  * Import reads the whole export into memory (JSON.parse) and refuses files over this size with a
@@ -102,6 +103,7 @@ interface Doc {
 const PROJECTION_ORDER = [
   "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
   "noticings", "extractor_state", "extractor_models", "extractor_runs", "attention_pins",
+  "dreams", "dream_state", "dream_preferences",
 ] as const;
 const PROJECTION_TABLE: Record<string, string> = Object.fromEntries(PROJECTION_ORDER.map((k) => [k, k]));
 
@@ -579,6 +581,33 @@ export async function importMind(
           }
         }
         if (key === "extractor_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
+        if (key === "dreams") {
+          // A laid dream from another life is not shown again: it arrives faded, with a dream.faded event written as the mind
+          // (reason "imported"). Decided ones (anchored, released) keep their status if they carry their decision event; faded keep it.
+          const fades: Row[] = [];
+          let laidCount = 0;
+          rows = rows.map((r) => {
+            const st = String(r.status);
+            if (st === "faded" || ((st === "anchored" || st === "released") && typeof r.decided_event_id === "string")) return { ...r, status: st };
+            if (typeof r.id !== "string") throw new ImportError("export file: a dream has no id");
+            const did = lc(r.id);
+            const evId = importExpiryEventId(`dream:${did}`);
+            fades.push({
+              id: evId, mind_id: target, kind: "dream.faded", subject_id: did,
+              payload: dreamFadedPayload.parse({ dream_id: did, reason: "imported" }),
+              written_by: target, recorded_at: importedAt, created_at: importedAt,
+            });
+            laidCount++;
+            return { ...r, status: "faded", decided_event_id: evId, decided_at: importedAt };
+          });
+          if (fades.length > 0) {
+            const evRep = await insertRows(tx, "events", fades, await cols("events"), { byId: true, skipExisting: true, ...(dryEvents ? { dryEvents } : {}) });
+            tables.events!.inserted += evRep.inserted;
+            tables.events!.already_present += evRep.already_present;
+            notes.push(`${laidCount} dream(s) in the file arrived faded, each with a dream.faded event (reason "imported"): a dream from another life is not shown again`);
+          }
+        }
+        if (key === "dream_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
         if (key === "extractor_runs") {
           // run history is the history of another life: a row dated after this import cannot be real and is not brought in
           // (it would hold a schedule gate shut), and every row is marked so the gate ignores it
@@ -661,6 +690,11 @@ export async function importMind(
           const t = tables[key]!;
           if (t.inserted > 0) notes.push("the extractor arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind extractor enable)");
           if (t.already_present > 0) notes.push(`${t.already_present} extractor_state row(s) already existed in the target and were left as they were (the file's was not applied)`);
+        }
+        if (key === "dream_state" && rows.length > 0) {
+          const t = tables[key]!;
+          if (t.inserted > 0) notes.push("dreaming arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind dream enable)");
+          if (t.already_present > 0) notes.push(`${t.already_present} dream_state row(s) already existed in the target and were left as they were (the file's was not applied)`);
         }
       }
       for (const k of Object.keys(doc.projections)) {

@@ -16,6 +16,8 @@ import { noticeExtract } from "../../extractor/extract.js";
 import { noticeRepair } from "../../extractor/repair.js";
 import { noticeTrain } from "../../extractor/train.js";
 import { outboxDeliver } from "./outbox_deliver.js";
+import { dreamFade } from "../../dream/fade.js";
+import { dreamGenerate } from "../../dream/generate.js";
 
 /** The passes in run order. */
 export const PASSES: readonly AnyPass[] = [
@@ -31,14 +33,15 @@ export const PASSES: readonly AnyPass[] = [
   lettersExpire,
   noticeExpire,
   noticeRepair,
+  dreamFade,
 ];
 
 /**
- * The model-backed passes of the extractor, listed apart from the twelve deterministic ones: each runs only for a mind whose
- * extractor the operator has enabled, at most once a day at its schedule. They run after PASSES in a normal tick, and
+ * The model-backed passes, listed apart from the thirteen deterministic ones: the extractor's two run only for a mind whose
+ * extractor the operator has enabled, and dream.generate only for one whose dreaming is enabled, each at most once a day at its schedule. They run after PASSES in a normal tick, and
  * report a "skipped" note when there is nothing to do.
  */
-export const MODEL_PASSES: readonly AnyPass[] = [noticeExtract, noticeTrain];
+export const MODEL_PASSES: readonly AnyPass[] = [noticeExtract, noticeTrain, dreamGenerate];
 
 /** What a normal tick runs: the deterministic passes, then the model-backed ones. */
 export const ALL_PASSES: readonly AnyPass[] = [...PASSES, ...MODEL_PASSES];

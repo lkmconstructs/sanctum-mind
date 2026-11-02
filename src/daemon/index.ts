@@ -7,6 +7,7 @@ import { registry } from "../verbs/registry.js";
 import type { Embedder } from "../verbs/types.js";
 import { NONE_RERANKER } from "../rerank/none.js";
 import type { Reranker } from "../rerank/types.js";
+import { NONE_DREAMER, type Dreamer } from "../dream/dreamer.js";
 import { checkExtractorEnv } from "../extractor/config.js";
 import type { SinkConfig } from "../sinks/types.js";
 import { getDaemonConfig, resolveDaemonConfig, type DaemonConfig } from "./config.js";
@@ -24,6 +25,8 @@ export interface DaemonDeps {
   embedder: Embedder;
   /** the extractor's cross-encoder (notice.extract only); default none, scores null */
   reranker?: Reranker;
+  /** the dreamer for dream.generate; the `none` dreamer when unset */
+  dreamer?: Dreamer;
   /** outbox sinks the outbox.deliver pass delivers to; default none */
   sinks?: SinkConfig[];
   coolingMs?: number;
@@ -109,7 +112,7 @@ async function runPass(
     const result = isDetached(pass)
       ? await pass.run({
           pool: deps.pool, mind_id: mind, now, sinks: deps.sinks ?? [], config,
-          embedder: deps.embedder, reranker: deps.reranker ?? NONE_RERANKER, inTx,
+          embedder: deps.embedder, reranker: deps.reranker ?? NONE_RERANKER, dreamer: deps.dreamer ?? NONE_DREAMER, inTx,
         })
       : await inTx("write", (ctx) => pass.run(ctx));
     return {

@@ -116,7 +116,7 @@ const FORBIDDEN_IDENTIFIERS: Array<[RegExp, string]> = [
   [/\bsupersedeNode\b/, "uses supersedeNode"],
 ];
 
-export function violations(source: string): string[] {
+export function violations(source: string, whitelist: readonly string[] = WHITELISTED_KINDS): string[] {
   const code = blankComments(source);
   const out: string[] = [];
 
@@ -157,7 +157,7 @@ export function violations(source: string): string[] {
     for (const k of kinds) {
       const v = /^\s*(["'`])([^"'`$\\]*)\1\s*$/.exec(k[1]!);
       if (!v) out.push(`appendEvent( with a kind that is not a string literal (${k[1]!.trim()})`);
-      else if (!WHITELISTED_KINDS.includes(v[2]!)) out.push(`appendEvent( with kind "${v[2]}" (allowed: ${WHITELISTED_KINDS.join(", ")})`);
+      else if (!whitelist.includes(v[2]!)) out.push(`appendEvent( with kind "${v[2]}" (allowed: ${whitelist.join(", ")})`);
     }
   }
   return out;

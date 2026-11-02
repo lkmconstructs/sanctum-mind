@@ -175,11 +175,11 @@ const runsOf = (pass: string) => A(`select * from extractor_runs where pass = $1
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("the passes are registered, separately", () => {
-  it("notice.expire and notice.repair are among the twelve deterministic passes; extract and train are the model-backed ones, run after them", () => {
-    expect(PASSES).toHaveLength(12);
+  it("notice.expire and notice.repair are among the thirteen deterministic passes; extract, train and dream.generate are the model-backed ones, run after them", () => {
+    expect(PASSES).toHaveLength(13);
     expect(PASSES.map((p) => p.name)).toContain("notice.expire");
-    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train"]);
-    expect(ALL_PASSES).toHaveLength(14);
+    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train", "dream.generate"]);
+    expect(ALL_PASSES).toHaveLength(16);
     expect(EXTRACTOR_PASSES.map((p) => p.name)).toEqual(["notice.expire", "notice.repair", "notice.extract", "notice.train"]);
     expect(PASSES.some((p) => MODEL_PASSES.includes(p))).toBe(false);
   });
@@ -260,7 +260,7 @@ describe("notice.extract: when it runs", () => {
     expect(await runsOf("notice.extract")).toHaveLength(0);
     // beta never enabled it: its run is a skip with no rows
     const b = await runDaemonOnce({ pool, embedder: FAKE_EMBEDDER, now: () => clock }, { trigger: "manual", minds: ["beta"], passes: MODEL_PASSES });
-    expect(b[0]!.passes.map((x) => [x.pass, x.ok, x.changed])).toEqual([["notice.extract", true, 0], ["notice.train", true, 0]]);
+    expect(b[0]!.passes.map((x) => [x.pass, x.ok, x.changed])).toEqual([["notice.extract", true, 0], ["notice.train", true, 0], ["dream.generate", true, 0]]);
     expect(await A("select 1 from extractor_runs")).toHaveLength(0);
   });
 });
@@ -631,7 +631,7 @@ describe("notice.extract: the stage 1 runtime guard still holds with everything 
     for (const k of kinds) expect(WHITELISTED_KINDS).toContain(k);
     // and the run goes through the same path as a normal tick: all fourteen passes, none failing
     const tick = await runDaemonOnce({ pool, embedder: FAKE_EMBEDDER, reranker: byWords, now: () => at(DAY) }, { trigger: "manual", minds: ["alpha"] });
-    expect(tick[0]!.passes).toHaveLength(14);
+    expect(tick[0]!.passes).toHaveLength(16);
     expect(tick[0]!.ok).toBe(true);
   });
 });

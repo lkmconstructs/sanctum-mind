@@ -89,6 +89,27 @@ export const mind_health = defineVerb({
       await ctx.tx.query("rollback to savepoint health_schema");
     }
     const version = { package: packageInfo().version, schema, pending };
-    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, version, counts, last_daemon_run, outbox, extractor } });
+    // dreaming's switch and what waits: laid counts only dreams the mind may see (stage propose, not faded)
+    const ds = await ctx.tx.query<{ enabled: boolean; stage: string; paused: boolean }>(
+      `select enabled, stage, paused_at is not null as paused from dream_state where mind_id = $1`,
+      [ctx.mind_id],
+    );
+    const laid = await ctx.tx.query<{ n: string }>(
+      `select count(*) as n from dreams where mind_id = $1 and stage = 'propose' and status = 'laid' and fades_at > $2`,
+      [ctx.mind_id, ctx.now()],
+    );
+    const dr = await ctx.tx.query<{ started_at: Date; ok: boolean; skipped: boolean }>(
+      `select started_at, ok, coalesce(notes->>'skipped', '') = 'true' as skipped from extractor_runs
+        where mind_id = $1 and pass = 'dream.generate' order by started_at desc limit 1`,
+      [ctx.mind_id],
+    );
+    const dreaming = {
+      enabled: ds.rows[0]?.enabled ?? false,
+      stage: ds.rows[0]?.stage ?? "off",
+      paused: ds.rows[0]?.paused ?? false,
+      laid: ds.rows[0]?.stage === "propose" ? Number(laid.rows[0]!.n) : 0,
+      last_run: dr.rows[0] ? { pass: "dream.generate", started_at: dr.rows[0].started_at, ok: dr.rows[0].ok, skipped: dr.rows[0].skipped } : null,
+    };
+    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, version, counts, last_daemon_run, outbox, extractor, dreaming } });
   },
 });

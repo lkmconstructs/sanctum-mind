@@ -501,8 +501,8 @@ describe("notice.expire", () => {
       (r) => r[0]!.passes.find((p) => p.pass === "notice.expire")!,
     );
 
-  it("is the eleventh deterministic pass, followed by notice.repair as the twelfth", () => {
-    expect(PASSES).toHaveLength(12);
+  it("is the eleventh deterministic pass, followed by notice.repair as the twelfth (dream.fade is the thirteenth)", () => {
+    expect(PASSES).toHaveLength(13);
     expect(PASSES[10]!.name).toBe("notice.expire");
     expect(PASSES[11]!.name).toBe("notice.repair");
   });

@@ -3,7 +3,7 @@
 
 import type { PoolClient } from "pg";
 
-export type ExtractorPassName = "notice.extract" | "notice.train" | "notice.repair";
+export type ExtractorPassName = "notice.extract" | "notice.train" | "notice.repair" | "dream.generate";
 
 /**
  * Today's scheduled instant: `schedule` (HH:MM) on the calendar day of `now`, in the SERVICE's local time zone

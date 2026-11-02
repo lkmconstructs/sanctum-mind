@@ -651,10 +651,10 @@ describe("the pin table guards itself (migrations 0024 and 0025)", () => {
 });
 
 describe("surfaces", () => {
-  it("there are twenty-six verbs; mind_attend is one", () => {
-    expect(registry).toHaveLength(26);
+  it("there are twenty-seven verbs; mind_attend is one", () => {
+    expect(registry).toHaveLength(27);
     expect(registry.map((v) => v.name)).toContain("mind_attend");
-    expect(new Set(registry.map((v) => v.name)).size).toBe(26);
+    expect(new Set(registry.map((v) => v.name)).size).toBe(27);
   });
 
   it("mind_orient quick and full carry attention (top 7, with the stale pin count) before noticings; orientation does not", async () => {
