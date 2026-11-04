@@ -4,7 +4,7 @@
 /** `METABOLISE_TIMEOUT_MS`: how long one model call may take. Default 90000. */
 export const DEFAULT_METABOLISE_TIMEOUT_MS = 90_000;
 /** The prompt's version, carried on every metabolised proposal (payload.prompt_version) so a changed prompt is visible. */
-export const METABOLISE_PROMPT_VERSION = 2;
+export const METABOLISE_PROMPT_VERSION = 3;
 /** Stretches worked on per tick: the oldest queued first. */
 export const METABOLISE_BATCH = 3;
 /** A stretch still queued after this many days is marked failed ("expired unprocessed"): a conversation that old is no longer fresh. */

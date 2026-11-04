@@ -41,7 +41,7 @@ export {
 export { EXTRACTOR_EVENT_SHAPES } from "./events.js";
 export { NONE_METABOLISER, httpMetaboliser, metaboliserFrom, answerFrom as metaboliseAnswerFrom, type Metaboliser, type MetaboliseAnswer } from "./metaboliser.js";
 export { checkMetaboliseEnv, metaboliserConfig, METABOLISE_PROMPT_VERSION } from "./metabolise_config.js";
-export { metaboliseSystemPrompt, composeStretch, turnLabel, type StretchTurn } from "./metabolise_prompt.js";
+export { metaboliseSystemPrompt, composeStretch, turnLabel, foldLabelText, type StretchTurn } from "./metabolise_prompt.js";
 export { FEATURE_NAMES, computeFeatures, type Features, type FeatureName } from "./features.js";
 export { PRIOR_MODEL, loadModel, scoreOf, type Model } from "./scorer.js";
 
