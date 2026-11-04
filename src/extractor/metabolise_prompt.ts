@@ -63,8 +63,8 @@ export const foldLabelText = foldName;
 
 /**
  * Folds a turn's TEXT (or the context line) and does only what label safety needs: every run of \p{White_Space}, line and
- * paragraph separators and Cc controls becomes one space (a turn is one line), and a "[" is made "(" only when it
- * is the first non-space character (a text cannot begin with "["). Everything else is left as written: ZWJ, ZWNJ, variation
+ * paragraph separators and Cc controls becomes one space (a turn is one line), and an ASCII "[" is made "(" only when it
+ * is the first character after leading whitespace and controls. Everything else is left as written, apart from trimmed whitespace: ZWJ, ZWNJ, variation
  * selectors and other Cf, inner brackets, and NFKC-sensitive characters (x\u00b2, \u2122).
  */
 export function foldText(s: string): string {

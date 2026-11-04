@@ -145,7 +145,9 @@ export function httpMetaboliser(cfg: MetaboliserConfig, fetchImpl: typeof fetch 
         }
         return { kind: "answer", ...a };
       } catch (e) {
-        const why = e instanceof Error ? e.message : String(e);
+        const cause = e instanceof Error ? (e as { cause?: unknown }).cause : undefined;
+        const detail = cause !== null && typeof cause === "object" ? ((cause as { code?: unknown }).code ?? (cause as { message?: unknown }).message) : undefined;
+        const why = (e instanceof Error ? e.message : String(e)) + (typeof detail === "string" && detail !== "" ? ` (${detail})` : "");
         if (!warned) {
           warned = true;
           console.warn(`[metabolise] the metaboliser at ${cfg.url} failed (${why}); stretches stay queued until it answers`);

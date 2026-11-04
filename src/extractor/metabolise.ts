@@ -10,7 +10,7 @@ import { noticeProposedPayload } from "./events.js";
 import { computeFeatures, type MetaboliseKind } from "./features.js";
 import { NONE_METABOLISER, type MetaboliseResult } from "./metaboliser.js";
 import { METABOLISE_BATCH, METABOLISE_EXPIRY_DAYS, METABOLISE_MAX_PER_KIND, METABOLISE_PROMPT_VERSION } from "./metabolise_config.js";
-import { composeStretch, metaboliseSystemPrompt, type StretchTurn } from "./metabolise_prompt.js";
+import { composeStretch, foldText, metaboliseSystemPrompt, type StretchTurn } from "./metabolise_prompt.js";
 import { brief, enabledReason, readState, recordRun } from "./schedule.js";
 import { loadModel, scoreOf, type Model } from "./scorer.js";
 
@@ -39,7 +39,7 @@ function turnsOf(payload: unknown): StretchTurn[] {
   for (const t of raw) {
     if (t === null || typeof t !== "object") continue;
     const x = t as { speaker?: unknown; name?: unknown; text?: unknown };
-    if ((x.speaker !== "self" && x.speaker !== "other") || typeof x.text !== "string" || x.text.trim() === "") continue;
+    if ((x.speaker !== "self" && x.speaker !== "other") || typeof x.text !== "string" || /^\p{Cf}*$/u.test(foldText(x.text))) continue; // blank or only invisible characters, as composeStretch would drop it
     out.push({ speaker: x.speaker, ...(typeof x.name === "string" && x.name.trim() !== "" ? { name: x.name } : {}), text: x.text });
   }
   return out;
