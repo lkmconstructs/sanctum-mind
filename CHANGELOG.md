@@ -2,15 +2,16 @@
 
 All notable changes to sanctum-mind are listed here, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Moving between versions is described in [UPGRADING.md](UPGRADING.md).
 
-## Unreleased
+## [0.3.0] - 2026-11-04
 
 ### Added
 
+- Dreaming (layers 0 to 2), migrations 0027 and 0028. One table of residue, `dreams`, with `dream_state` (the operator's switch, kept apart from the extractor's) and `dream_preferences`, and two passes: `dream.generate` (model-backed, once a day after 03:30 local time, from the last `DREAM_WINDOW_HOURS` of what the mind wrote, what it has pinned and who was close lately; at stage `shadow` the dream is recorded and never shown) and `dream.fade` (a laid dream nobody decided on fades after its time-to-live). A dream is not memory: it is never a node or an event's content until the mind anchors it. Migration 0028 adds the guards: a decision carries its time and its event, a faded row carries its `dream.faded` event, a laid row has no decision, and a laid dream's text and residue cannot change for anyone, admin included. Import refuses a dream or noticing whose decision event is missing or wrong, and names it. The verb `mind_dream` (the 27th; `list`, `read`, `anchor`, `release`, `prefer`): `anchor` is an observation authored by the mind through the `mind_observe` path (`context: "dream"`, a charge required, nothing linked for it), `release` puts a dream down, and `prefer` (`all`, `none`, or a list of subjects) keeps a person out of its dreams by subject and alias: events that name them are dropped from the residue, not scrubbed. Operator CLI `sanctum-mind dream enable|disable|pause|resume|stage|report`. `mind_orient` carries the newest laid dream at `quick` and `full`, and `mind_health` reports `dreaming`. New environment variables: `DREAMER` (`none` or `http`), `DREAM_URL`, `DREAM_MODEL`, `DREAM_API_KEY`, `DREAM_TIMEOUT_MS` (default 90000), `DREAM_WINDOW_HOURS` (default 36, at most 168), `DREAM_TTL_DAYS` (default 7). Export, import and purge carry the dream tables (imported laid dreams arrive faded). Off by default. See DREAMING.md.
 - Metabolism (Voice 2), migration 0029. The verb `mind_metabolise` (the 28th; mind only) records a stretch of conversation as one `metabolise.stretch` event, not embedded, and queues it, whether or not the extractor is on. The model-backed pass `notice.metabolise` (gated by the extractor's enabled and paused state only, three stretches a tick, a week's patience) proposes `feeling` and `relation` noticings in the first person, scored by the per-mind scorer (`FEATURE_NAMES` is now fifteen). `mind_notice accept` turns a feeling into an observation (context `metabolised`, charge from the emotion plus the mind's own tags) and a relation into a note on that person (state and intensity kept if held, a new relation needs a state), recording the alias (`relations.aliases`) and nudging `connection` satisfaction when the proposal carried warmth. Nothing applies itself. `mind_health` reports `metabolise`. New environment variables: `METABOLISER`, `METABOLISE_URL`, `METABOLISE_MODEL`, `METABOLISE_API_KEY`, `METABOLISE_TIMEOUT_MS`. Export and import carry the queue and the aliases. See DREAMING.md.
 
 ### Upgrading
 
-Run `sanctum-mind upgrade` to apply migration 0029. Nothing to do by hand; metabolism is off until the operator enables the extractor and sets `METABOLISER=http`.
+Run `sanctum-mind upgrade` to apply migrations 0027, 0028 and 0029. Nothing to do by hand; dreaming is off until the operator runs `sanctum-mind dream enable`, and metabolism until the extractor is enabled and `METABOLISER=http` is set.
 
 ## [0.2.1] - 2026-10-12
 
