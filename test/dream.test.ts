@@ -580,6 +580,48 @@ describe("review fixes", () => {
   });
 });
 
+describe("the preference reaches aliases and relations beyond the shown fifty", () => {
+  const spy = (seen: string[]): Dreamer => ({ name: "fake", model: "m", dream: async (_s, user) => { seen.push(user); return { dream: "d", question: "q" }; } });
+
+  it("an event, a pin and a handoff field that name an excluded relation only by an alias are dropped and counted", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Lissa", state: "close", intensity: 0.9, note: "the one I build with" });
+    await admin.query(`update relations set aliases = array['Bearcub', 'Lis-bear'] where mind_id = 'alpha' and subject = 'Lissa'`);
+    await texturedEvent("bearcub fixed the ledger", ["relief"]);
+    await texturedEvent("the forge was quiet", ["calm"]);
+    await run(alpha, "mind_write", { mind_id: "alpha", type: "journal", text: "I keep thinking about LIS-BEAR and the door" });
+    const pinEv = (await q("alpha", `select id from events where payload->>'text' like 'I keep thinking%'`))[0].id;
+    expect((await run(alpha, "mind_attend", { mind_id: "alpha", operation: "pin", item_type: "event", item_id: pinEv })).ok).toBe(true);
+    await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "Bearcub wants the judge next", active_texture: "steady" } });
+    expect((await D(alpha, { operation: "prefer", relations: "none" })).ok).toBe(true);
+    const seen: string[] = [];
+    const r = await daemon([dreamGenerate], spy(seen));
+    expect(r[0]!.passes[0]!.notes![0]).toMatch(/1 events, 0 pinned, 0 relations, 3 dropped by the mind's preference/);
+    expect(seen[0]!.toLowerCase()).not.toMatch(/bearcub|lis-bear|lissa/);
+    expect(seen[0]).toContain("the forge was quiet");
+    expect(seen[0]).toContain("The texture I left with: steady");
+    expect((await q("alpha", "select residue from dreams"))[0].residue.dropped).toBe(3);
+  });
+
+  it("an excluded relation older than the fifty shown is still excluded", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    const names = ["Zed", ...Array.from({ length: 54 }, (_, i) => `Person${i}`)];
+    for (const subject of names) await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject, state: "near", intensity: 0.5 });
+    // Zed is the oldest of 55: outside the fifty most recently updated
+    await admin.query(`update relations set updated_at = updated_at - interval '1 hour' where mind_id = 'alpha' and subject = 'Zed'`);
+    expect((await q("alpha", "select count(*)::int as n from relations"))[0].n).toBe(55);
+    await texturedEvent("Zed said the ledger held", ["relief"]);
+    await texturedEvent("the forge was quiet", ["calm"]);
+    expect((await D(alpha, { operation: "prefer", relations: names.slice(1) })).ok).toBe(true);
+    const seen: string[] = [];
+    const r = await daemon([dreamGenerate], spy(seen));
+    expect(r[0]!.passes[0]!.notes![0]).toMatch(/1 events, .*1 dropped by the mind's preference/);
+    expect(seen[0]).not.toContain("Zed");
+    expect(seen[0]).toContain("the forge was quiet");
+    expect((await q("alpha", "select residue from dreams"))[0].residue.dropped).toBe(1);
+  });
+});
+
 describe("the operator", () => {
   it("parseDreamArgs: subcommand, --mind, --stage only on enable/stage, --schedule and --gap-hours only on enable, validation", () => {
     expect(parseDreamArgs(["enable", "--mind", "alpha", "--stage", "propose", "--schedule", "04:30", "--gap-hours", "12"])).toEqual({ action: "enable", mind: "alpha", stage: "propose", schedule: "04:30", gapHours: 12, json: false });

@@ -11,7 +11,7 @@ import { bookkeepingExcluded } from "../extractor/events.js";
  * the handoff's unresolved tension and active texture, what the mind has pinned, and its identity cores as the preamble.
  *
  * Who appears is the mind's to decide (dream_preferences.relations: "all" | "none" | subjects). An excluded relation's subject
- * is left out of "close lately", its note is not read, an event whose text contains the subject is DROPPED (scrubbing text is
+ * and its aliases are left out of "close lately", its note is not read, an event or pin whose text contains the subject or an alias is DROPPED (scrubbing text is
  * unreliable; dropping is honest; the count is kept), and a handoff field that names it is left out.
  */
 export interface Residue {
@@ -54,14 +54,17 @@ export async function readResidue(tx: PoolClient, mind: string, now: Date, windo
 
   const cores = await readIdentityCores(tx, mind);
 
-  const allRelations = await tx.query<{ subject: string; state: string; note: string | null; updated_at: Date }>(
+  // What is shown: the 50 most recently updated live relations. Who is excluded is a separate question and is answered from
+  // ALL live relations (no limit), by subject and by every alias, so an older excluded relation cannot leak.
+  const shown = await tx.query<{ subject: string; state: string; note: string | null; updated_at: Date }>(
     `select subject, state, note, updated_at from relations where mind_id = $1 and cleared_at is null order by updated_at desc limit 50`,
     [mind],
   );
+  const live = await tx.query<{ subject: string; aliases: string[] | null }>(`select subject, aliases from relations where mind_id = $1 and cleared_at is null`, [mind]);
   const allowed = (subject: string): boolean => pref === "all" || (pref !== "none" && pref.includes(subject));
-  const excluded = allRelations.rows.filter((r) => !allowed(r.subject)).map((r) => r.subject);
-  const relations = allRelations.rows
-    .filter((r) => allowed(r.subject) && r.updated_at.getTime() >= from.getTime())
+  const excluded = live.rows.filter((r) => !allowed(r.subject)).flatMap((r) => [r.subject, ...(r.aliases ?? [])]);
+  const relations = shown.rows
+    .filter((r) => allowed(r.subject) && r.updated_at.getTime() >= from.getTime() && !(excluded.length > 0 && mentions(`${r.subject}\n${r.note ?? ""}`, excluded)))
     .map((r) => ({ subject: r.subject, state: r.state, note: r.note }));
 
   const ev = await tx.query<{ id: string; payload: Record<string, unknown>; charge: string[] | null }>(
