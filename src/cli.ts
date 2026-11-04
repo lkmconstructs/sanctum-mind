@@ -19,6 +19,9 @@ import { importRevien } from "./adapters/revien.js";
 import { ArgError, parseDaemonArgs, parseImportArgs } from "./cli-args.js";
 import { GRANT_USAGE, parseGrantArgs, runGrantCommand } from "./grants-admin.js";
 import { EXTRACTOR_USAGE, parseExtractorArgs, runExtractorCommand } from "./extractor-admin.js";
+import { DREAM_USAGE, parseDreamArgs, runDreamCommand } from "./dream-admin.js";
+import { checkDreamEnv, dreamerFrom, dreamerConfig } from "./dream/index.js";
+import { checkMetaboliseEnv, metaboliserConfig, metaboliserFrom } from "./extractor/index.js";
 import { exportMind, parseExportArgs } from "./export.js";
 import { importMind, parseImportMindArgs } from "./import-mind.js";
 import { formatPurge, parsePurgeArgs, purgeMind } from "./purge.js";
@@ -56,6 +59,8 @@ commands:
                     manage grants between minds (sanctum_operator or ADMIN URL; see "grant" usage below)
   extractor enable|disable|pause|resume|stage|report|repair-backfill --mind <id> ...
                     operate the optional extractor that proposes links, patterns and distillations (sanctum_operator or ADMIN URL; see "extractor" usage below)
+  dream enable|disable|pause|resume|stage|report --mind <id> ...
+                    operate the optional dreaming pass that lays one dream a day from the mind's residue (sanctum_operator or ADMIN URL; see "dream" usage below)
   export-mind --mind <id> [--out <file>]
                     write one mind (ledger, graph, projections) to a JSON file (sanctum_import URL)
   import-mind <file> --mind <target> [--dry-run] [--allow-core] [--strict] [--with-letters]
@@ -81,6 +86,8 @@ ${UPGRADE_USAGE}
 ${GRANT_USAGE}
 
 ${EXTRACTOR_USAGE}
+
+${DREAM_USAGE}
 
 ${MINDS_ADMIN_USAGE}
 `;
@@ -247,6 +254,10 @@ async function main(): Promise<void> {
     case "daemon": {
       defaultCoolingMs(); // fail fast on a bad IDENTITY_COOLING_HOURS
       checkExtractorEnv(); // and on a bad EXTRACTOR_TTL_DAYS, EXTRACTOR_REPROPOSE_DAYS or EXTRACTOR_MAX_CANDIDATES
+      checkDreamEnv(); // and on a bad DREAMER, DREAM_URL, DREAM_MODEL, DREAM_TTL_DAYS or DREAM_WINDOW_HOURS
+      const dreamer = dreamerFrom(dreamerConfig(process.env));
+      checkMetaboliseEnv(); // and on a bad METABOLISER, METABOLISE_URL, METABOLISE_MODEL or METABOLISE_TIMEOUT_MS
+      const metaboliser = metaboliserFrom(metaboliserConfig(process.env));
       const reranker = rerankerFromEnv(process.env); // and on a bad RERANKER, or RERANKER=http without a valid RERANK_URL
       const args = argsOrFail(() => parseDaemonArgs(process.argv.slice(3)));
       const minds = args.mind ? [args.mind] : undefined;
@@ -256,7 +267,7 @@ async function main(): Promise<void> {
       await enforceLane(pool, { command: "daemon", lanes: ["daemon"] });
       const embedder = embedderFromEnv(process.env);
       if (args.once) {
-        const reports = await runDaemonOnce({ pool, embedder, reranker, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
+        const reports = await runDaemonOnce({ pool, embedder, reranker, dreamer, metaboliser, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
         for (const r of reports) {
           const failed = r.passes.filter((p) => !p.ok).map((p) => `${p.pass}: ${p.error ?? "failed"}`);
           const changed = r.passes.reduce((n, p) => n + p.changed, 0);
@@ -265,7 +276,7 @@ async function main(): Promise<void> {
             continue;
           }
           console.log(`${r.mind_id}: ${r.ok ? "ok" : "FAILED"} (${r.passes.length} passes, ${changed} changes)${failed.length ? "\n  " + failed.join("\n  ") : ""}`);
-          for (const p of r.passes) for (const n of p.notes ?? []) if (p.pass.startsWith("notice.") && p.pass !== "notice.expire") console.log(`  ${p.pass}: ${n}`);
+          for (const p of r.passes) for (const n of p.notes ?? []) if ((p.pass.startsWith("notice.") && p.pass !== "notice.expire") || p.pass === "dream.generate") console.log(`  ${p.pass}: ${n}`);
         }
         await pool.end();
         if (reports.length === 0) {
@@ -274,7 +285,7 @@ async function main(): Promise<void> {
         }
         process.exit(reports.every((r) => r.ok) ? 0 : 2);
       }
-      const handle = startDaemon({ pool, embedder, reranker, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
+      const handle = startDaemon({ pool, embedder, reranker, dreamer, metaboliser, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
       console.error(`sanctum-mind: daemon running every ${args.interval} minute(s)${args.mind ? ` for ${args.mind}` : ""}`);
       let stopping = false;
       const stop = async () => {
@@ -328,6 +339,18 @@ async function main(): Promise<void> {
       await enforceLane(pool, { command: "extractor", lanes: ["operator"], allowAdmin: true });
       try {
         console.log(await runExtractorCommand(pool, args));
+      } finally {
+        await pool.end();
+      }
+      process.exit(0);
+    }
+    case "dream": {
+      const args = parseDreamArgs(process.argv.slice(3));
+      const pool = createPool(requireDatabaseUrl());
+      await enforceSchema(pool);
+      await enforceLane(pool, { command: "dream", lanes: ["operator"], allowAdmin: true });
+      try {
+        console.log(await runDreamCommand(pool, args));
       } finally {
         await pool.end();
       }

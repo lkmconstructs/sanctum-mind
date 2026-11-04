@@ -10,6 +10,7 @@ import { ArgError } from "./cli-args.js";
 import { withMind } from "./db/pool.js";
 import { EXPORT_FORMAT } from "./export.js";
 import { noticeExpiredPayload } from "./extractor/events.js";
+import { dreamFadedPayload } from "./dream/events.js";
 
 /**
  * Import reads the whole export into memory (JSON.parse) and refuses files over this size with a
@@ -102,6 +103,7 @@ interface Doc {
 const PROJECTION_ORDER = [
   "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
   "noticings", "extractor_state", "extractor_models", "extractor_runs", "attention_pins",
+  "dreams", "dream_state", "dream_preferences", "metabolise_queue",
 ] as const;
 const PROJECTION_TABLE: Record<string, string> = Object.fromEntries(PROJECTION_ORDER.map((k) => [k, k]));
 
@@ -322,6 +324,41 @@ function dropForeignRefs(doc: Doc): Record<string, number> {
   }
 }
 
+/**
+ * Run BEFORE dropForeignRefs, which would silently drop a row whose decided_event_id names an event the file does not hold.
+ * - dreams: an anchored or released one whose decision id is absent from the file fails the import, naming the dream; a faded one
+ *   loses the dangling id (its decision is re-made, as for any faded row without a valid event, in the dreams section).
+ * - noticings: an accepted or rejected one that names a decision event must name, in the file, an event of kind notice.<status>
+ *   about that noticing; otherwise the import fails, naming the noticing. (One that names none still arrives expired.)
+ */
+function checkDecisionEvents(doc: Doc): void {
+  const evById = new Map(doc.events.filter((e) => typeof e.id === "string").map((e) => [lc(e.id), e]));
+  for (const r of doc.projections.dreams ?? []) {
+    const st = String(r.status);
+    if (typeof r.decided_event_id !== "string" || evById.has(lc(r.decided_event_id))) continue;
+    if (st === "anchored" || st === "released") {
+      throw new ImportError(
+        `export file: dream ${typeof r.id === "string" ? lc(r.id) : "(no id)"} is ${st} but its decided_event_id names an event that is not in the file; nothing was imported`,
+      );
+    }
+    if (st === "faded") r.decided_event_id = null;
+  }
+  for (const r of doc.projections.noticings ?? []) {
+    const st = String(r.status);
+    if ((st !== "accepted" && st !== "rejected") || typeof r.decided_event_id !== "string") continue;
+    const e = evById.get(lc(r.decided_event_id));
+    const nid = typeof r.id === "string" ? lc(r.id) : "(no id)";
+    if (e === undefined) {
+      throw new ImportError(`export file: noticing ${nid} is ${st} but its decided_event_id names an event that is not in the file; nothing was imported`);
+    }
+    if (e.kind !== `notice.${st}` || typeof e.subject_id !== "string" || typeof r.id !== "string" || lc(e.subject_id) !== lc(r.id)) {
+      throw new ImportError(
+        `export file: noticing ${nid} is ${st} but its decided_event_id names an event that is not a notice.${st} event about it; nothing was imported`,
+      );
+    }
+  }
+}
+
 const CORE_TYPES = ["identity", "vow"];
 
 /** A fixed event id per imported noticing, so re-running an import finds its own expiry event instead of writing another. */
@@ -403,6 +440,9 @@ export async function importMind(
     if ("written_by" in o) o.written_by = target;
     return o;
   };
+
+  // a decision whose event is not in the file must not be dropped quietly by the filter below
+  checkDecisionEvents(doc);
 
   // references outside the file are refused before anything is written
   const refused = dropForeignRefs(doc);
@@ -579,6 +619,55 @@ export async function importMind(
           }
         }
         if (key === "extractor_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
+        if (key === "dreams") {
+          // A laid dream from another life is not shown again: it arrives faded, with a dream.faded event written as the mind
+          // (reason "imported"). Decided ones (anchored, released, and faded too) keep their status only if they carry a decision
+          // event the database's guard will accept (an event of this mind, subject = the dream, kind = dream.<status>). A faded row
+          // without such an event (0028 checks only new writes, so a database upgraded from 0027 may hold faded rows with no
+          // dream.faded event, or a wrong one) gets a fresh dream.faded event like a laid one; an anchored or released row without
+          // one fails the import, naming the dream. A decision with no decided_at (written before 0028 required it) is dated at the import.
+          const fades: Row[] = [];
+          const evById = new Map(doc.events.map((e) => [lc(e.id), e]));
+          const eventPasses = (r: Row, st: string): boolean => {
+            if (typeof r.decided_event_id !== "string" || typeof r.id !== "string") return false;
+            const e = evById.get(lc(r.decided_event_id));
+            return e !== undefined && e.kind === `dream.${st}` && typeof e.subject_id === "string" && lc(e.subject_id) === lc(r.id);
+          };
+          let laidCount = 0;
+          let refadedCount = 0;
+          rows = rows.map((r) => {
+            const st = String(r.status);
+            if ((st === "faded" || st === "anchored" || st === "released") && eventPasses(r, st)) {
+              return { ...r, status: st, decided_at: r.decided_at ?? importedAt };
+            }
+            if (typeof r.id !== "string") throw new ImportError("export file: a dream has no id");
+            if (st === "anchored" || st === "released") {
+              throw new ImportError(
+                `export file: dream ${lc(r.id)} is ${st} but the file holds no dream.${st} event for it (its decided_event_id is missing, or names an event of another kind or subject); nothing was imported`,
+              );
+            }
+            const did = lc(r.id);
+            const evId = importExpiryEventId(`dream:${did}`);
+            fades.push({
+              id: evId, mind_id: target, kind: "dream.faded", subject_id: did,
+              payload: dreamFadedPayload.parse({ dream_id: did, reason: "imported" }),
+              written_by: target, recorded_at: importedAt, created_at: importedAt,
+            });
+            if (st === "faded") refadedCount++;
+            else laidCount++;
+            return { ...r, status: "faded", decided_event_id: evId, decided_at: importedAt };
+          });
+          if (fades.length > 0) {
+            const evRep = await insertRows(tx, "events", fades, await cols("events"), { byId: true, skipExisting: true, ...(dryEvents ? { dryEvents } : {}) });
+            tables.events!.inserted += evRep.inserted;
+            tables.events!.already_present += evRep.already_present;
+            if (laidCount > 0) notes.push(`${laidCount} dream(s) in the file arrived faded, each with a dream.faded event (reason "imported"): a dream from another life is not shown again`);
+            if (refadedCount > 0) notes.push(`${refadedCount} dream(s) in the file were already faded but had no dream.faded event of their own; each was given one (reason "imported")`);
+          }
+        }
+        if (key === "dream_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
+        // a stretch from another life is not metabolised again: every queue row arrives done (the database's guard admits an import only as done)
+        if (key === "metabolise_queue") rows = rows.map((r) => ({ ...r, status: "done", done_at: importedAt, note: "imported" }));
         if (key === "extractor_runs") {
           // run history is the history of another life: a row dated after this import cannot be real and is not brought in
           // (it would hold a schedule gate shut), and every row is marked so the gate ignores it
@@ -661,6 +750,11 @@ export async function importMind(
           const t = tables[key]!;
           if (t.inserted > 0) notes.push("the extractor arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind extractor enable)");
           if (t.already_present > 0) notes.push(`${t.already_present} extractor_state row(s) already existed in the target and were left as they were (the file's was not applied)`);
+        }
+        if (key === "dream_state" && rows.length > 0) {
+          const t = tables[key]!;
+          if (t.inserted > 0) notes.push("dreaming arrived disabled and at stage shadow, whatever the file said: the operator re-enables it and chooses the stage (sanctum-mind dream enable)");
+          if (t.already_present > 0) notes.push(`${t.already_present} dream_state row(s) already existed in the target and were left as they were (the file's was not applied)`);
         }
       }
       for (const k of Object.keys(doc.projections)) {

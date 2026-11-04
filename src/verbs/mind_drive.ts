@@ -8,13 +8,13 @@ import { appendEvent, mindIdSchema, text } from "./common.js";
 import {
   AXES,
   DRIVES,
-  clamp10,
   driveView,
   levelsAt,
   writeInstant,
   loadDriveRows,
   lockDrive,
   persistDecay,
+  nudgeDrive,
   upsertDrive,
   type Drive,
 } from "./drives.js";
@@ -78,33 +78,15 @@ export const mind_drive = defineVerb({
 
     const drive = input.drive!;
     const axis = input.axis!;
+    if (input.operation === "nudge") {
+      const nudged = await nudgeDrive(ctx, { context, drive, axis, delta: input.delta!, source: input.source, note: input.note });
+      return ok({ event_id: nudged.event_id, projection: { event_id: nudged.event_id, drive: nudged.drive } });
+    }
     await lockDrive(ctx, context, drive);
     const row = (await loadDriveRows(ctx, context)).find((r) => r.drive === drive);
     // One instant for the whole write: decay target and stored updated_at (never behind the row).
     const at = writeInstant(asOf, row ? [row] : []);
     const cur = levelsAt(row, at);
-
-    if (input.operation === "nudge") {
-      const before = cur[axis];
-      const after = clamp10(before + input.delta!);
-      const next = { ...cur, [axis]: after };
-      const ev = await appendEvent(ctx, {
-        kind: "drive.nudge",
-        payload: {
-          context,
-          drive,
-          axis,
-          delta: input.delta,
-          source: input.source ?? null,
-          note: input.note ?? null,
-          before,
-          after,
-        },
-        ...(context === "" ? {} : { context }),
-      });
-      const saved = await upsertDrive(ctx, context, drive, next, ev.id, at);
-      return ok({ event_id: ev.id, projection: { event_id: ev.id, drive: driveView(drive, levelsAt(saved, saved.updated_at), saved.updated_at) } });
-    }
 
     // set_baseline
     const next = { ...cur, baselines: { ...cur.baselines, [axis]: input.value! } };

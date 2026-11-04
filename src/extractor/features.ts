@@ -2,7 +2,7 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
 /**
- * The scorer's inputs: thirteen named numbers per candidate, all in 0..1. They are stored on every noticing (`features`
+ * The scorer's inputs: fifteen named numbers per candidate, all in 0..1. They are stored on every noticing (`features`
  * jsonb), so a refit reads exactly what the scorer saw. The names are the model's vocabulary: weights are keyed by them.
  *
  *   rerank            cross-encoder score in 0..1; 0 when there is none
@@ -19,6 +19,7 @@
  *   attended          1 when any source is something the mind is attending to (a node or event it pinned, or one that a top-12 attention
  *                     item rests on; see src/verbs/attention.ts), else 0. Added after the first twelve: a stored row or a model
  *                     from before it reads 0 for it (featureVector, parseWeights).
+ *   kind_feeling, kind_relation   one-hot of the two metabolised kinds, added last (metabolism, Voice 2); older rows and models read 0 for them
  */
 export const FEATURE_NAMES = [
   "rerank",
@@ -34,10 +35,15 @@ export const FEATURE_NAMES = [
   "kind_pattern",
   "kind_distillation",
   "attended",
+  "kind_feeling",
+  "kind_relation",
 ] as const;
 export type FeatureName = (typeof FEATURE_NAMES)[number];
 export type Features = Record<FeatureName, number>;
+/** The kinds the candidate pass (notice.extract) proposes; the counts in extract.ts are keyed by these. */
 export type NoticingKind = "link" | "pattern" | "distillation";
+/** The kinds the metabolise pass proposes. */
+export type MetaboliseKind = "feeling" | "relation";
 
 export const SALIENCE_VALUE: Record<string, number> = { foundational: 1, active: 0.7, background: 0.4, archive: 0.1 };
 /** What an unset salience counts as in the feature (and, below the 0.7 bar, in the distillation rule). */
@@ -60,7 +66,7 @@ export interface SourceFacts {
 }
 
 export interface FeatureInput {
-  kind: NoticingKind;
+  kind: NoticingKind | MetaboliseKind;
   /** cross-encoder score in 0..1, or null when there is none */
   rerank: number | null;
   /** the cosine feature before clamping (see above) */
@@ -106,6 +112,8 @@ export function computeFeatures(i: FeatureInput): Features {
     kind_pattern: i.kind === "pattern" ? 1 : 0,
     kind_distillation: i.kind === "distillation" ? 1 : 0,
     attended: i.sources.some((s) => s.attended === true) ? 1 : 0,
+    kind_feeling: i.kind === "feeling" ? 1 : 0,
+    kind_relation: i.kind === "relation" ? 1 : 0,
   };
 }
 

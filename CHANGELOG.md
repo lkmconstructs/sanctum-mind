@@ -2,6 +2,16 @@
 
 All notable changes to sanctum-mind are listed here, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Moving between versions is described in [UPGRADING.md](UPGRADING.md).
 
+## Unreleased
+
+### Added
+
+- Metabolism (Voice 2), migration 0029. The verb `mind_metabolise` (the 28th; mind only) records a stretch of conversation as one `metabolise.stretch` event, not embedded, and queues it, whether or not the extractor is on. The model-backed pass `notice.metabolise` (gated by the extractor's enabled and paused state only, three stretches a tick, a week's patience) proposes `feeling` and `relation` noticings in the first person, scored by the per-mind scorer (`FEATURE_NAMES` is now fifteen). `mind_notice accept` turns a feeling into an observation (context `metabolised`, charge from the emotion plus the mind's own tags) and a relation into a note on that person (state and intensity kept if held, a new relation needs a state), recording the alias (`relations.aliases`) and nudging `connection` satisfaction when the proposal carried warmth. Nothing applies itself. `mind_health` reports `metabolise`. New environment variables: `METABOLISER`, `METABOLISE_URL`, `METABOLISE_MODEL`, `METABOLISE_API_KEY`, `METABOLISE_TIMEOUT_MS`. Export and import carry the queue and the aliases. See DREAMING.md.
+
+### Upgrading
+
+Run `sanctum-mind upgrade` to apply migration 0029. Nothing to do by hand; metabolism is off until the operator enables the extractor and sets `METABOLISER=http`.
+
 ## [0.2.1] - 2026-10-12
 
 ### Changed

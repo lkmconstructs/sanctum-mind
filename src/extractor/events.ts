@@ -10,7 +10,7 @@ import { z } from "zod";
  * extra key, so a payload cannot grow a text field unnoticed; the passes parse through these before appending, and
  * test/notice.test.ts parses every `notice.*` event in the ledger against them.
  */
-const kindOfNoticing = z.enum(["link", "pattern", "distillation", "repair"]);
+const kindOfNoticing = z.enum(["link", "pattern", "distillation", "repair", "feeling", "relation"]);
 const stageOfNoticing = z.enum(["shadow", "propose"]);
 
 export const noticeProposedPayload = z.strictObject({
@@ -38,14 +38,15 @@ export const noticeModelTrainedPayload = z.strictObject({
 });
 
 /**
- * Events that are bookkeeping, not memory: `notice.*` (the extractor's proposals and decisions), `attend.*` (pins and
+ * Events that are bookkeeping, not memory: `notice.*` (the extractor's proposals and decisions), `dream.*` and `daemon.dream.*` (dreams laid,
+ * decided and faded, and the operator's switch; a dream's text is never in an event), `attend.*` (pins and
  * releases) and `daemon.extractor.*` / `daemon.repair.backfill` (operator bookkeeping) and `repair.kept` / `repair.rethought` (paired with the ordinary rethink event; `repair.retired` is a change to
  * memory and stays). ONE definition, as a SQL predicate on the `kind` column of `events`, used wherever the ledger is read
  * as memory: mind_orient `recent`, mind_weather, the event side of search and surface, and belief repair's context events.
  * A new bookkeeping kind is added here and nowhere else. Use `bookkeepingExcluded("e.kind")` when the table is aliased.
  */
 export const bookkeepingExcluded = (col = "kind"): string =>
-  `${col} not like 'notice.%' and ${col} not like 'attend.%' and ${col} not like 'daemon.extractor.%' and ${col} not in ('repair.kept', 'repair.rethought', 'daemon.repair.backfill')`;
+  `${col} not like 'notice.%' and ${col} not like 'attend.%' and ${col} not like 'daemon.extractor.%' and ${col} not like 'dream.%' and ${col} not like 'daemon.dream.%' and ${col} not in ('repair.kept', 'repair.rethought', 'daemon.repair.backfill')`;
 
 export const EXTRACTOR_EVENT_SHAPES = {
   "notice.proposed": noticeProposedPayload,

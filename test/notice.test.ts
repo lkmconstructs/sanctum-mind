@@ -501,8 +501,8 @@ describe("notice.expire", () => {
       (r) => r[0]!.passes.find((p) => p.pass === "notice.expire")!,
     );
 
-  it("is the eleventh deterministic pass, followed by notice.repair as the twelfth", () => {
-    expect(PASSES).toHaveLength(12);
+  it("is the eleventh deterministic pass, followed by notice.repair as the twelfth (dream.fade is the thirteenth)", () => {
+    expect(PASSES).toHaveLength(13);
     expect(PASSES[10]!.name).toBe("notice.expire");
     expect(PASSES[11]!.name).toBe("notice.repair");
   });
@@ -1305,6 +1305,35 @@ describe("export, import and purge", () => {
       expect(r.decided_at).not.toBeNull();
       expect((await a2.query("select kind, payload from events where id = $1", [r.decided_event_id])).rows[0]).toEqual({ kind: "notice.expired", payload: { noticing_id: r.id, reason: "imported" } });
     }
+  });
+
+  it("import: an accepted or rejected noticing whose decision event is absent from the file, of the wrong kind, or about another noticing fails the import, naming the noticing", async () => {
+    const ids = await seedFull();
+    const other = ids.pending;
+    const f0 = join(dir, `x${seq++}.json`);
+    await exportMind(pool, "alpha", f0);
+    const base = JSON.parse(readFileSync(f0, "utf8"));
+    const acceptedEv: string = base.projections.noticings.find((n: any) => n.id === ids.accepted).decided_event_id;
+    const proposedEv: string = base.events.find((e: any) => e.kind === "notice.proposed").id;
+    const cases: Array<[string, (doc: any) => void, RegExp]> = [
+      ["dangling", (d) => { d.projections.noticings.find((n: any) => n.id === ids.accepted).decided_event_id = "00000000-0000-4000-8000-000000000abc"; }, /is accepted but its decided_event_id names an event that is not in the file/],
+      ["wrong kind", (d) => { d.projections.noticings.find((n: any) => n.id === ids.accepted).decided_event_id = proposedEv; }, /is accepted but its decided_event_id names an event that is not a notice\.accepted event about it/],
+      ["status mismatch", (d) => { d.projections.noticings.find((n: any) => n.id === ids.accepted).status = "rejected"; }, /is rejected but its decided_event_id names an event that is not a notice\.rejected event about it/],
+      ["another noticing", (d) => { d.events.find((e: any) => e.id === acceptedEv).subject_id = other; }, /is accepted but its decided_event_id names an event that is not a notice\.accepted event about it/],
+    ];
+    for (const [name, tamper, re] of cases) {
+      const doc = JSON.parse(JSON.stringify(base));
+      tamper(doc);
+      const f = join(dir, `x${seq++}.json`);
+      writeFileSync(f, JSON.stringify(doc));
+      const { a2, p2 } = await secondDb();
+      await expect(importMind(p2, f, "alpha"), name).rejects.toThrow(re);
+      await expect(importMind(p2, f, "alpha"), name).rejects.toThrow(new RegExp(`noticing ${ids.accepted}`));
+      expect((await a2.query("select count(*)::int n from noticings")).rows[0].n, name).toBe(0);
+    }
+    // the untampered file still imports
+    const { p2 } = await secondDb();
+    expect((await importMind(p2, f0, "alpha")).tables.noticings).toMatchObject({ inserted: 3 });
   });
 
   it("import leaves a target's own extractor_state alone and says so", async () => {

@@ -13,7 +13,7 @@ export const REPAIR_DECISIONS = ["keep", "rethink", "retire"] as const;
 
 export const noticeAcceptedPayload = z.strictObject({
   noticing_id: z.uuid(),
-  kind: z.enum(["link", "pattern", "distillation", "repair"]),
+  kind: z.enum(["link", "pattern", "distillation", "repair", "feeling", "relation"]),
   /** every kind but repair names its sources; a repair names only its decision */
   sources: z.array(z.uuid()).optional(),
   /** repair: what the mind decided about the dependant */
@@ -25,6 +25,11 @@ export const noticeAcceptedPayload = z.strictObject({
   /** the pattern or distill event the node was made from */
   content_event_id: z.uuid().optional(),
   edited: z.boolean().optional(),
+  /** feeling: the observe event and node the accepted feeling became */
+  observe_event_id: z.uuid().optional(),
+  /** relation: the relate.set event, and the drive.nudge event when the proposal carried warmth */
+  relate_event_id: z.uuid().optional(),
+  drive_event_id: z.uuid().optional(),
 }).superRefine((v, c) => {
   if (v.kind === "repair") {
     if (v.decision === undefined) c.addIssue({ code: "custom", message: "a repair is decided keep, rethink or retire", path: ["decision"] });
@@ -41,6 +46,6 @@ export const repairRetiredPayload = z.strictObject({ noticing_id: z.uuid(), upst
 
 export const noticeRejectedPayload = z.strictObject({
   noticing_id: z.uuid(),
-  kind: z.enum(["link", "pattern", "distillation", "repair"]),
+  kind: z.enum(["link", "pattern", "distillation", "repair", "feeling", "relation"]),
   reason: z.string().nullable(),
 });

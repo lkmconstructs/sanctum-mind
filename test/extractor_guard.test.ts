@@ -9,7 +9,12 @@ import type { Pool } from "pg";
 import { appPool, closePool, queryAs, resetDatabase } from "./helpers.js";
 import { runDaemonOnce } from "../src/daemon/index.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
-import { EXTRACTOR_PASSES } from "../src/extractor/index.js";
+import { DREAM_FORBIDDEN_TABLES, violations, WHITELISTED_KINDS } from "./guard_scan.js";
+import { EXTRACTOR_PASSES, noticeMetabolise } from "../src/extractor/index.js";
+import { setExtractorState } from "../src/extractor-admin.js";
+import { runVerb } from "../src/verbs/run.js";
+import { registry } from "../src/verbs/registry.js";
+import type { Metaboliser } from "../src/extractor/metaboliser.js";
 
 /**
  * The extractor proposes; it never writes memory. Two layers check that, and neither is the real boundary (that is the
@@ -30,8 +35,6 @@ import { EXTRACTOR_PASSES } from "../src/extractor/index.js";
  * 2. A runtime test below: run every extractor pass over a seeded mind and compare nodes and edges (all columns) before
  *    and after, and check that every event the passes appended is of a whitelisted kind.
  */
-export const WHITELISTED_KINDS = ["notice.proposed", "notice.expired", "notice.model.trained"];
-
 const DIR = fileURLToPath(new URL("../src/extractor", import.meta.url));
 
 function files(dir: string): string[] {
@@ -39,128 +42,6 @@ function files(dir: string): string[] {
     const p = path.join(dir, f);
     return statSync(p).isDirectory() ? files(p) : [p];
   });
-}
-
-/** Index just past the string literal that starts at `i` (a quote or backtick), honouring backslash escapes. */
-function endOfString(src: string, i: number): number {
-  const q = src[i]!;
-  let j = i + 1;
-  while (j < src.length) {
-    if (src[j] === "\\") j += 2;
-    else if (src[j] === q) return j + 1;
-    else if (q !== "`" && src[j] === "\n") return j; // an unterminated plain string ends at the line
-    else j++;
-  }
-  return src.length;
-}
-
-/** Blanks line and block comments with spaces (newlines kept), leaving every string literal untouched. Strings first. */
-export function blankComments(src: string): string {
-  let out = "";
-  let i = 0;
-  while (i < src.length) {
-    const c = src[i]!;
-    const d = src[i + 1];
-    if (c === '"' || c === "'" || c === "`") {
-      const e = endOfString(src, i);
-      out += src.slice(i, e);
-      i = e;
-    } else if (c === "/" && d === "/") {
-      while (i < src.length && src[i] !== "\n") { out += " "; i++; }
-    } else if (c === "/" && d === "*") {
-      const e = src.indexOf("*/", i + 2);
-      const stop = e === -1 ? src.length : e + 2;
-      out += src.slice(i, stop).replace(/[^\n]/g, " ");
-      i = stop;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  return out;
-}
-
-/** The text between the parenthesis at `open` and its match, skipping strings; null when unbalanced. */
-function parenBody(code: string, open: number): string | null {
-  let depth = 0;
-  let i = open;
-  while (i < code.length) {
-    const c = code[i]!;
-    if (c === '"' || c === "'" || c === "`") { i = endOfString(code, i); continue; }
-    if (c === "(") depth++;
-    else if (c === ")" && --depth === 0) return code.slice(open + 1, i);
-    i++;
-  }
-  return null;
-}
-
-const T = String.raw`(?:public\s*\.\s*)?"?(?:nodes|events|edges)"?(?![\w])`;
-const SQL_FORMS: Array<[RegExp, string]> = [
-  [new RegExp(String.raw`\binsert\s+into\s+${T}`, "i"), "inserts into a memory table"],
-  [new RegExp(String.raw`\bupdate\s+(?:only\s+)?${T}`, "i"), "updates a memory table"],
-  [new RegExp(String.raw`\bmerge\s+into\s+${T}`, "i"), "merges into a memory table"],
-  [new RegExp(String.raw`\bcopy\s+${T}`, "i"), "copies into a memory table"],
-  [new RegExp(String.raw`\bdelete\s+from\s+(?:only\s+)?${T}`, "i"), "deletes from a memory table"],
-  [new RegExp(String.raw`\btruncate\s+(?:table\s+)?(?:only\s+)?${T}`, "i"), "truncates a memory table"],
-  [/\b(?:insert\s+into|merge\s+into|delete\s+from|update|copy|truncate)\s*(?:\$\{|["'`]\s*\+)/i, "writes to a table whose name is not a literal"],
-  // repair_work: the extractor may only claim and acknowledge (update); the rows are inserted by verbs in the invalidating transaction and by the operator's backfill
-  [/\b(?:insert\s+into|merge\s+into|copy)\s+(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "inserts into repair_work (only verbs and the operator backfill insert work)"],
-  [/\b(?:delete\s+from|truncate(?:\s+table)?)\s+(?:only\s+)?(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "deletes from repair_work"],
-];
-const FORBIDDEN_IDENTIFIERS: Array<[RegExp, string]> = [
-  [/\bregistry\b/, "uses the verb registry"],
-  [/\brunVerb\b/, "calls runVerb"],
-  [/\.handler\s*\(/, "calls a verb handler"],
-  [/\blinkNodes\b/, "uses linkNodes"],
-  [/\binsertSelfNode\b/, "uses insertSelfNode"],
-  [/\bsupersedeNode\b/, "uses supersedeNode"],
-];
-
-export function violations(source: string): string[] {
-  const code = blankComments(source);
-  const out: string[] = [];
-
-  const joined = code.replace(/(["'`])\s*\+\s*(["'`])/g, ""); // "insert " + "into nodes" -> "insert into nodes"
-  for (const [re, what] of SQL_FORMS) if (re.test(code) || re.test(joined)) out.push(what);
-  for (const [re, what] of FORBIDDEN_IDENTIFIERS) if (re.test(code)) out.push(what);
-
-  // imports, re-exports, dynamic import and require of anything under verbs/
-  const checkSpec = (spec: string, clause: string | null) => {
-    if (!/(^|\/)verbs\//.test(spec)) return;
-    if (/\/verbs\/types\.js$/.test(spec)) return;
-    if (/\/verbs\/common\.js$/.test(spec) && clause !== null && clause.replace(/\s+/g, " ").trim() === "{ appendEvent }") return;
-    out.push(`imports ${spec}${clause === null ? "" : ` (${clause.replace(/\s+/g, " ").trim()})`}; only types.js and { appendEvent } from common.js are allowed`);
-  };
-  for (const m of code.matchAll(/\b(?:import|export)\b([^;"'`]*?)\bfrom\s*(["'])([^"']+)\2/g)) checkSpec(m[3]!, m[1]!);
-  for (const m of code.matchAll(/\bimport\s*(["'])([^"']+)\1/g)) checkSpec(m[2]!, null);
-  for (const m of code.matchAll(/\b(?:import|require)\s*\(\s*(["'])([^"']+)\1/g)) checkSpec(m[2]!, null);
-  if (/\b(?:import|require)\s*\(\s*[^"'\s]/.test(code)) out.push("imports a module by a non-literal specifier");
-
-  // appendEvent: only direct calls with an object literal whose every kind: is a whitelisted literal
-  for (const m of code.matchAll(/\bappendEvent\b/g)) {
-    const after = code.slice(m.index! + m[0].length).match(/^\s*\(/);
-    if (!after) {
-      // the only bare mention allowed is the unaliased name inside `import { appendEvent } from ...` (checked above)
-      const isImportClause = /import\s*\{\s*$/.test(code.slice(0, m.index!)) && /^\s*\}\s*from\b/.test(code.slice(m.index! + m[0].length));
-      if (!isImportClause) out.push("appendEvent used other than as a direct call");
-      continue;
-    }
-    const open = m.index! + m[0].length + after[0].length - 1;
-    const args = parenBody(code, open);
-    if (args === null) { out.push("appendEvent( call is not balanced"); continue; }
-    if (!/^\s*[A-Za-z_$][\w$]*\s*,\s*\{/.test(args)) out.push("appendEvent( without an object literal argument");
-    if (args.includes("...")) out.push("appendEvent( call contains a spread");
-    if (/[{,]\s*\[/.test(args)) out.push("appendEvent( call contains a computed key");
-    if (/[{,]\s*kind\s*[,}]/.test(args)) out.push("appendEvent( call uses a shorthand kind");
-    const kinds = [...args.matchAll(/(?:^|[\s,{])["'`]?kind["'`]?\s*:\s*([^,}]*)/g)];
-    if (kinds.length === 0) out.push("appendEvent( without a kind");
-    for (const k of kinds) {
-      const v = /^\s*(["'`])([^"'`$\\]*)\1\s*$/.exec(k[1]!);
-      if (!v) out.push(`appendEvent( with a kind that is not a string literal (${k[1]!.trim()})`);
-      else if (!WHITELISTED_KINDS.includes(v[2]!)) out.push(`appendEvent( with kind "${v[2]}" (allowed: ${WHITELISTED_KINDS.join(", ")})`);
-    }
-  }
-  return out;
 }
 
 describe("src/extractor never writes memory (static)", () => {
@@ -190,6 +71,16 @@ describe("src/extractor never writes memory (static)", () => {
       ["copy", `copy nodes from stdin`],
       ["truncate", `truncate table edges`],
       ["a cte write", `with x as (insert into events (a) values (1) returning id) select * from x`],
+      ["insert into relations", `await tx.query("insert into relations (mind_id, subject) values ('a', 'b')")`],
+      ["update relations", `await tx.query("update relations set note = 'x'")`],
+      ["delete from drive_state", `await tx.query("delete from drive_state where true")`],
+      ["update drive_state, quoted", `await tx.query('update public."drive_state" set level = 1')`],
+      ["insert into attention_pins", `await tx.query("insert into attention_pins (a) values (1)")`],
+      ["update dream_preferences", `await tx.query("update dream_preferences set a = 1")`],
+      ["insert into dreams", `await tx.query("insert into dreams (id) values (1)")`],
+      ["update dreams", `await tx.query("update dreams set status = 'faded'")`],
+      ["insert into metabolise_queue", `await tx.query("insert into metabolise_queue (mind_id) values ('a')")`],
+      ["delete from metabolise_queue", `await tx.query("delete from metabolise_queue where true")`],
       ["insert into repair_work", `await tx.query("insert into repair_work (a) values (1)")`],
       ["insert into repair_work, quoted and qualified", `await tx.query('INSERT INTO public."repair_work" (a)')`],
       ["delete from repair_work", `await tx.query("delete from repair_work where true")`],
@@ -253,6 +144,15 @@ describe("src/extractor never writes memory (static)", () => {
       expect(violations(`await tx.query("select id from nodes where id = $1"); await tx.query("select * from events e join edges d on true")`)).toEqual([]);
       expect(violations(`on conflict (id) do update set status = excluded.status`)).toEqual([]);
     });
+    it("updating a metabolise_queue row's status, and reading the tables it may not write", () => {
+      expect(violations(`await tx.query("update metabolise_queue set status = 'done', done_at = now() where id = $1")`)).toEqual([]);
+      expect(violations(`await tx.query("select subject, state from relations where mind_id = $1"); await tx.query("select relations from dream_preferences"); await tx.query("select 1 from dreams")`)).toEqual([]);
+    });
+    it("the dream directory's own table list lets dreams be laid and decided, and still bars the rest", () => {
+      expect(violations(`await tx.query("insert into dreams (id) values (1)"); await tx.query("update dreams set status = 'faded'")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES)).toEqual([]);
+      expect(violations(`await tx.query("insert into relations (a) values (1)")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES).length).toBeGreaterThan(0);
+      expect(violations(`await tx.query("update drive_state set a = 1")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES).length).toBeGreaterThan(0);
+    });
     it("mentions in comments", () => {
       expect(violations(`// never insert into nodes here\n/* appendEvent(ctx, { kind: "observe" }) and registry */\nconst x = 1;`)).toEqual([]);
     });
@@ -305,4 +205,47 @@ describe("src/extractor never writes memory (runtime)", () => {
     expect(kinds.length).toBeGreaterThan(0);
     for (const k of kinds) expect(WHITELISTED_KINDS).toContain(k);
   });
+
+  for (const stage of ["shadow", "propose"] as const) {
+    it(`the metabolise pass at ${stage} proposes but leaves nodes, edges, relations and drive_state byte-identical`, async () => {
+      const now = new Date(Date.now() + 1000);
+      const run = (name: string, input: Record<string, unknown>) =>
+        runVerb({ pool, registry, now: () => now, embedder: NONE_EMBEDDER }, { bearer: "alpha", grants: {} }, name, { mind_id: "alpha", ...input }) as Promise<any>;
+      const as = (sql: string, params: unknown[] = []) => queryAs(pool, "alpha", "alpha", sql, params);
+      const ns: string[] = [];
+      for (const c of ["one", "two"]) ns.push((await as(`insert into nodes (mind_id, node_type, label, content, written_by) values ('alpha', 'observation', $1, $1, 'alpha') returning id`, [c])).rows[0].id);
+      await as(`insert into edges (mind_id, edge_type, written_by, source_node_id, target_node_id) values ('alpha', 'related_to', 'alpha', $1, $2)`, ns);
+      expect((await run("mind_relate", { operation: "set", subject: "Rowan", state: "close", intensity: 0.7, note: "Old friend." })).ok).toBe(true);
+      expect((await run("mind_drive", { operation: "nudge", drive: "play", axis: "intensity", delta: 1 })).ok).toBe(true);
+      await setExtractorState(admin, "alpha", "enable", { stage, schedule: "23:59" });
+      const queued = await run("mind_metabolise", { turns: [{ speaker: "other", name: "Rowan", text: "I got the job." }, { speaker: "self", text: "I am so glad." }] });
+      expect(queued.ok).toBe(true);
+
+      const snap = async () => ({
+        nodes: (await admin.query("select to_jsonb(n)::text j from nodes n order by id")).rows.map((r) => r.j),
+        edges: (await admin.query("select to_jsonb(e)::text j from edges e order by id")).rows.map((r) => r.j),
+        relations: (await admin.query("select to_jsonb(r)::text j from relations r order by mind_id, subject")).rows.map((r) => r.j),
+        drive_state: (await admin.query("select to_jsonb(d)::text j from drive_state d order by mind_id, context, drive")).rows.map((r) => r.j),
+      });
+      const before = await snap();
+      expect(before.relations.length).toBeGreaterThan(0);
+      expect(before.drive_state.length).toBeGreaterThan(0);
+      const maxSeq = (await admin.query("select max(seq)::bigint s from events")).rows[0].s;
+
+      const metaboliser: Metaboliser = {
+        name: "fake",
+        model: "fake-model",
+        async metabolise() {
+          return { kind: "answer" as const, feelings: [{ emotion: "joy", weight: "medium", pillar: "bond", content: "I felt joy for Rowan." }], relations: [{ subject: "Rowan", note: "Starts a new job.", warmth: true }] };
+        },
+      };
+      const reports = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, metaboliser, now: () => now }, { trigger: "manual", minds: ["alpha"], passes: [noticeMetabolise] });
+      expect(reports[0]!.passes[0]).toMatchObject({ ok: true, changed: 2 }); // not vacuous: a feeling and a relation were proposed
+      expect((await admin.query("select count(*)::int c from noticings where stage = $1", [stage])).rows[0].c).toBe(2);
+
+      expect(await snap()).toEqual(before);
+      const kinds = (await admin.query("select distinct kind from events where seq > $1", [maxSeq])).rows.map((r) => r.kind);
+      expect(kinds).toEqual(["notice.proposed"]);
+    });
+  }
 });

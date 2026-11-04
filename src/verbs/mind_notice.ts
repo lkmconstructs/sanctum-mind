@@ -4,15 +4,18 @@
 import { z } from "zod";
 import { err, ok, type Result } from "../result.js";
 import { defineVerb, type VerbContext } from "./types.js";
-import { appendEvent, deriveLabel, mindIdSchema, text, uuidSchema, nodeLockKey } from "./common.js";
+import { appendEvent, deriveLabel, mindIdSchema, nonBlankText, text, uuidSchema, nodeLockKey } from "./common.js";
 import { DISTILLATION_NODE, IDENTITY_NODE, MEMORY_MIND_ONLY, PATTERN_NODE, VOW_NODE, insertSelfNode, supersedeNode } from "./self_common.js";
 import { LINK_EDGE_TYPES, linkNodes } from "./mind_link.js";
 import { recordRepairWork } from "./repair_work.js";
+import { observeAsMind } from "./mind_observe.js";
+import { setRelation } from "./mind_relate.js";
+import { nudgeDrive } from "./drives.js";
 import {
   REPAIR_DECISIONS, noticeAcceptedPayload, noticeRejectedPayload, repairKeptPayload, repairRethoughtPayload, repairRetiredPayload,
 } from "./notice_events.js";
 
-const KINDS = ["link", "pattern", "distillation", "repair"] as const;
+const KINDS = ["link", "pattern", "distillation", "repair", "feeling", "relation"] as const;
 const SNIPPET = 240;
 
 const schema = z.strictObject({
@@ -32,6 +35,12 @@ const schema = z.strictObject({
   /** accept (link): edge type and weight; default the proposal's edge_type and 0.5 */
   edge_type: z.enum(LINK_EDGE_TYPES).optional(),
   weight: z.number().min(0).max(1).optional(),
+  /** accept (feeling): extra charge tags beside the emotion, which is always the first */
+  charge: z.array(nonBlankText(64)).max(15).optional(),
+  /** accept (relation): the mind's own wording of the note to add; the state and intensity to set (a new relation needs a state; an existing one keeps its own unless given) */
+  note: text(4000).optional(),
+  state: text(200).optional(),
+  intensity: z.number().min(0).max(1).optional(),
   /** reject: why; recorded on the event */
   reason: text(4000).optional(),
 }).superRefine((v, c) => {
@@ -115,7 +124,10 @@ export async function listNoticings(
     );
     for (const n of nodes.rows) snippets.set(n.id, { id: n.id, type: "node", snippet: n.s });
     const events = await ctx.tx.query<{ id: string; s: string }>(
-      `select id, left(coalesce(payload->>'content', payload->>'text', ''), ${SNIPPET}) as s from events
+      `select id, case when jsonb_typeof(payload->'turns') = 'array'
+                       then 'stretch of ' || jsonb_array_length(payload->'turns') || (case when jsonb_array_length(payload->'turns') = 1 then ' turn' else ' turns' end)
+                       else left(coalesce(payload->>'content', payload->>'text', ''), ${SNIPPET}) end as s
+         from events
         where mind_id = $1 and id = any($2::uuid[])`,
       [ctx.mind_id, ids],
     );
@@ -170,10 +182,12 @@ async function sourceNodeIds(ctx: VerbContext, sources: string[]): Promise<strin
 export const mind_notice = defineVerb({
   name: "mind_notice",
   description:
-    "What the extractor noticed. list: pending proposals (links, patterns, distillations) ranked by score; shown only when the operator " +
+    "What the extractor noticed. list: pending proposals (links, patterns, distillations, and the feelings and relations metabolised from stretches of conversation) ranked by score; shown only when the operator " +
     "has enabled the extractor at stage propose. Repairs are also listed, first, whenever one is pending: when a node you relied on was rewritten or retired, " +
     "each node that depended on it is put to you. accept and reject are for the mind acting as itself: accepting authors the memory " +
     "(a link edge, a pattern node, a distillation node) as the mind, with provenance to the proposal and its sources; the sources are never changed. " +
+    "A feeling is accepted as an observation in your own words (content to edit, charge to add tags); a relation as a note on that person " +
+    "(note to edit, state and intensity to set; a person you do not yet hold needs a state), with its alias recorded. " +
     "A repair is accepted with a decision: keep (it still holds), rethink (give the new wording in content) or retire. " +
     "Rejecting records the reason and removes nothing but the proposal.",
   schema,
@@ -181,6 +195,22 @@ export const mind_notice = defineVerb({
   mindOnly: (input) => input.operation === "accept" || input.operation === "reject",
   mindOnlyMessage: MEMORY_MIND_ONLY,
   embedText: (input) => (input.operation === "accept" ? (input.content ?? null) : null),
+  // Accepting a feeling without the mind's own words stores the proposal's content as an observation, so that is what is embedded (the
+  // proposal is read before the write transaction; its payload is immutable). Only a feeling that the handler could accept is looked up:
+  // pending, stage propose, not past its expiry, the operator's stage for the mind propose. Every other kind returns null.
+  embedTextFrom: (input) => {
+    if (input.operation !== "accept" || input.content !== undefined || input.noticing_id === undefined) return null;
+    const noticing = input.noticing_id;
+    return async (read, now) => {
+      const r = await read<{ content: unknown }>(
+        `select n.payload->>'content' as content from noticings n join extractor_state s on s.mind_id = n.mind_id
+          where n.id = $1 and n.mind_id = $2 and n.kind = 'feeling' and n.stage = 'propose' and n.status = 'pending' and n.expires_at > $3 and s.stage = 'propose'`,
+        [noticing, input.mind_id, now],
+      );
+      const c = r[0]?.content;
+      return typeof c === "string" && c.trim() !== "" ? c : null;
+    };
+  },
   handler: async (ctx, input): Promise<Result<unknown>> => {
     if (input.operation === "list") {
       return ok({ projection: await listNoticings(ctx, { kind: input.kind, limit: input.limit }) });
@@ -212,6 +242,12 @@ export const mind_notice = defineVerb({
       const st = await ctx.tx.query<{ stage: string }>(`select stage from extractor_state where mind_id = $1`, [ctx.mind_id]);
       if (st.rows[0]?.stage !== "propose") return err("conflict", "the extractor is not at stage propose", "noticing_id");
     }
+    if (n.kind !== "relation") {
+      if (input.note !== undefined) return err("invalid_input", "note applies to relation proposals only", "note");
+      if (input.state !== undefined) return err("invalid_input", "state applies to relation proposals only", "state");
+      if (input.intensity !== undefined) return err("invalid_input", "intensity applies to relation proposals only", "intensity");
+    }
+    if (n.kind !== "feeling" && input.charge !== undefined) return err("invalid_input", "charge applies to feeling proposals only", "charge");
     if (n.kind === "repair") return decideRepair(ctx, n, input);
     if (input.decision !== undefined) return err("invalid_input", "decision applies to repair proposals only", "decision");
     if (input.label !== undefined) return err("invalid_input", "label applies to repair proposals (rethink) only", "label");
@@ -261,6 +297,9 @@ export const mind_notice = defineVerb({
 
     if (input.edge_type !== undefined) return err("invalid_input", "edge_type applies to link proposals only", "edge_type");
     if (input.weight !== undefined) return err("invalid_input", "weight applies to link proposals only", "weight");
+
+    if (n.kind === "feeling") return acceptFeeling(ctx, n, input);
+    if (n.kind === "relation") return acceptRelation(ctx, n, input);
 
     const content = input.content ?? str(n.kind === "pattern" ? n.payload.summary : n.payload.content);
     if (content === null || content.trim() === "") {
@@ -318,6 +357,100 @@ export const mind_notice = defineVerb({
     return ok({ event_id: ev.id, projection: { noticing_id: id, status: "accepted", node_id, distill_event_id: distill.id } });
   },
 });
+
+/**
+ * Accepting a feeling: an observation authored by the mind (mind_observe's own write path), in the mind's wording (`content`) or the
+ * proposal's, charged with the emotion first and then any tags the mind adds, context "metabolised", the node's metadata naming the
+ * proposal and its sources. The stretch it came from is not changed. `notice.accepted` carries ids only.
+ */
+async function acceptFeeling(ctx: VerbContext, n: NoticingRow, input: z.infer<typeof schema>): Promise<Result<unknown>> {
+  const id = n.id;
+  const content = input.content ?? str(n.payload.content);
+  if (content === null || content.trim() === "") return err("invalid_input", "this proposal carries no content: pass content", "content");
+  const emotion = str(n.payload.emotion);
+  const charge = [...new Set([...(emotion === null ? [] : [emotion]), ...(input.charge ?? [])])];
+  if (charge.length === 0) return err("invalid_input", "a feeling needs a charge: pass charge", "charge");
+  const observed = await observeAsMind(ctx, {
+    content,
+    texture: { charge },
+    context: "metabolised",
+    metadata: { noticing_id: id, sources: n.sources },
+  });
+  if (!observed.ok) return observed;
+  const { event_id, node_id } = observed.receipt.projection as { event_id: string; node_id: string };
+  const ev = await appendEvent(ctx, {
+    kind: "notice.accepted",
+    subject_id: id,
+    payload: noticeAcceptedPayload.parse({
+      noticing_id: id, kind: "feeling", sources: n.sources, observe_event_id: event_id, node_id,
+      edited: input.content !== undefined && input.content !== str(n.payload.content),
+    }),
+  });
+  await decide(ctx, id, "accepted", ev);
+  return ok({ event_id: ev.id, projection: { noticing_id: id, status: "accepted", node_id, observe_event_id: event_id } });
+}
+
+/**
+ * Accepting a relation: a standing relation set by the mind (setRelation, the write path of `mind_relate set`) with the note, the
+ * alias recorded, and, when the proposal carried warmth, a nudge to `connection` satisfaction. A relation the mind already holds keeps
+ * its state and intensity unless given, and the note is appended on a new line; a new relation needs a state. `notice.accepted`
+ * carries ids only: no name, note or alias.
+ */
+async function acceptRelation(ctx: VerbContext, n: NoticingRow, input: z.infer<typeof schema>): Promise<Result<unknown>> {
+  const id = n.id;
+  if (input.content !== undefined) return err("invalid_input", "content applies to pattern, distillation and feeling proposals; a relation takes note", "content");
+  const subject = str(n.payload.subject);
+  const proposedNote = input.note ?? str(n.payload.note);
+  if (subject === null || proposedNote === null || proposedNote.trim() === "") return err("conflict", "this relation proposal is malformed", "noticing_id");
+  const alias = str(n.payload.alias);
+
+  await ctx.tx.query("select pg_advisory_xact_lock(hashtext('relation:' || $1 || ':' || $2))", [ctx.mind_id, subject]);
+  const cur = await ctx.tx.query<{ state: string; intensity: number; note: string | null; aliases: string[]; cleared_at: Date | null }>(
+    `select state, intensity, note, aliases, cleared_at from relations where mind_id = $1 and subject = $2`,
+    [ctx.mind_id, subject],
+  );
+  const row = cur.rows[0];
+  // A cleared relation is a new one as far as state, intensity and note go (the mind is re-opening it, so it must say how), but the
+  // aliases the cleared row held are still the mind's and are merged with, never replaced.
+  const have = row !== undefined && row.cleared_at === null ? row : undefined;
+  let state: string;
+  let intensity: number;
+  let note: string;
+  if (have) {
+    state = input.state ?? have.state;
+    intensity = input.intensity ?? have.intensity;
+    note = have.note !== null && have.note.trim() !== "" ? `${have.note}\n${proposedNote}` : proposedNote;
+    if (note.length > 4000) return err("invalid_input", "the relation's note would pass 4000 characters; rewrite it with mind_relate set first", "note");
+  } else {
+    if (input.state === undefined) return err("invalid_input", "a new relation needs a state", "state");
+    state = input.state;
+    intensity = input.intensity ?? 0.5;
+    note = proposedNote;
+  }
+  const known = row?.aliases ?? [];
+  const addAlias = alias !== null && !known.some((a) => a.toLowerCase() === alias.toLowerCase()) && alias.toLowerCase() !== subject.toLowerCase();
+  const set = await setRelation(ctx, { subject, state, intensity, note, ...(addAlias ? { aliases: [...known, alias!] } : {}) });
+
+  let drive_event_id: string | undefined;
+  if (n.payload.warmth === true) {
+    const nudged = await nudgeDrive(ctx, { context: "", drive: "connection", axis: "satisfaction", delta: 0.5, source: "metabolised", note: id });
+    drive_event_id = nudged.event_id;
+  }
+  const ev = await appendEvent(ctx, {
+    kind: "notice.accepted",
+    subject_id: id,
+    payload: noticeAcceptedPayload.parse({
+      noticing_id: id, kind: "relation", sources: n.sources, relate_event_id: set.event.id,
+      ...(drive_event_id === undefined ? {} : { drive_event_id }),
+      edited: input.note !== undefined && input.note !== str(n.payload.note),
+    }),
+  });
+  await decide(ctx, id, "accepted", ev);
+  return ok({
+    event_id: ev.id,
+    projection: { noticing_id: id, status: "accepted", relate_event_id: set.event.id, ...(drive_event_id === undefined ? {} : { drive_event_id }) },
+  });
+}
 
 async function insertProvenanceEdge(
   ctx: VerbContext,

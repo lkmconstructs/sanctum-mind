@@ -8,6 +8,7 @@ import type { VerbContext } from "./types.js";
 import { mindIdSchema, text } from "./common.js";
 import { bookkeepingExcluded } from "../extractor/events.js";
 import { listNoticings, pendingRepairs, repairsByUpstream } from "./mind_notice.js";
+import { listDreams } from "./mind_dream.js";
 
 const lim = (def: number, max = 100) => z.number().int().min(1).max(max).default(def);
 
@@ -41,7 +42,7 @@ async function compose(ctx: VerbContext, name: string, input: Record<string, unk
 export const mind_orient = defineVerb<typeof schema, unknown>({
   name: "mind_orient",
   description:
-    "Wake: compose identity, vows, state, handoff, health and (deeper) loops, threads, tasks, relations, drives, inbox, weather, anchors, attention (the top seven things it is carrying, with pins), noticings (when the operator has the extractor at stage propose), repairs (pending), desires, holdings, recent events and daemon orphan sightings into one read. Appends no event.",
+    "Wake: compose identity, vows, state, handoff, health and (deeper) loops, threads, tasks, relations, drives, inbox, weather, anchors, attention (the top seven things it is carrying, with pins), noticings (when the operator has the extractor at stage propose), repairs (pending), dream (the newest waiting, when the operator has dreaming at stage propose), desires, holdings, recent events and daemon orphan sightings into one read. Appends no event.",
   schema,
   scopeFor: () => "read",
   handler: async (ctx, input) => {
@@ -94,6 +95,14 @@ export const mind_orient = defineVerb<typeof schema, unknown>({
         },
         // repairs waiting for the mind (a node it relied on was rewritten or retired); shown whatever the extractor's state, with the top 5 upstreams by count
         { key: "repairs", run: async (c) => ({ pending: await pendingRepairs(c), by_upstream: await repairsByUpstream(c, 5) }) },
+        // the newest dream waiting for the mind, as a bare array of at most one (dreaming at stage propose; a shadow dream is never shown); [] when none or off
+        {
+          key: "dream",
+          run: async (c) => {
+            if (!c.registry.some((v) => v.name === "mind_dream")) return [];
+            return (await listDreams(c, 1)).dreams.map((d) => ({ id: d.id, content: d.content, question: d.question, fades_at: d.fades_at }));
+          },
+        },
       );
     }
     if (full) {
