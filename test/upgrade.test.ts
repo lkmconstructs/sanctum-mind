@@ -194,8 +194,8 @@ describe("upgrade on a fresh database", () => {
     expect(d.r.applied).toEqual([]);
     expect(d.r.pending).toEqual(await allFiles());
     expect(d.text).toContain("dry run");
-    expect(d.text).toContain("pending (28): 0001_core.sql ... 0028_dream_guards.sql");
-    expect(d.text).toContain("would apply 28 migration(s)");
+    expect(d.text).toContain("pending (29): 0001_core.sql ... 0029_metabolism.sql");
+    expect(d.text).toContain("would apply 29 migration(s)");
     expect(d.text).toContain("repair work is checked for every mind once 0025 is applied");
     expect(d.text).toContain("you would still need to:");
     expect(d.text).toContain("(0026) no login on");
@@ -223,9 +223,9 @@ describe("upgrade from 0024", () => {
     const db = await at0024();
     const { r, text } = await upgrade();
     expect(r.pending).toEqual([]);
-    expect(r.applied).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql"]);
+    expect(r.applied).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql", "0029_metabolism.sql"]);
     expect(text).toContain("24 migration(s) applied, schema 0024_attention");
-    expect(text).toContain("pending (4): 0025_repair_work.sql, 0026_lanes.sql, 0027_dreaming.sql, 0028_dream_guards.sql");
+    expect(text).toContain("pending (5): 0025_repair_work.sql, 0026_lanes.sql, 0027_dreaming.sql, 0028_dream_guards.sql, 0029_metabolism.sql");
     expect(text).toContain("alpha: 1 repair work row(s) added");
     expect(text).not.toContain("beta:"); // nothing outstanding for beta
     expect(r.backfilled).toEqual([{ mind: "alpha", count: 1 }]);
@@ -281,7 +281,7 @@ describe("upgrade from 0024", () => {
     const db = await at0024();
     await setLogins(true);
     const { r, text } = await upgrade({ noBackfill: true });
-    expect(r.applied).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql"]);
+    expect(r.applied).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql", "0029_metabolism.sql"]);
     expect(r.backfilled).toEqual([]);
     expect(text).toContain("backfill: skipped (--no-backfill)");
     expect(text.indexOf("still needs you:")).toBeLessThan(text.indexOf("sanctum-mind extractor repair-backfill --mind alpha"));
@@ -298,7 +298,7 @@ describe("upgrade from 0024", () => {
     const db = await at0024();
     const { r, text } = await upgrade({ dryRun: true });
     expect(r.exitCode).toBe(0);
-    expect(text).toContain("would apply 4 migration(s)");
+    expect(text).toContain("would apply 5 migration(s)");
     expect(text).toContain("repair work is checked for every mind once 0025 is applied");
     expect(text).toContain("you would still need to:\n  1. (0026) no login on");
     expect((await db.query("select count(*)::int as n from schema_migrations")).rows[0].n).toBe(24);
@@ -352,7 +352,7 @@ describe("migrations that refuse", () => {
     await db.query(stmt);
     const ok = await upgrade();
     expect(ok.r.applied).toContain("0020_proposals_guard.sql");
-    expect((await db.query("select count(*)::int as n from schema_migrations")).rows[0].n).toBe(28);
+    expect((await db.query("select count(*)::int as n from schema_migrations")).rows[0].n).toBe(29);
   });
 
   it("prints the database's detail when a migration refuses", async () => {
@@ -369,14 +369,14 @@ describe("a database newer than the build", () => {
   async function withFutureRow(): Promise<Pool> {
     const db = track(await resetDatabase());
     admin = db;
-    await db.query("insert into schema_migrations (filename, checksum) values ('0027_future.sql', 'x')");
+    await db.query("insert into schema_migrations (filename, checksum) values ('0030_future.sql', 'x')");
     return db;
   }
 
   it("upgrade reports it, says there is no downgrade, and exits through an error", async () => {
     await withFutureRow();
     const lines: string[] = [];
-    await expect(runUpgrade({ databaseUrl: url(), dryRun: false, noBackfill: false }, (l) => lines.push(l))).rejects.toThrow(/does not carry \(0027_future\.sql\).*There is no downgrade/);
+    await expect(runUpgrade({ databaseUrl: url(), dryRun: false, noBackfill: false }, (l) => lines.push(l))).rejects.toThrow(/does not carry \(0030_future\.sql\).*There is no downgrade/);
     await expect(runUpgrade({ databaseUrl: url(), dryRun: true, noBackfill: false }, () => undefined)).rejects.toThrow(/There is no downgrade/);
   });
 
@@ -450,11 +450,11 @@ describe("startup refuses a database that is behind", () => {
     admin = track(await resetDatabase());
     const pool = track(appPool());
     await expect(assertSchemaCurrent(pool)).resolves.toBeUndefined();
-    await admin.query("delete from schema_migrations where filename in ('0025_repair_work.sql', '0026_lanes.sql', '0027_dreaming.sql', '0028_dream_guards.sql')");
+    await admin.query("delete from schema_migrations where filename in ('0025_repair_work.sql', '0026_lanes.sql', '0027_dreaming.sql', '0028_dream_guards.sql', '0029_metabolism.sql')");
     const e = await assertSchemaCurrent(pool).catch((x) => x);
     expect(e).toBeInstanceOf(SchemaBehind);
-    expect(e.message).toBe("database is 4 migration(s) behind: run `sanctum-mind upgrade` with the admin URL");
-    expect((await schemaStatus(pool)).pending).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql"]);
+    expect(e.message).toBe("database is 5 migration(s) behind: run `sanctum-mind upgrade` with the admin URL");
+    expect((await schemaStatus(pool)).pending).toEqual(["0025_repair_work.sql", "0026_lanes.sql", "0027_dreaming.sql", "0028_dream_guards.sql", "0029_metabolism.sql"]);
   });
 
   it("a login that cannot read schema_migrations is told to upgrade", async () => {
@@ -470,7 +470,7 @@ describe("startup refuses a database that is behind", () => {
 
   it("http, stdio and daemon each refuse to start when the last migration is missing", async () => {
     admin = track(await resetDatabase());
-    await admin.query("delete from schema_migrations where filename = '0028_dream_guards.sql'");
+    await admin.query("delete from schema_migrations where filename = '0029_metabolism.sql'");
     const env = { ...process.env, DATABASE_URL: laneUrl("verb"), EMBEDDER: "none", SANCTUM_BEARER: "alpha-test-key", PORT: "0" };
     const daemonEnv = { ...env, DATABASE_URL: laneUrl("daemon") };
     const cli = path.join(ROOT, "src/cli.ts");
@@ -527,9 +527,9 @@ describe("version in mind_health and GET /health", () => {
     const r: any = await runVerb({ pool, registry }, { bearer: "alpha", grants: {} }, "mind_health", { mind_id: "alpha" });
     expect(r.ok).toBe(true);
     expect(r.receipt.projection.version).toEqual({ package: packageInfo().version, schema: files[files.length - 1]!.replace(/\.sql$/, ""), pending: 0 });
-    await admin.query("delete from schema_migrations where filename = '0028_dream_guards.sql'");
+    await admin.query("delete from schema_migrations where filename = '0029_metabolism.sql'");
     const behind: any = await runVerb({ pool, registry }, { bearer: "alpha", grants: {} }, "mind_health", { mind_id: "alpha" });
-    expect(behind.receipt.projection.version).toEqual({ package: packageInfo().version, schema: "0027_dreaming", pending: 1 });
+    expect(behind.receipt.projection.version).toEqual({ package: packageInfo().version, schema: "0028_dream_guards", pending: 1 });
   });
 
   it("mind_health still answers when the login cannot read schema_migrations", async () => {

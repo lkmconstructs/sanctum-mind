@@ -175,12 +175,12 @@ const runsOf = (pass: string) => A(`select * from extractor_runs where pass = $1
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("the passes are registered, separately", () => {
-  it("notice.expire and notice.repair are among the thirteen deterministic passes; extract, train and dream.generate are the model-backed ones, run after them", () => {
+  it("notice.expire and notice.repair are among the thirteen deterministic passes; extract, train, dream.generate and metabolise are the model-backed ones, run after them", () => {
     expect(PASSES).toHaveLength(13);
     expect(PASSES.map((p) => p.name)).toContain("notice.expire");
-    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train", "dream.generate"]);
-    expect(ALL_PASSES).toHaveLength(16);
-    expect(EXTRACTOR_PASSES.map((p) => p.name)).toEqual(["notice.expire", "notice.repair", "notice.extract", "notice.train"]);
+    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train", "dream.generate", "notice.metabolise"]);
+    expect(ALL_PASSES).toHaveLength(17);
+    expect(EXTRACTOR_PASSES.map((p) => p.name)).toEqual(["notice.expire", "notice.repair", "notice.extract", "notice.train", "notice.metabolise"]);
     expect(PASSES.some((p) => MODEL_PASSES.includes(p))).toBe(false);
   });
 });
@@ -260,7 +260,7 @@ describe("notice.extract: when it runs", () => {
     expect(await runsOf("notice.extract")).toHaveLength(0);
     // beta never enabled it: its run is a skip with no rows
     const b = await runDaemonOnce({ pool, embedder: FAKE_EMBEDDER, now: () => clock }, { trigger: "manual", minds: ["beta"], passes: MODEL_PASSES });
-    expect(b[0]!.passes.map((x) => [x.pass, x.ok, x.changed])).toEqual([["notice.extract", true, 0], ["notice.train", true, 0], ["dream.generate", true, 0]]);
+    expect(b[0]!.passes.map((x) => [x.pass, x.ok, x.changed])).toEqual([["notice.extract", true, 0], ["notice.train", true, 0], ["dream.generate", true, 0], ["notice.metabolise", true, 0]]);
     expect(await A("select 1 from extractor_runs")).toHaveLength(0);
   });
 });
@@ -629,9 +629,9 @@ describe("notice.extract: the stage 1 runtime guard still holds with everything 
     const kinds = (await A("select distinct kind from events where seq > $1", [maxSeq])).map((r) => r.kind);
     expect(kinds.length).toBeGreaterThan(0);
     for (const k of kinds) expect(WHITELISTED_KINDS).toContain(k);
-    // and the run goes through the same path as a normal tick: all fourteen passes, none failing
+    // and the run goes through the same path as a normal tick: all seventeen passes, none failing
     const tick = await runDaemonOnce({ pool, embedder: FAKE_EMBEDDER, reranker: byWords, now: () => at(DAY) }, { trigger: "manual", minds: ["alpha"] });
-    expect(tick[0]!.passes).toHaveLength(16);
+    expect(tick[0]!.passes).toHaveLength(17);
     expect(tick[0]!.ok).toBe(true);
   });
 });
@@ -841,8 +841,8 @@ describe("features and scorer", () => {
   const src = (o: Partial<{ created_at: Date; context: string | null; keys: string[]; charge: string[]; salience: number | null }> = {}) => ({
     created_at: clock, context: null, keys: [], charge: [], salience: null, ...o,
   });
-  it("names exactly the thirteen features (the twelfth was joined by attended), all in 0..1", () => {
-    expect([...FEATURE_NAMES]).toEqual(["rerank", "rerank_missing", "cosine", "recency_days", "shared_context", "charge_overlap", "cooccurrence", "salience_mean", "source_count", "kind_link", "kind_pattern", "kind_distillation", "attended"]);
+  it("names exactly the fifteen features (the twelfth was joined by attended, the last two by metabolism), all in 0..1", () => {
+    expect([...FEATURE_NAMES]).toEqual(["rerank", "rerank_missing", "cosine", "recency_days", "shared_context", "charge_overlap", "cooccurrence", "salience_mean", "source_count", "kind_link", "kind_pattern", "kind_distillation", "attended", "kind_feeling", "kind_relation"]);
     const f = computeFeatures({ kind: "pattern", rerank: 0.4, cosine: 0.7, now: clock, sources: [src({ created_at: at(-10 * DAY) }), src({ created_at: at(-50 * DAY) }), src()] });
     expect(Object.keys(f)).toEqual([...FEATURE_NAMES]);
     for (const v of Object.values(f)) {
@@ -881,7 +881,7 @@ describe("features and scorer", () => {
     expect(sorted[1]![0]).toBe("cosine");
     expect(PRIOR_WEIGHTS.recency_days).toBeLessThan(0);
     expect(Math.abs(PRIOR_WEIGHTS.source_count)).toBeLessThan(0.5);
-    expect([PRIOR_WEIGHTS.kind_link, PRIOR_WEIGHTS.kind_pattern, PRIOR_WEIGHTS.kind_distillation]).toEqual([0, 0, 0]);
+    expect([PRIOR_WEIGHTS.kind_link, PRIOR_WEIGHTS.kind_pattern, PRIOR_WEIGHTS.kind_distillation, PRIOR_WEIGHTS.kind_feeling, PRIOR_WEIGHTS.kind_relation]).toEqual([0, 0, 0, 0, 0]);
     const f = (rerank: number | null, cosine: number) => computeFeatures({ kind: "link", rerank, cosine, now: clock, sources: [{ created_at: clock, context: null, keys: [], charge: [], salience: null }, { created_at: clock, context: null, keys: [], charge: [], salience: null }] });
     const hi = scoreOf(PRIOR_MODEL, f(0.9, 0.8));
     const lo = scoreOf(PRIOR_MODEL, f(0.1, 0.62));

@@ -8,6 +8,7 @@ import type { Embedder } from "../verbs/types.js";
 import { NONE_RERANKER } from "../rerank/none.js";
 import type { Reranker } from "../rerank/types.js";
 import { NONE_DREAMER, type Dreamer } from "../dream/dreamer.js";
+import { NONE_METABOLISER, type Metaboliser } from "../extractor/metaboliser.js";
 import { checkExtractorEnv } from "../extractor/config.js";
 import type { SinkConfig } from "../sinks/types.js";
 import { getDaemonConfig, resolveDaemonConfig, type DaemonConfig } from "./config.js";
@@ -27,6 +28,8 @@ export interface DaemonDeps {
   reranker?: Reranker;
   /** the dreamer for dream.generate; the `none` dreamer when unset */
   dreamer?: Dreamer;
+  /** the metaboliser for notice.metabolise; the `none` metaboliser when unset */
+  metaboliser?: Metaboliser;
   /** outbox sinks the outbox.deliver pass delivers to; default none */
   sinks?: SinkConfig[];
   coolingMs?: number;
@@ -112,7 +115,7 @@ async function runPass(
     const result = isDetached(pass)
       ? await pass.run({
           pool: deps.pool, mind_id: mind, now, sinks: deps.sinks ?? [], config,
-          embedder: deps.embedder, reranker: deps.reranker ?? NONE_RERANKER, dreamer: deps.dreamer ?? NONE_DREAMER, inTx,
+          embedder: deps.embedder, reranker: deps.reranker ?? NONE_RERANKER, dreamer: deps.dreamer ?? NONE_DREAMER, metaboliser: deps.metaboliser ?? NONE_METABOLISER, inTx,
         })
       : await inTx("write", (ctx) => pass.run(ctx));
     return {

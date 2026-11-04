@@ -10,7 +10,7 @@ import { z } from "zod";
  * extra key, so a payload cannot grow a text field unnoticed; the passes parse through these before appending, and
  * test/notice.test.ts parses every `notice.*` event in the ledger against them.
  */
-const kindOfNoticing = z.enum(["link", "pattern", "distillation", "repair"]);
+const kindOfNoticing = z.enum(["link", "pattern", "distillation", "repair", "feeling", "relation"]);
 const stageOfNoticing = z.enum(["shadow", "propose"]);
 
 export const noticeProposedPayload = z.strictObject({

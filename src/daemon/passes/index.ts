@@ -13,6 +13,7 @@ import { embeddingsBackfill } from "./embeddings_backfill.js";
 import { lettersExpire } from "./letters_expire.js";
 import { noticeExpire } from "../../extractor/expire.js";
 import { noticeExtract } from "../../extractor/extract.js";
+import { noticeMetabolise } from "../../extractor/metabolise.js";
 import { noticeRepair } from "../../extractor/repair.js";
 import { noticeTrain } from "../../extractor/train.js";
 import { outboxDeliver } from "./outbox_deliver.js";
@@ -38,10 +39,10 @@ export const PASSES: readonly AnyPass[] = [
 
 /**
  * The model-backed passes, listed apart from the thirteen deterministic ones: the extractor's two run only for a mind whose
- * extractor the operator has enabled, and dream.generate only for one whose dreaming is enabled, each at most once a day at its schedule. They run after PASSES in a normal tick, and
+ * extractor the operator has enabled, dream.generate only for one whose dreaming is enabled, each at most once a day at its schedule, and notice.metabolise for one whose extractor is enabled and not paused, every tick that stretches are queued. They run after PASSES in a normal tick, and
  * report a "skipped" note when there is nothing to do.
  */
-export const MODEL_PASSES: readonly AnyPass[] = [noticeExtract, noticeTrain, dreamGenerate];
+export const MODEL_PASSES: readonly AnyPass[] = [noticeExtract, noticeTrain, dreamGenerate, noticeMetabolise];
 
 /** What a normal tick runs: the deterministic passes, then the model-backed ones. */
 export const ALL_PASSES: readonly AnyPass[] = [...PASSES, ...MODEL_PASSES];

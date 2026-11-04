@@ -110,6 +110,19 @@ export const mind_health = defineVerb({
       laid: ds.rows[0]?.stage === "propose" ? Number(laid.rows[0]!.n) : 0,
       last_run: dr.rows[0] ? { pass: "dream.generate", started_at: dr.rows[0].started_at, ok: dr.rows[0].ok, skipped: dr.rows[0].skipped } : null,
     };
-    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, version, counts, last_daemon_run, outbox, extractor, dreaming } });
+    // metabolism: the stretches waiting for, and worked through by, notice.metabolise (counts only; never the text)
+    const mq = await ctx.tx.query<{ status: string; n: string }>(`select status, count(*) as n from metabolise_queue where mind_id = $1 group by status`, [ctx.mind_id]);
+    const mqn = (s: string): number => Number(mq.rows.find((r) => r.status === s)?.n ?? 0);
+    const mr = await ctx.tx.query<{ started_at: Date; ok: boolean }>(
+      `select started_at, ok from extractor_runs where mind_id = $1 and pass = 'notice.metabolise' order by started_at desc limit 1`,
+      [ctx.mind_id],
+    );
+    const metabolise = {
+      queued: mqn("queued"),
+      done: mqn("done"),
+      failed: mqn("failed"),
+      last_run: mr.rows[0] ? { pass: "notice.metabolise", started_at: mr.rows[0].started_at, ok: mr.rows[0].ok } : null,
+    };
+    return ok({ projection: { db: "up" as const, mind_id: input.mind_id, version, counts, last_daemon_run, outbox, extractor, dreaming, metabolise } });
   },
 });

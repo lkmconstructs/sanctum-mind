@@ -4,6 +4,7 @@
 import type { Pool } from "pg";
 import type { MindMode } from "../../db/pool.js";
 import type { Dreamer } from "../../dream/dreamer.js";
+import type { Metaboliser } from "../../extractor/metaboliser.js";
 import type { Reranker } from "../../rerank/types.js";
 import type { SinkConfig } from "../../sinks/types.js";
 import type { Embedder, VerbContext } from "../../verbs/types.js";
@@ -49,6 +50,8 @@ export interface DetachedPassContext {
   reranker: Reranker;
   /** the configured dreamer (dream.generate); the `none` dreamer when unset */
   dreamer?: Dreamer;
+  /** the configured metaboliser (notice.metabolise); the `none` metaboliser when unset */
+  metaboliser?: Metaboliser;
   /**
    * One short transaction as the mind, marked actor `daemon`, with the same context a transactional pass gets. `write` mode
    * also takes the per-mind daemon advisory lock first, so it never overlaps a transactional pass or another daemon.

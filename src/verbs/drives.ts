@@ -178,3 +178,34 @@ export async function persistDecay(
   }
   return { event_id: ev.id, drives };
 }
+
+export interface NudgeInput {
+  context: string;
+  drive: Drive;
+  axis: Axis;
+  delta: number;
+  source?: string | null | undefined;
+  note?: string | null | undefined;
+}
+
+/**
+ * Adds `delta` to one axis of one drive: the lock, one `drive.nudge` event and the upsert, all at the same instant. The single code
+ * path behind `mind_drive nudge` and the accept of a metabolised relation that carried warmth (mind_notice).
+ */
+export async function nudgeDrive(ctx: VerbContext, i: NudgeInput): Promise<{ event_id: string; drive: DriveView }> {
+  await lockDrive(ctx, i.context, i.drive);
+  const row = (await loadDriveRows(ctx, i.context)).find((r) => r.drive === i.drive);
+  // One instant for the whole write: decay target and stored updated_at (never behind the row).
+  const at = writeInstant(ctx.now(), row ? [row] : []);
+  const cur = levelsAt(row, at);
+  const before = cur[i.axis];
+  const after = clamp10(before + i.delta);
+  const next = { ...cur, [i.axis]: after };
+  const ev = await appendEvent(ctx, {
+    kind: "drive.nudge",
+    payload: { context: i.context, drive: i.drive, axis: i.axis, delta: i.delta, source: i.source ?? null, note: i.note ?? null, before, after },
+    ...(i.context === "" ? {} : { context: i.context }),
+  });
+  const saved = await upsertDrive(ctx, i.context, i.drive, next, ev.id, at);
+  return { event_id: ev.id, drive: driveView(i.drive, levelsAt(saved, saved.updated_at), saved.updated_at) };
+}

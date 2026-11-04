@@ -21,6 +21,7 @@ import { GRANT_USAGE, parseGrantArgs, runGrantCommand } from "./grants-admin.js"
 import { EXTRACTOR_USAGE, parseExtractorArgs, runExtractorCommand } from "./extractor-admin.js";
 import { DREAM_USAGE, parseDreamArgs, runDreamCommand } from "./dream-admin.js";
 import { checkDreamEnv, dreamerFrom, dreamerConfig } from "./dream/index.js";
+import { checkMetaboliseEnv, metaboliserConfig, metaboliserFrom } from "./extractor/index.js";
 import { exportMind, parseExportArgs } from "./export.js";
 import { importMind, parseImportMindArgs } from "./import-mind.js";
 import { formatPurge, parsePurgeArgs, purgeMind } from "./purge.js";
@@ -255,6 +256,8 @@ async function main(): Promise<void> {
       checkExtractorEnv(); // and on a bad EXTRACTOR_TTL_DAYS, EXTRACTOR_REPROPOSE_DAYS or EXTRACTOR_MAX_CANDIDATES
       checkDreamEnv(); // and on a bad DREAMER, DREAM_URL, DREAM_MODEL, DREAM_TTL_DAYS or DREAM_WINDOW_HOURS
       const dreamer = dreamerFrom(dreamerConfig(process.env));
+      checkMetaboliseEnv(); // and on a bad METABOLISER, METABOLISE_URL, METABOLISE_MODEL or METABOLISE_TIMEOUT_MS
+      const metaboliser = metaboliserFrom(metaboliserConfig(process.env));
       const reranker = rerankerFromEnv(process.env); // and on a bad RERANKER, or RERANKER=http without a valid RERANK_URL
       const args = argsOrFail(() => parseDaemonArgs(process.argv.slice(3)));
       const minds = args.mind ? [args.mind] : undefined;
@@ -264,7 +267,7 @@ async function main(): Promise<void> {
       await enforceLane(pool, { command: "daemon", lanes: ["daemon"] });
       const embedder = embedderFromEnv(process.env);
       if (args.once) {
-        const reports = await runDaemonOnce({ pool, embedder, reranker, dreamer, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
+        const reports = await runDaemonOnce({ pool, embedder, reranker, dreamer, metaboliser, sinks: loadSinks(process.env) }, { trigger: "manual", ...(minds ? { minds } : {}) });
         for (const r of reports) {
           const failed = r.passes.filter((p) => !p.ok).map((p) => `${p.pass}: ${p.error ?? "failed"}`);
           const changed = r.passes.reduce((n, p) => n + p.changed, 0);
@@ -282,7 +285,7 @@ async function main(): Promise<void> {
         }
         process.exit(reports.every((r) => r.ok) ? 0 : 2);
       }
-      const handle = startDaemon({ pool, embedder, reranker, dreamer, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
+      const handle = startDaemon({ pool, embedder, reranker, dreamer, metaboliser, sinks: loadSinks(process.env) }, { intervalMinutes: args.interval, ...(minds ? { minds } : {}) });
       console.error(`sanctum-mind: daemon running every ${args.interval} minute(s)${args.mind ? ` for ${args.mind}` : ""}`);
       let stopping = false;
       const stop = async () => {

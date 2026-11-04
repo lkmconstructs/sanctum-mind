@@ -122,10 +122,10 @@ async function twoDependants() {
 }
 
 describe("the pass", () => {
-  it("is the twelfth deterministic pass (dream.fade follows as the thirteenth) and of a normal tick of sixteen", () => {
+  it("is the twelfth deterministic pass (dream.fade follows as the thirteenth) and of a normal tick of seventeen", () => {
     expect(PASSES).toHaveLength(13);
     expect(PASSES[11]!.name).toBe("notice.repair");
-    expect(ALL_PASSES).toHaveLength(16);
+    expect(ALL_PASSES).toHaveLength(17);
     expect(PASSES.some((p) => p.name === "notice.repair" && "detached" in p)).toBe(false);
   });
 

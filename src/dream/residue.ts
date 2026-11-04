@@ -2,6 +2,7 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
 import type { PoolClient } from "pg";
+import { readIdentityCores } from "../extractor/cores.js";
 import { bookkeepingExcluded } from "../extractor/events.js";
 
 /**
@@ -51,10 +52,7 @@ export async function readResidue(tx: PoolClient, mind: string, now: Date, windo
   const from = new Date(now.getTime() - windowHours * 3_600_000);
   const pref = await readPreference(tx, mind);
 
-  const cores = await tx.query<{ content: string }>(
-    `select content from nodes where mind_id = $1 and node_type = 'identity' and invalidated_at is null order by created_at asc`,
-    [mind],
-  );
+  const cores = await readIdentityCores(tx, mind);
 
   const allRelations = await tx.query<{ subject: string; state: string; note: string | null; updated_at: Date }>(
     `select subject, state, note, updated_at from relations where mind_id = $1 and cleared_at is null order by updated_at desc limit 50`,
@@ -123,7 +121,7 @@ export async function readResidue(tx: PoolClient, mind: string, now: Date, windo
   };
 
   return {
-    cores: cores.rows.map((c) => c.content),
+    cores,
     events,
     chargeCounts,
     relations,

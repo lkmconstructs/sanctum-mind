@@ -651,10 +651,10 @@ describe("the pin table guards itself (migrations 0024 and 0025)", () => {
 });
 
 describe("surfaces", () => {
-  it("there are twenty-seven verbs; mind_attend is one", () => {
-    expect(registry).toHaveLength(27);
+  it("there are twenty-eight verbs; mind_attend is one", () => {
+    expect(registry).toHaveLength(28);
     expect(registry.map((v) => v.name)).toContain("mind_attend");
-    expect(new Set(registry.map((v) => v.name)).size).toBe(27);
+    expect(new Set(registry.map((v) => v.name)).size).toBe(28);
   });
 
   it("mind_orient quick and full carry attention (top 7, with the stale pin count) before noticings; orientation does not", async () => {
@@ -776,7 +776,7 @@ describe("the extractor attends to what the mind attends to", () => {
 
   it("the attended feature is 0 or 1, the prior weight is +0.3, and a model or stored row from before it reads 0", () => {
     expect(FEATURE_NAMES).toContain("attended");
-    expect(FEATURE_NAMES).toHaveLength(13);
+    expect(FEATURE_NAMES).toHaveLength(15);
     expect(PRIOR_WEIGHTS.attended).toBe(0.3);
     const src = (attended: boolean) => ({ created_at: clock, context: null, keys: [], charge: [], salience: null, attended });
     const f = (a: boolean, b: boolean) => computeFeatures({ kind: "link", rerank: 0.5, cosine: 0.7, now: clock, sources: [src(a), src(b)] });

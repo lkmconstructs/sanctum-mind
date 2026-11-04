@@ -3,7 +3,7 @@
 
 import type { PoolClient } from "pg";
 
-export type ExtractorPassName = "notice.extract" | "notice.train" | "notice.repair" | "dream.generate";
+export type ExtractorPassName = "notice.extract" | "notice.train" | "notice.repair" | "dream.generate" | "notice.metabolise";
 
 /**
  * Today's scheduled instant: `schedule` (HH:MM) on the calendar day of `now`, in the SERVICE's local time zone
@@ -45,6 +45,16 @@ export function notDueReason(state: GateState | null, now: Date): string | null 
   if (!state || !state.enabled) return "the extractor is not enabled for this mind";
   if (state.paused) return "the extractor is paused";
   if (now.getTime() < scheduledAt(now, state.schedule).getTime()) return `not due until ${state.schedule} (service local time)`;
+  return null;
+}
+
+/**
+ * Why the metabolise pass must not run now, or null when it may: the operator's switch and pause ONLY. A stretch is handed over
+ * when the conversation ends, not at the extractor's hour, so the pass ignores the schedule time of day and the once-a-day rule.
+ */
+export function enabledReason(state: GateState | null): string | null {
+  if (!state || !state.enabled) return "the extractor is not enabled for this mind";
+  if (state.paused) return "the extractor is paused";
   return null;
 }
 

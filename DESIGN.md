@@ -130,7 +130,7 @@ failures.
 | Region | Verbs |
 | --- | --- |
 | Wake | `mind_orient` (depth: orientation, quick, full) |
-| Remember | `mind_observe`, `mind_write`, `mind_search`, `mind_surface`, `mind_notice` |
+| Remember | `mind_observe`, `mind_write`, `mind_search`, `mind_surface`, `mind_notice`, `mind_dream`, `mind_metabolise` |
 | Hold | `mind_sit`, `mind_resolve`, `mind_loop`, `mind_thread`, `mind_task` |
 | Self | `mind_identity` (read, read_section, affirm, propose, retire, withdraw, settle, attest, object), `mind_vow` (make, list, recall, break, withdraw_break, note), `mind_anchor`, `mind_desire`, `mind_rethink` |
 | Bond | `mind_relate`, `mind_letter`, `mind_link` |
@@ -139,7 +139,7 @@ failures.
 
 Deferred to their own design pass: `mind_dream`, `mind_unconscious`,
 `mind_maintain`. The daemon is implemented: deterministic passes over the ledger
-and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are twelve passes, all deterministic, including `identity.settle`, `notice.expire` and `notice.repair`. The optional model-backed extractor passes (`notice.extract`, `notice.train`) are listed separately: they run only for a mind whose extractor the operator has enabled, once a day.
+and the clock (no model calls), each change recorded as a ledger event (`daemon.*`, or `identity.settled` / `identity.retired` / `vow.break.settled` written as the mind). There are twelve passes, all deterministic, including `identity.settle`, `notice.expire` and `notice.repair`. The optional model-backed extractor passes (`notice.extract`, `notice.train`, and `notice.metabolise`, which turns stretches handed over by `mind_metabolise` into proposed feelings and relations) are listed separately: they run only for a mind whose extractor the operator has enabled, the first two once a day, the last whenever a stretch is queued.
 
 ### Noticing
 

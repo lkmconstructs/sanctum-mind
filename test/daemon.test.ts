@@ -94,12 +94,12 @@ afterAll(async () => {
 });
 
 describe("runner", () => {
-  it("runs the thirteen deterministic passes in spec order, then the three model-backed ones, and records a daemon_runs row per mind", async () => {
+  it("runs the thirteen deterministic passes in spec order, then the four model-backed ones, and records a daemon_runs row per mind", async () => {
     expect(PASSES.map((p) => p.name)).toEqual([
       "drives.decay", "context.expire", "loops.stale", "holdings.settle",
       "desires.fade", "identity.settle", "graph.orphans", "embeddings.backfill", "outbox.deliver", "letters.expire", "notice.expire", "notice.repair", "dream.fade",
     ]);
-    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train", "dream.generate"]);
+    expect(MODEL_PASSES.map((p) => p.name)).toEqual(["notice.extract", "notice.train", "dream.generate", "notice.metabolise"]);
     expect(ALL_PASSES.map((p) => p.name)).toEqual([...PASSES, ...MODEL_PASSES].map((p) => p.name));
     const reports = await daemon({ trigger: "timer" });
     expect(reports.map((r) => r.mind_id)).toEqual(["alpha", "beta"]);
@@ -111,7 +111,7 @@ describe("runner", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0].trigger).toBe("timer");
     expect(runs[0].finished_at).not.toBeNull();
-    expect(runs[0].passes).toHaveLength(16);
+    expect(runs[0].passes).toHaveLength(17);
     expect(runs[0].passes.every((p: any) => p.ok === true && typeof p.ms === "number" && p.changed === 0)).toBe(true);
   });
 
@@ -538,7 +538,7 @@ describe("mind_health", () => {
     const boom: DaemonPass = { name: "test.boom", run: async () => { throw new Error("x"); } };
     await daemon({ trigger: "manual", minds: ["alpha"] });
     let h = (await health()).last_daemon_run;
-    expect(h).toMatchObject({ passes_ok: 16, passes_failed: 0 });
+    expect(h).toMatchObject({ passes_ok: 17, passes_failed: 0 });
     expect(h.started_at).toBeInstanceOf(Date);
     expect(h.finished_at).toBeInstanceOf(Date);
     const later = new Date(NOW.getTime() + HOUR);

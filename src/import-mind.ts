@@ -103,7 +103,7 @@ interface Doc {
 const PROJECTION_ORDER = [
   "brain_state", "drive_state", "kv_contexts", "handoffs", "holdings", "loops", "threads", "tasks", "relations", "proposals",
   "noticings", "extractor_state", "extractor_models", "extractor_runs", "attention_pins",
-  "dreams", "dream_state", "dream_preferences",
+  "dreams", "dream_state", "dream_preferences", "metabolise_queue",
 ] as const;
 const PROJECTION_TABLE: Record<string, string> = Object.fromEntries(PROJECTION_ORDER.map((k) => [k, k]));
 
@@ -628,6 +628,8 @@ export async function importMind(
           }
         }
         if (key === "dream_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
+        // a stretch from another life is not metabolised again: every queue row arrives done (the database's guard admits an import only as done)
+        if (key === "metabolise_queue") rows = rows.map((r) => ({ ...r, status: "done", done_at: importedAt, note: "imported" }));
         if (key === "extractor_runs") {
           // run history is the history of another life: a row dated after this import cannot be real and is not brought in
           // (it would hold a schedule gate shut), and every row is marked so the gate ignores it

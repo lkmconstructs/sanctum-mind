@@ -46,4 +46,8 @@ export const PRIOR_WEIGHTS: Record<FeatureName, number> = {
   // Added after the first twelve weights. A model trained before it existed has no `attended` weight and the scorer reads a missing
   // weight as 0 (parseWeights in scorer.ts), so such a model ignores the feature until it is refit; a refit starts from this prior.
   attended: 0.3,
+  // The metabolised kinds start at zero as well: no prior opinion that a feeling or a fact about a person is worth more than a link.
+  // Added last; a model trained before them reads a missing weight as 0 (parseWeights) and ignores the feature until it is refit.
+  kind_feeling: 0,
+  kind_relation: 0,
 };
