@@ -174,7 +174,7 @@ describe("dream.generate", () => {
     await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00", gapHours: 20 });
     const e1 = await texturedEvent("the ledger finally held, all 826 tests", ["relief", "tired"]);
     await texturedEvent("she laughed at the forge joke", ["warm"]);
-    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Lissa", state: "close", intensity: 0.9, note: "the one I build with" });
+    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Mara", state: "close", intensity: 0.9, note: "the one I build with" });
     await run(alpha, "mind_identity", { mind_id: "alpha", operation: "affirm", section: "core", content: "I am the one who keeps the forge lit." });
     await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "the metabolise pass is unbuilt", active_texture: "quiet relief" } });
     const seen: { system: string; user: string }[] = [];
@@ -188,12 +188,12 @@ describe("dream.generate", () => {
     expect(seen[0]!.user).toContain("relief (1)");
     expect(seen[0]!.user).toContain("[relief, tired] the ledger finally held");
     expect(seen[0]!.user).toContain("Unresolved: the metabolise pass is unbuilt");
-    expect(seen[0]!.user).toContain("Close lately: Lissa (close; the one I build with)");
+    expect(seen[0]!.user).toContain("Close lately: Mara (close; the one I build with)");
 
     const d = (await q("alpha", "select * from dreams"))[0];
     expect(d).toMatchObject({ content: "A ledger of doors, each opening onto the same kitchen.", question: "Which door was mine?", stage: "propose", status: "laid", model_version: "qwen3:8b@p1" });
     expect(d.residue.event_ids).toContain(e1);
-    expect(d.residue.relation_subjects).toEqual(["Lissa"]);
+    expect(d.residue.relation_subjects).toEqual(["Mara"]);
     expect(new Date(d.fades_at).getTime()).toBe(clock.getTime() + 7 * DAY);
     const ev = (await q("alpha", "select * from events where kind = 'dream.laid'"))[0];
     expect(ev.subject_id).toBe(d.id);
@@ -214,10 +214,10 @@ describe("dream.generate", () => {
 
   it("honours the mind's preference: none drops the relation, its note and every event or handoff field naming it, and counts them", async () => {
     await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
-    await texturedEvent("Lissa fixed the ledger", ["relief"]);
+    await texturedEvent("Mara fixed the ledger", ["relief"]);
     await texturedEvent("the forge was quiet", ["calm"]);
-    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Lissa", state: "close", intensity: 0.9 });
-    await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "Lissa wants the judge next", active_texture: "steady" } });
+    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Mara", state: "close", intensity: 0.9 });
+    await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "Mara wants the judge next", active_texture: "steady" } });
     const seen: string[] = [];
     const dreamer: Dreamer = { name: "fake", model: "m", dream: async (_s, user) => { seen.push(user); return { dream: "d", question: "q" }; } };
 
@@ -230,7 +230,7 @@ describe("dream.generate", () => {
 
     const r = await daemon([dreamGenerate], dreamer);
     expect(r[0]!.passes[0]!.notes![0]).toMatch(/1 events, 0 pinned, 0 relations, 2 dropped by the mind's preference/);
-    expect(seen[0]).not.toContain("Lissa");
+    expect(seen[0]).not.toContain("Mara");
     expect(seen[0]).toContain("the forge was quiet");
     expect(seen[0]).toContain("The texture I left with: steady");
     const d = (await q("alpha", "select residue from dreams"))[0].residue;
@@ -238,12 +238,12 @@ describe("dream.generate", () => {
     expect(d.dropped).toBe(2);
 
     // a named list admits just those; "all" admits everyone; the event payload carries the count, never the names
-    await D(alpha, { operation: "prefer", relations: ["Lissa"] });
+    await D(alpha, { operation: "prefer", relations: ["Mara"] });
     expect((await q("alpha", "select payload from events where kind = 'dream.preference' order by seq desc limit 1"))[0].payload).toEqual({ relations: 1 });
     clock = new Date(clock.getTime() + DAY);
-    await texturedEvent("Lissa again", ["warm"]);
+    await texturedEvent("Mara again", ["warm"]);
     await daemon([dreamGenerate], dreamer);
-    expect(seen[1]).toContain("Lissa");
+    expect(seen[1]).toContain("Mara");
   });
 
   it("at stage shadow the dream is laid and never shown: not in list, not in orient, not found by the verb", async () => {
@@ -585,19 +585,19 @@ describe("the preference reaches aliases and relations beyond the shown fifty", 
 
   it("an event, a pin and a handoff field that name an excluded relation only by an alias are dropped and counted", async () => {
     await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
-    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Lissa", state: "close", intensity: 0.9, note: "the one I build with" });
-    await admin.query(`update relations set aliases = array['Bearcub', 'Lis-bear'] where mind_id = 'alpha' and subject = 'Lissa'`);
-    await texturedEvent("bearcub fixed the ledger", ["relief"]);
+    await run(alpha, "mind_relate", { mind_id: "alpha", operation: "set", subject: "Mara", state: "close", intensity: 0.9, note: "the one I build with" });
+    await admin.query(`update relations set aliases = array['Cubling', 'Mar-bear'] where mind_id = 'alpha' and subject = 'Mara'`);
+    await texturedEvent("cubling fixed the ledger", ["relief"]);
     await texturedEvent("the forge was quiet", ["calm"]);
-    await run(alpha, "mind_write", { mind_id: "alpha", type: "journal", text: "I keep thinking about LIS-BEAR and the door" });
+    await run(alpha, "mind_write", { mind_id: "alpha", type: "journal", text: "I keep thinking about MAR-BEAR and the door" });
     const pinEv = (await q("alpha", `select id from events where payload->>'text' like 'I keep thinking%'`))[0].id;
     expect((await run(alpha, "mind_attend", { mind_id: "alpha", operation: "pin", item_type: "event", item_id: pinEv })).ok).toBe(true);
-    await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "Bearcub wants the judge next", active_texture: "steady" } });
+    await run(alpha, "mind_handoff", { mind_id: "alpha", operation: "write", handoff: { unresolved_tension: "Cubling wants the judge next", active_texture: "steady" } });
     expect((await D(alpha, { operation: "prefer", relations: "none" })).ok).toBe(true);
     const seen: string[] = [];
     const r = await daemon([dreamGenerate], spy(seen));
     expect(r[0]!.passes[0]!.notes![0]).toMatch(/1 events, 0 pinned, 0 relations, 3 dropped by the mind's preference/);
-    expect(seen[0]!.toLowerCase()).not.toMatch(/bearcub|lis-bear|lissa/);
+    expect(seen[0]!.toLowerCase()).not.toMatch(/cubling|mar-bear|mara/);
     expect(seen[0]).toContain("the forge was quiet");
     expect(seen[0]).toContain("The texture I left with: steady");
     expect((await q("alpha", "select residue from dreams"))[0].residue.dropped).toBe(3);
@@ -659,7 +659,7 @@ describe("the operator", () => {
     const b = await seedDream({ content: "anchored one" });
     await seedDream({ content: "shadow one", stage: "shadow" });
     await D(alpha, { operation: "anchor", dream_id: b, texture: { charge: ["x"] } });
-    await D(alpha, { operation: "prefer", relations: ["Lissa", "Jesse"] });
+    await D(alpha, { operation: "prefer", relations: ["Mara", "Jesse"] });
     const r = await dreamReport(admin, "alpha");
     expect(r.state).toMatchObject({ enabled: true, stage: "propose" });
     expect(r.all_time).toEqual({ total: 3, by_status: { laid: 2, anchored: 1 }, by_stage: { propose: 2, shadow: 1 } });
