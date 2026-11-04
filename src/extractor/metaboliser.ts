@@ -8,8 +8,10 @@ import type { MetaboliserConfig } from "./metabolise_config.js";
  * The metaboliser: one chat completion against an OpenAI-compatible endpoint, answering with a JSON object
  * `{"feelings": [...], "relations": [...]}`. The result says what happened, so the pass can tell an outage from a bad answer:
  * `answer` (proposals), `empty` (both arrays empty: a complete answer, the stretch is done with nothing proposed), `unusable` (the model
- * answered but with no JSON object or neither array: the stretch is marked failed with the note), and `unavailable` (network error,
- * timeout, non-2xx, empty body, or a throw: the stretch stays queued and the pass stops for this tick).
+ * was reached but this stretch got no usable answer: a 4xx other than 401, 403, 408 and 429, a 2xx that is not JSON or holds no
+ * choices or content, a reply with no JSON object or neither array, or one whose every entry is malformed: that stretch is marked
+ * failed with the note, with the HTTP status, and the tick goes on), and `unavailable` (network error, timeout, 5xx, 429, 408, 401,
+ * 403, any other non-2xx, or a throw: the stretch stays queued and the pass stops for this tick).
  */
 export interface Metaboliser {
   readonly name: string;
@@ -57,6 +59,11 @@ const clean = (v: unknown, max: number): string | null => {
  * neither array (so a model that answered in prose is a failure and a model that answered `{"feelings": [], "relations": []}` is not).
  */
 export function answerFrom(text: string): MetaboliseAnswer | null {
+  return coerce(text)?.answer ?? null;
+}
+
+/** answerFrom, plus how many entries the model offered (kept or dropped): all dropped is not the same as none offered. */
+function coerce(text: string): { answer: MetaboliseAnswer; offered: number } | null {
   const o = parseLastJson<{ feelings?: unknown; relations?: unknown }>(text);
   if (o === null || typeof o !== "object" || (!Array.isArray(o.feelings) && !Array.isArray(o.relations))) return null;
   const feelings: MetaboliseFeeling[] = [];
@@ -80,7 +87,8 @@ export function answerFrom(text: string): MetaboliseAnswer | null {
     const alias = clean(r.alias, 200);
     relations.push({ subject, note, ...(alias === null || alias.toLowerCase() === subject.toLowerCase() ? {} : { alias }), warmth: r.warmth === true });
   }
-  return { feelings, relations };
+  const offered = (Array.isArray(o.feelings) ? o.feelings.length : 0) + (Array.isArray(o.relations) ? o.relations.length : 0);
+  return { answer: { feelings, relations }, offered };
 }
 
 export const NONE_METABOLISER: Metaboliser = {
@@ -110,14 +118,32 @@ export function httpMetaboliser(cfg: MetaboliserConfig, fetchImpl: typeof fetch 
           }),
           signal: AbortSignal.timeout(cfg.timeoutMs),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as { choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string } }> };
+        if (!res.ok) {
+          // Unavailable (the row stays queued, the tick stops): 5xx, 429, 408, and 401/403 (a credential problem would fail every row),
+          // and any other non-2xx that is not a 4xx (a redirect or 1xx is a wrong URL, which fails every row too).
+          // Unusable (this row fails, the tick goes on): any other 4xx, which is about this request (an oversized stretch: 400, 413, 422).
+          const st = res.status;
+          const poison = st >= 400 && st < 500 && st !== 401 && st !== 403 && st !== 408 && st !== 429;
+          if (poison) return { kind: "unusable", note: `the metaboliser refused this stretch (HTTP ${st})` };
+          throw new Error(`HTTP ${st}`);
+        }
+        const raw = await res.text(); // a body that dies mid-read is a network error: caught below, unavailable
+        let data: { choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string } }> };
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          return { kind: "unusable", note: `HTTP ${res.status}: the metaboliser's reply was not JSON` };
+        }
         const m = data?.choices?.[0]?.message;
         const text = m?.content?.trim() || m?.reasoning_content?.trim() || m?.reasoning?.trim() || "";
-        if (text === "") throw new Error("empty response body");
-        const a = answerFrom(text);
-        if (a === null) return { kind: "unusable", note: "the metaboliser answered without a JSON object holding feelings or relations" };
-        return a.feelings.length === 0 && a.relations.length === 0 ? { kind: "empty" } : { kind: "answer", ...a };
+        if (text === "") return { kind: "unusable", note: `HTTP ${res.status}: the metaboliser's reply held no choices or content` };
+        const c = coerce(text);
+        if (c === null) return { kind: "unusable", note: `HTTP ${res.status}: the metaboliser answered without a JSON object holding feelings or relations` };
+        const a = c.answer;
+        if (a.feelings.length === 0 && a.relations.length === 0) {
+          return c.offered > 0 ? { kind: "unusable", note: `HTTP ${res.status}: every entry the metaboliser offered was malformed` } : { kind: "empty" };
+        }
+        return { kind: "answer", ...a };
       } catch (e) {
         const why = e instanceof Error ? e.message : String(e);
         if (!warned) {

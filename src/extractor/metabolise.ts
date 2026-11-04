@@ -56,7 +56,7 @@ function turnsOf(payload: unknown): StretchTurn[] {
  * and no once-a-day rule. Each tick first expires: a stretch queued more than a week is marked failed ("expired unprocessed"), under
  * the per-mind lock, whatever the extractor's switch and whatever the metaboliser kind (a run is recorded only when something expired).
  * Then it works the oldest few queued stretches. METABOLISER=none skips with a note and leaves the rest queued. A model that answers
- * unusably marks that stretch failed; a model that is unavailable (outage, timeout, non-2xx, a throw) leaves the stretch queued, records
+ * unusably (a 4xx about this stretch, a body that is not JSON, nothing usable in it) marks that stretch failed and the tick goes on to the next; a model that is unavailable (network error, timeout, 5xx, 429, 408, 401, 403, a throw) leaves the stretch queued, records
  * a failed run, and stops for this tick. Never throws; the next tick takes the next stretches.
  */
 export const noticeMetabolise: DetachedPass = {
