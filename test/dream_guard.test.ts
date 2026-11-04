@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
 import { appPool, closePool, queryAs, resetDatabase } from "./helpers.js";
-import { violations } from "./extractor_guard.test.js";
+import { violations } from "./guard_scan.js";
 import { runDaemonOnce } from "../src/daemon/index.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
 import { DREAM_PASSES } from "../src/dream/index.js";
@@ -15,7 +15,7 @@ import type { Dreamer } from "../src/dream/dreamer.js";
 
 /**
  * Dreaming lays down residue; it never writes memory. The extractor's two layers, applied to src/dream/: the static scan
- * (test/extractor_guard.test.ts, `violations`, with dreaming's own whitelist) over every file, and a runtime test that runs
+ * (test/guard_scan.ts, `violations`, with dreaming's own whitelist) over every file, and a runtime test that runs
  * every dream pass over a seeded mind with a dreamer that answers, and compares nodes and edges before and after. The real
  * boundary is the database (migration 0027) and the verb `mind_dream anchor`, mind only.
  */

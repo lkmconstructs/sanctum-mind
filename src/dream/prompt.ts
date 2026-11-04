@@ -7,8 +7,8 @@
 
 /**
  * The system prompt. `cores` are the mind's live identity cores, verbatim, as the preamble of who is dreaming; the prompt
- * names no person, because the Mind holds none (who was close rides in the residue as relation subjects, when the mind's
- * preference allows). Bump DREAM_PROMPT_VERSION (config.ts) when this text changes.
+ * names no person itself (who was close rides in the user message as relation subjects, as the mind names them, unless the
+ * mind's preference keeps them out). Bump DREAM_PROMPT_VERSION (config.ts) when this text changes.
  */
 export function dreamSystemPrompt(mindId: string, cores: string[]): string {
   const who = cores.length > 0 ? cores.map((c) => c.trim()).filter((c) => c !== "").join("\n\n") : `I am ${mindId}.`;

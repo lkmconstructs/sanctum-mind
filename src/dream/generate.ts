@@ -38,6 +38,18 @@ export function dreamNotDueReason(state: DreamState | null, now: Date): string |
   return null;
 }
 
+/** Why the gap since the last real dream forbids another now, or null. Read in the plan and again under the lock in the write. */
+async function gapReason(tx: PoolClient, mind: string, state: DreamState, now: Date): Promise<string | null> {
+  const last = await tx.query<{ t: Date | null }>(
+    `select max(started_at) as t from extractor_runs
+      where mind_id = $1 and pass = 'dream.generate' and ok
+        and coalesce(notes->>'skipped', '') = '' and coalesce(notes->>'imported', '') = ''`,
+    [mind],
+  );
+  const t = last.rows[0]?.t ?? null;
+  return t !== null && now.getTime() - t.getTime() < state.gap_hours * HOUR_MS ? `the last dream was less than ${state.gap_hours} hours ago` : null;
+}
+
 type Plan = { skip: string; record?: { reason: string } } | { residue: Residue; state: DreamState };
 
 /**
@@ -61,14 +73,8 @@ export const dreamGenerate: DetachedPass = {
         if (why !== null || !state) return { skip: why ?? "dreaming is not enabled for this mind" };
         const today = await runsSince(c.tx, mind, "dream.generate", startOfDay(started));
         if (today.some(isRealRun)) return { skip: `already ran today (schedule ${state.schedule})` };
-        const last = await c.tx.query<{ t: Date | null }>(
-          `select max(started_at) as t from extractor_runs
-            where mind_id = $1 and pass = 'dream.generate' and ok
-              and coalesce(notes->>'skipped', '') = '' and coalesce(notes->>'imported', '') = ''`,
-          [mind],
-        );
-        const t = last.rows[0]?.t ?? null;
-        if (t !== null && started.getTime() - t.getTime() < state.gap_hours * HOUR_MS) return { skip: `the last dream was less than ${state.gap_hours} hours ago` };
+        const tooSoon = await gapReason(c.tx, mind, state, started);
+        if (tooSoon !== null) return { skip: tooSoon };
         if (dreamer.name === "none") {
           const reason = "DREAMER=none: no model to dream with";
           return today.some(isSkip) ? { skip: reason } : { skip: reason, record: { reason } };
@@ -103,6 +109,13 @@ export const dreamGenerate: DetachedPass = {
         if ((await runsSince(c.tx, mind, "dream.generate", startOfDay(started))).some(isRealRun)) {
           await recordRun(c.tx, mind, "dream.generate", started, ctx.now(), false, { skipped: true, reason: "raced" });
           return { changed: 0, notes: ["skipped: another run laid today's dream"] };
+        }
+        // gap_hours too, from the state just read: the operator may have raised it while the model worked, and a run may have been
+        // recorded under another day's start
+        const tooSoon = await gapReason(c.tx, mind, state, started);
+        if (tooSoon !== null) {
+          await recordRun(c.tx, mind, "dream.generate", started, ctx.now(), false, { skipped: true, reason: tooSoon });
+          return { changed: 0, notes: [`skipped: ${tooSoon}`] };
         }
         if (answer === null) {
           await recordRun(c.tx, mind, "dream.generate", started, ctx.now(), false, { error: "the dreamer answered with no dream" });

@@ -51,7 +51,12 @@ export async function runVerb(
   const embedder = deps.embedder ?? NONE_EMBEDDER;
   let embedded: VerbContext["embedded"];
   try {
-    const toEmbed = verb.embedText?.(input);
+    let toEmbed = verb.embedText?.(input) ?? null;
+    if (toEmbed === null && verb.embedTextFrom) {
+      const from = verb.embedTextFrom;
+      toEmbed = await withMind(deps.pool, input.mind_id, caller.bearer, "read", (tx) =>
+        from(async <T,>(sql: string, params: unknown[]) => (await tx.query(sql, params)).rows as T[], input), "verb");
+    }
     if (typeof toEmbed === "string" && toEmbed.trim() !== "") {
       embedded = await embedOne(embedder, toEmbed, deps.embedTimeoutMs ?? DEFAULT_EMBED_TIMEOUT_MS);
     }

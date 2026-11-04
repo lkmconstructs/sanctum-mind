@@ -583,12 +583,16 @@ export async function importMind(
         if (key === "extractor_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
         if (key === "dreams") {
           // A laid dream from another life is not shown again: it arrives faded, with a dream.faded event written as the mind
-          // (reason "imported"). Decided ones (anchored, released) keep their status if they carry their decision event; faded keep it.
+          // (reason "imported"). Decided ones (anchored, released, and faded too) keep their status only if they carry their decision
+          // event (a faded row without one gets a dream.faded event like a laid one: every faded dream has one); a decision with no
+          // decided_at (written before migration 0028 required it) is dated at the import.
           const fades: Row[] = [];
           let laidCount = 0;
           rows = rows.map((r) => {
             const st = String(r.status);
-            if (st === "faded" || ((st === "anchored" || st === "released") && typeof r.decided_event_id === "string")) return { ...r, status: st };
+            if ((st === "faded" || st === "anchored" || st === "released") && typeof r.decided_event_id === "string") {
+              return { ...r, status: st, decided_at: r.decided_at ?? importedAt };
+            }
             if (typeof r.id !== "string") throw new ImportError("export file: a dream has no id");
             const did = lc(r.id);
             const evId = importExpiryEventId(`dream:${did}`);

@@ -77,6 +77,12 @@ export interface Verb<S extends z.ZodTypeAny = z.ZodTypeAny, P = unknown> {
    * the transaction; handlers read the result from ctx.embedded and never call the embedder.
    */
   embedText?: (input: z.infer<S>) => string | null;
+  /**
+   * For a verb whose stored text is not in its input (mind_dream anchor stores the dream's own text unless the mind rewrote it).
+   * Used only when embedText gave nothing: the runner opens a short read transaction as the caller, before the write transaction,
+   * and passes `read` to run a query in it. Same contract as embedText otherwise: null for nothing to embed.
+   */
+  embedTextFrom?: (read: <T = Record<string, unknown>>(sql: string, params: unknown[]) => Promise<T[]>, input: z.infer<S>) => Promise<string | null>;
   handler: (ctx: VerbContext, input: z.infer<S>) => Promise<Result<P>>;
 }
 

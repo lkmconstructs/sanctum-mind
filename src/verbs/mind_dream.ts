@@ -93,7 +93,14 @@ export const mind_dream = defineVerb({
   scopeFor: (input) => (input.operation === "list" || input.operation === "read" ? "read" : "write"),
   mindOnly: (input) => input.operation === "anchor" || input.operation === "release" || input.operation === "prefer",
   mindOnlyMessage: MEMORY_MIND_ONLY,
+  // mind_observe embeds the text it stores (its content); anchor stores input.text, or else the dream's own content, so that is
+  // what is embedded (the dream is read before the write transaction; its content is immutable once laid)
   embedText: (input) => (input.operation === "anchor" ? (input.text ?? null) : null),
+  embedTextFrom: async (read, input) => {
+    if (input.operation !== "anchor" || input.text !== undefined || input.dream_id === undefined) return null;
+    const r = await read<{ content: string }>(`select content from dreams where id = $1 and mind_id = $2 and stage = 'propose'`, [input.dream_id, input.mind_id]);
+    return r[0]?.content ?? null;
+  },
   handler: async (ctx, input): Promise<Result<unknown>> => {
     if (input.operation === "list") {
       const shown = await listDreams(ctx, input.limit);
@@ -138,6 +145,10 @@ export const mind_dream = defineVerb({
     if (!d || d.stage !== "propose") return err("not_found", "dream not found", "dream_id");
     if (d.status !== "laid") return err("conflict", `dream is already ${d.status}`, "dream_id");
 
+    // a dream past fades_at is gone from list and orient and the daemon is about to fade it: neither decision applies to it, so
+    // release and anchor refuse it alike (otherwise whether a late release lands would depend on whether dream.fade had ticked yet)
+    if (d.fades_at.getTime() <= ctx.now().getTime()) return err("conflict", "the dream has faded", "dream_id");
+
     if (input.operation === "release") {
       const ev = await appendEvent(ctx, {
         kind: "dream.released",
@@ -148,8 +159,7 @@ export const mind_dream = defineVerb({
       return ok({ event_id: ev.id, projection: { event_id: ev.id, dream_id: id, status: "released" } });
     }
 
-    // anchor
-    if (d.fades_at.getTime() <= ctx.now().getTime()) return err("conflict", "the dream has faded", "dream_id");
+    // anchor (the operator's stage gates anchor, as it gates accepting a noticing; release, like rejecting one, is not gated by it)
     const st = await ctx.tx.query<{ stage: string }>(`select stage from dream_state where mind_id = $1`, [ctx.mind_id]);
     if (st.rows[0]?.stage !== "propose") return err("conflict", "dreaming is not at stage propose", "dream_id");
     const content = input.text ?? d.content;
