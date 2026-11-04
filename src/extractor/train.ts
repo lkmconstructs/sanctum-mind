@@ -22,7 +22,7 @@ export const EPOCHS = 200;
 export const LEARNING_RATE = 0.5;
 /**
  * The L2 penalty, lambda * (w - w_prior)^2 / 2 on every weight (not the bias), against a mean loss. It pulls the fit
- * toward the hand-set prior rather than toward zero: with a few dozen decisions and thirteen features, a mind's weights should
+ * toward the hand-set prior rather than toward zero: with a few dozen decisions and fifteen features, a mind's weights should
  * move only as far as its decisions push them. 0.05 means a weight moves a full point only if the data insists.
  */
 export const L2 = 0.05;

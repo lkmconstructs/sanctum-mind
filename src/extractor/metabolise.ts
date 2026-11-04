@@ -8,7 +8,7 @@ import { readIdentityCores } from "./cores.js";
 import { noticingExpiresAt } from "./config.js";
 import { noticeProposedPayload } from "./events.js";
 import { computeFeatures, type MetaboliseKind } from "./features.js";
-import { NONE_METABOLISER, type MetaboliseAnswer } from "./metaboliser.js";
+import { NONE_METABOLISER, type MetaboliseResult } from "./metaboliser.js";
 import { METABOLISE_BATCH, METABOLISE_EXPIRY_DAYS, METABOLISE_MAX_PER_KIND, METABOLISE_PROMPT_VERSION } from "./metabolise_config.js";
 import { composeStretch, metaboliseSystemPrompt, type StretchTurn } from "./metabolise_prompt.js";
 import { brief, enabledReason, readState, recordRun } from "./schedule.js";
@@ -27,7 +27,7 @@ interface Stretch {
 
 type Plan =
   | { skip: string }
-  | { stage: "shadow" | "propose"; model: Model; cores: string[]; expired: string[]; stretches: Stretch[] };
+  | { stage: "shadow" | "propose"; model: Model; cores: string[]; stretches: Stretch[] };
 
 type Outcome = { status: "done" | "failed" | "skipped"; feelings: number; relations: number };
 
@@ -53,9 +53,11 @@ function turnsOf(payload: unknown): StretchTurn[] {
  * memory only when the mind accepts it through `mind_notice` (outside this directory).
  *
  * The gate is the operator's switch and pause ONLY (enabledReason): stretches arrive when conversations end, so there is no hour
- * and no once-a-day rule. Each tick works the oldest few queued stretches. A stretch still queued after a week is marked failed
- * ("expired unprocessed"). METABOLISER=none skips with a note and leaves every stretch queued. A silent or throwing model marks that
- * stretch failed and writes no proposal. Never throws; the next tick takes the next stretches.
+ * and no once-a-day rule. Each tick first expires: a stretch queued more than a week is marked failed ("expired unprocessed"), under
+ * the per-mind lock, whatever the extractor's switch and whatever the metaboliser kind (a run is recorded only when something expired).
+ * Then it works the oldest few queued stretches. METABOLISER=none skips with a note and leaves the rest queued. A model that answers
+ * unusably marks that stretch failed; a model that is unavailable (outage, timeout, non-2xx, a throw) leaves the stretch queued, records
+ * a failed run, and stops for this tick. Never throws; the next tick takes the next stretches.
  */
 export const noticeMetabolise: DetachedPass = {
   name: "notice.metabolise",
@@ -65,16 +67,29 @@ export const noticeMetabolise: DetachedPass = {
     const started = ctx.now();
     const metaboliser = ctx.metaboliser ?? NONE_METABOLISER;
     try {
+      // expiry runs every tick, before the gate and the none-skip: a stretch that can never be worked must not stay queued forever
+      const cutoff = new Date(started.getTime() - METABOLISE_EXPIRY_DAYS * DAY_MS);
+      const expired = await ctx.inTx("write", async (c) => {
+        const r = await c.tx.query(
+          `update metabolise_queue set status = 'failed', done_at = $3, note = 'expired unprocessed'
+            where mind_id = $1 and status = 'queued' and created_at < $2`,
+          [mind, cutoff, ctx.now()],
+        );
+        const n = r.rowCount ?? 0;
+        if (n > 0) {
+          const st = await readState(c.tx, mind);
+          await recordRun(c.tx, mind, "notice.metabolise", started, ctx.now(), true, {
+            stage: st?.stage ?? null, model: metaboliser.model, prompt_version: METABOLISE_PROMPT_VERSION, stretches: n, done: 0, failed: 0, expired: n, proposed: { feeling: 0, relation: 0 },
+          });
+        }
+        return n;
+      });
+      const expiredNote = expired > 0 ? `; ${expired} expired unprocessed` : "";
       const plan = await ctx.inTx("read", async (c): Promise<Plan> => {
         const state = await readState(c.tx, mind);
         const why = enabledReason(state);
         if (why !== null || !state) return { skip: why ?? "the extractor is not enabled for this mind" };
-        if (metaboliser.name === "none") return { skip: "METABOLISER=none: no model to metabolise with; queued stretches stay queued" };
-        const cutoff = new Date(started.getTime() - METABOLISE_EXPIRY_DAYS * DAY_MS);
-        const old = await c.tx.query<{ id: string }>(
-          `select id from metabolise_queue where mind_id = $1 and status = 'queued' and created_at < $2 order by created_at, id limit 200`,
-          [mind, cutoff],
-        );
+        if (metaboliser.name === "none") return { skip: "METABOLISER=none: no model to metabolise with; stretches stay queued until they expire" };
         const rows = await c.tx.query<{ id: string; stretch_event_id: string; payload: unknown; created_at: Date }>(
           `select q.id, q.stretch_event_id, e.payload, e.created_at
              from metabolise_queue q join events e on e.id = q.stretch_event_id and e.mind_id = q.mind_id
@@ -82,7 +97,7 @@ export const noticeMetabolise: DetachedPass = {
             order by q.created_at, q.id limit $3`,
           [mind, cutoff, METABOLISE_BATCH],
         );
-        if (old.rows.length === 0 && rows.rows.length === 0) return { skip: "no stretch is queued" };
+        if (rows.rows.length === 0) return { skip: "no stretch is queued" };
         const payloadContext = (p: unknown): string | null => {
           const v = p !== null && typeof p === "object" ? (p as { context?: unknown }).context : null;
           return typeof v === "string" && v.trim() !== "" ? v : null;
@@ -91,35 +106,29 @@ export const noticeMetabolise: DetachedPass = {
           stage: state.stage,
           model: await loadModel(c.tx, mind),
           cores: await readIdentityCores(c.tx, mind),
-          expired: old.rows.map((r) => r.id),
           stretches: rows.rows.map((r) => ({ queue_id: r.id, event_id: r.stretch_event_id, at: r.created_at, turns: turnsOf(r.payload), context: payloadContext(r.payload) })),
         };
       });
-      if ("skip" in plan) return { changed: 0, notes: [`skipped: ${plan.skip}`] };
-
-      let expired = 0;
-      if (plan.expired.length > 0) {
-        expired = await ctx.inTx("write", async (c) => {
-          const r = await c.tx.query(
-            `update metabolise_queue set status = 'failed', done_at = $3, note = 'expired unprocessed'
-              where mind_id = $1 and id = any($2::uuid[]) and status = 'queued'`,
-            [mind, plan.expired, ctx.now()],
-          );
-          return r.rowCount ?? 0;
-        });
-      }
+      if ("skip" in plan) return { changed: 0, notes: [`skipped: ${plan.skip}${expiredNote}`] };
 
       const system = metaboliseSystemPrompt(mind, plan.cores);
       const totals = { done: 0, failed: 0, skipped: 0, feeling: 0, relation: 0 };
+      let unavailable: string | null = null;
       for (const s of plan.stretches) {
-        let answer: MetaboliseAnswer | null = null;
+        let result: MetaboliseResult | null = null;
         if (s.turns.length > 0) {
           try {
-            answer = await metaboliser.metabolise(system, composeStretch(s.turns, s.context));
+            result = await metaboliser.metabolise(system, composeStretch(s.turns, s.context));
           } catch (e) {
             console.error(`daemon: the metaboliser threw for mind ${mind}:`, e);
+            result = { kind: "unavailable", note: `the metaboliser threw: ${brief(e)}` };
           }
         }
+        if (result?.kind === "unavailable") {
+          unavailable = result.note; // the stretch stays queued; do not hammer a dead endpoint
+          break;
+        }
+        const answer = result === null || result.kind === "unusable" ? null : result.kind === "empty" ? { feelings: [], relations: [] } : result;
         const noTurns = s.turns.length === 0;
         const out = await ctx.inTx("write", async (c): Promise<Outcome> => {
           const none: Outcome = { status: "skipped", feelings: 0, relations: 0 };
@@ -132,7 +141,7 @@ export const noticeMetabolise: DetachedPass = {
             await c.tx.query(`update metabolise_queue set status = $3, done_at = $4, note = $5 where id = $1 and mind_id = $2`, [s.queue_id, mind, status, ctx.now(), note]);
           };
           if (answer === null) {
-            await finish("failed", noTurns ? "the stretch holds no usable turns" : "the metaboliser gave no usable answer");
+            await finish("failed", noTurns ? "the stretch holds no usable turns" : result?.kind === "unusable" ? result.note : "the metaboliser gave no usable answer");
             return { status: "failed", feelings: 0, relations: 0 };
           }
 
@@ -194,16 +203,17 @@ export const noticeMetabolise: DetachedPass = {
         totals.relation += out.relations;
       }
 
-      if (totals.done + totals.failed + expired > 0) {
+      if (totals.done + totals.failed + (unavailable === null ? 0 : 1) > 0) {
         await ctx.inTx("write", async (c) => {
-          await recordRun(c.tx, mind, "notice.metabolise", started, ctx.now(), totals.failed === 0, {
+          await recordRun(c.tx, mind, "notice.metabolise", started, ctx.now(), totals.failed === 0 && unavailable === null, {
             stage: plan.stage,
             model: metaboliser.model,
             prompt_version: METABOLISE_PROMPT_VERSION,
             stretches: totals.done + totals.failed + totals.skipped,
             done: totals.done,
             failed: totals.failed,
-            expired,
+            expired: 0,
+            ...(unavailable === null ? {} : { unavailable }),
             proposed: { feeling: totals.feeling, relation: totals.relation },
           });
         });
@@ -215,7 +225,8 @@ export const noticeMetabolise: DetachedPass = {
           `${total} proposed at stage ${plan.stage} (feeling ${totals.feeling}, relation ${totals.relation}) from ${totals.done} stretch(es)` +
             (totals.failed > 0 ? `; ${totals.failed} failed` : "") +
             (totals.skipped > 0 ? `; ${totals.skipped} left queued (the extractor was switched or paused meanwhile)` : "") +
-            (expired > 0 ? `; ${expired} expired unprocessed` : ""),
+            (unavailable !== null ? `; stopped: ${unavailable} (left queued)` : "") +
+            expiredNote,
         ],
       };
     } catch (e) {

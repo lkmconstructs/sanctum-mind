@@ -48,7 +48,7 @@ export const stretchPayload = z.strictObject({
  * reads the queue later and may PROPOSE feelings and relations; nothing here becomes memory by itself.
  *
  * The stretch is recorded whether or not the extractor is on, paused or at shadow: the house must not lose a conversation because an
- * operator switch was off at the time. With the extractor off the row simply waits (and expires unprocessed after a week).
+ * operator switch was off at the time. With the extractor off, paused or METABOLISER=none the row simply waits, and the daemon marks it failed "expired unprocessed" once it has been queued more than a week (expiry runs every tick regardless).
  *
  * No embedding: embedText is absent, so the event carries no vector. A raw transcript is bulk, and embedded it would drown the
  * mind's own observations in `mind_surface` and `mind_search`; what the mind keeps from a stretch it keeps through `mind_notice`.

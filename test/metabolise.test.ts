@@ -20,7 +20,7 @@ import { exportMind } from "../src/export.js";
 import { importMind } from "../src/import-mind.js";
 import { purgeMind } from "../src/purge.js";
 import { noticeMetabolise, EXTRACTOR_EVENT_SHAPES } from "../src/extractor/index.js";
-import { answerFrom, httpMetaboliser, NONE_METABOLISER, type Metaboliser, type MetaboliseAnswer } from "../src/extractor/metaboliser.js";
+import { answerFrom, httpMetaboliser, NONE_METABOLISER, type Metaboliser, type MetaboliseAnswer, type MetaboliseResult } from "../src/extractor/metaboliser.js";
 import { metaboliserConfig } from "../src/extractor/metabolise_config.js";
 import { composeStretch, metaboliseSystemPrompt, METABOLISE_PROMPT_VERSION } from "../src/extractor/metabolise_prompt.js";
 import { noticeAcceptedPayload, noticeRejectedPayload } from "../src/verbs/notice_events.js";
@@ -53,8 +53,12 @@ const TURNS = [
   { speaker: "self", text: "That is wonderful. I am so glad for you." },
 ];
 
-/** A metaboliser that records what it was asked and answers as told (an Error is thrown). */
-function fake(answer: MetaboliseAnswer | null | Error | ((user: string) => MetaboliseAnswer | null)): Metaboliser & { calls: Array<{ system: string; user: string }> } {
+const UNUSABLE: MetaboliseResult = { kind: "unusable", note: "no JSON object" };
+const asResult = (a: MetaboliseAnswer | MetaboliseResult): MetaboliseResult =>
+  "kind" in a ? a : a.feelings.length === 0 && a.relations.length === 0 ? { kind: "empty" } : { kind: "answer", ...a };
+
+/** A metaboliser that records what it was asked and answers as told (an Error is thrown; a bare answer is wrapped as a result). */
+function fake(answer: MetaboliseAnswer | MetaboliseResult | Error | ((user: string) => MetaboliseAnswer | MetaboliseResult)): Metaboliser & { calls: Array<{ system: string; user: string }> } {
   const calls: Array<{ system: string; user: string }> = [];
   return {
     name: "fake",
@@ -63,7 +67,7 @@ function fake(answer: MetaboliseAnswer | null | Error | ((user: string) => Metab
     async metabolise(system, user) {
       calls.push({ system, user });
       if (answer instanceof Error) throw answer;
-      return typeof answer === "function" ? answer(user) : answer;
+      return asResult(typeof answer === "function" ? answer(user) : answer);
     },
   };
 }
@@ -127,6 +131,7 @@ describe("the metaboliser (model dependency)", () => {
         { emotion: "joy", weight: "huge", pillar: "bond", content: "bad weight" },
         { emotion: "", weight: "light", pillar: "x", content: "no emotion" },
         { emotion: "calm", weight: "light", content: "no pillar" },
+        { emotion: "calm", weight: "light", pillar: "  ", content: "empty pillar" },
         "nope",
       ],
       relations: [
@@ -148,17 +153,24 @@ describe("the metaboliser (model dependency)", () => {
     expect(answerFrom("nothing here")).toBeNull();
   });
 
-  it("httpMetaboliser posts system+user to <url>/chat/completions with the bearer, temperature 0.4 and max_tokens 1200; a failure is null", async () => {
+  it("httpMetaboliser posts system+user to <url>/chat/completions with the bearer, temperature 0.4 and max_tokens 1200; a failure is unavailable", async () => {
     const calls: any[] = [];
     const ok = httpMetaboliser({ kind: "http", url: "http://m.test/v1", model: "m", apiKey: "k", timeoutMs: 1000 }, (async (url: any, init: any) => {
       calls.push({ url, body: JSON.parse(init.body), auth: init.headers.authorization });
       return new Response(JSON.stringify({ choices: [{ message: { content: 'ok {"feelings": [], "relations": []}' } }] }));
     }) as any);
-    expect(await ok.metabolise("SYS", "USER")).toEqual({ feelings: [], relations: [] });
+    expect(await ok.metabolise("SYS", "USER")).toEqual({ kind: "empty" });
     expect(calls[0]).toMatchObject({ url: "http://m.test/v1/chat/completions", auth: "Bearer k", body: { model: "m", temperature: 0.4, max_tokens: 1200, messages: [{ role: "system", content: "SYS" }, { role: "user", content: "USER" }] } });
     const bad = httpMetaboliser({ kind: "http", url: "http://m.test/v1", model: "m", apiKey: null, timeoutMs: 1000 }, (async () => new Response("no", { status: 500 })) as any);
-    expect(await bad.metabolise("s", "u")).toBeNull();
-    expect(await NONE_METABOLISER.metabolise("s", "u")).toBeNull();
+    expect(await bad.metabolise("s", "u")).toMatchObject({ kind: "unavailable", note: expect.stringContaining("HTTP 500") });
+    expect(await NONE_METABOLISER.metabolise("s", "u")).toMatchObject({ kind: "unavailable" });
+    const mk = (f: any) => httpMetaboliser({ kind: "http", url: "http://m.test/v1", model: "m", apiKey: null, timeoutMs: 1000 }, f);
+    const reply = (content: string) => (async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }))) as any;
+    expect(await mk(async () => { throw new Error("ECONNREFUSED"); }).metabolise("s", "u")).toMatchObject({ kind: "unavailable", note: expect.stringContaining("ECONNREFUSED") });
+    expect(await mk(reply("   ")).metabolise("s", "u")).toMatchObject({ kind: "unavailable" });
+    expect(await mk(reply("I have no JSON for you")).metabolise("s", "u")).toMatchObject({ kind: "unusable" });
+    expect(await mk(reply('{"feelings": [{"emotion": "joy", "weight": "light", "pillar": "bond", "content": "I felt joy."}], "relations": []}')).metabolise("s", "u"))
+      .toMatchObject({ kind: "answer", feelings: [{ emotion: "joy" }], relations: [] });
   });
 
   it("the prompt is first person with the identity cores as preamble (or 'I am <mind>'), labels turns from the turns alone, and keeps Lantern's restraint", () => {
@@ -359,19 +371,46 @@ describe("notice.metabolise", () => {
     expect(await q("select 1 from events where kind = 'notice.proposed'")).toEqual([]);
   });
 
-  it("a null answer, or a throw, marks the row failed with a note and proposes nothing; the next stretch is still worked", async () => {
+  it("an unusable answer marks the row failed with the note and proposes nothing; the next stretch is still worked", async () => {
     await enable();
     await queued();
-    const p = await go(fake(null));
+    const p = await go(fake(UNUSABLE));
     expect(p).toMatchObject({ ok: true, changed: 0 });
-    expect((await queueRows())[0]).toMatchObject({ status: "failed", note: "the metaboliser gave no usable answer" });
+    expect((await queueRows())[0]).toMatchObject({ status: "failed", note: "no JSON object" });
     await queued([{ speaker: "self", text: "second" }]);
-    expect(await go(fake(new Error("boom")))).toMatchObject({ ok: true, changed: 0 });
-    expect((await queueRows())[1]).toMatchObject({ status: "failed" });
-    await queued([{ speaker: "self", text: "third" }]);
     expect((await go(fake(answer([feeling("calm")])))).changed).toBe(1);
-    expect((await queueRows()).map((r) => r.status)).toEqual(["failed", "failed", "done"]);
-    expect(await q("select ok from extractor_runs where pass = 'notice.metabolise' order by started_at")).toEqual([{ ok: false }, { ok: false }, { ok: true }]);
+    expect((await queueRows()).map((r) => r.status)).toEqual(["failed", "done"]);
+    expect(await q("select ok from extractor_runs where pass = 'notice.metabolise' order by started_at")).toEqual([{ ok: false }, { ok: true }]);
+  });
+
+  it("an unavailable metaboliser (returned, or thrown) leaves the row queued, records a failed run, and stops the tick before the next stretch", async () => {
+    await enable();
+    await queued([{ speaker: "self", text: "first" }]);
+    await queued([{ speaker: "self", text: "second" }]);
+    for (const m of [fake({ kind: "unavailable", note: "HTTP 503" }), fake(new Error("boom"))]) {
+      const p = await go(m);
+      expect(p).toMatchObject({ ok: true, changed: 0 });
+      expect(p.notes![0]).toMatch(/left queued/);
+      expect(m.calls).toHaveLength(1); // the second stretch was not attempted
+      expect((await queueRows()).map((r) => r.status)).toEqual(["queued", "queued"]);
+    }
+    expect(await noticings()).toEqual([]);
+    const runs = await q("select ok, notes from extractor_runs where pass = 'notice.metabolise' order by started_at");
+    expect(runs.map((r) => r.ok)).toEqual([false, false]);
+    expect(runs[0].notes).toMatchObject({ done: 0, failed: 0, unavailable: "HTTP 503" });
+    // the endpoint comes back: both are worked
+    const m = fake(answer([feeling("joy")]));
+    expect((await go(m)).changed).toBe(2);
+    expect(m.calls).toHaveLength(2);
+    expect((await queueRows()).map((r) => r.status)).toEqual(["done", "done"]);
+  });
+
+  it("an empty result is a complete answer: the row is done and nothing is proposed", async () => {
+    await enable();
+    await queued();
+    expect(await go(fake({ kind: "empty" }))).toMatchObject({ ok: true, changed: 0 });
+    expect((await queueRows())[0]).toMatchObject({ status: "done" });
+    expect(await noticings()).toEqual([]);
   });
 
   it("attribution: the prompt labels a self turn 'me' and an other turn by its name, carries the cores and the context; a pet name rides as an alias, never as a feeling", async () => {
@@ -450,6 +489,32 @@ describe("notice.metabolise", () => {
     expect((await q("select notes from extractor_runs where pass = 'notice.metabolise' order by started_at desc limit 1"))[0].notes).toMatchObject({ expired: 2, done: 0, failed: 0 });
   });
 
+  it("expiry runs whatever the metaboliser kind or the extractor switch: an 8-day-old stretch is failed, a 6-day-old one is left alone, and an idle tick records nothing", async () => {
+    const six = new Date(Date.now() + 6 * DAY);
+    const eight = new Date(Date.now() + 8 * DAY);
+    // METABOLISER=none, extractor enabled
+    await enable();
+    await queued([{ speaker: "self", text: "old" }]);
+    expect(await go(NONE_METABOLISER, six)).toMatchObject({ ok: true, changed: 0 });
+    expect((await queueRows())[0]).toMatchObject({ status: "queued" });
+    expect(await q("select 1 from extractor_runs where pass = 'notice.metabolise'")).toEqual([]);
+    const p = await go(NONE_METABOLISER, eight);
+    expect(p.notes![0]).toMatch(/METABOLISER=none.*1 expired unprocessed/);
+    expect((await queueRows())[0]).toMatchObject({ status: "failed", note: "expired unprocessed" });
+    expect(await q("select ok, notes from extractor_runs where pass = 'notice.metabolise'")).toMatchObject([{ ok: true, notes: { expired: 1 } }]);
+    await go(NONE_METABOLISER, eight); // idle: nothing more recorded
+    expect(await q("select 1 from extractor_runs where pass = 'notice.metabolise'")).toHaveLength(1);
+    // extractor disabled (and a model present): likewise
+    await setExtractorState(admin, "alpha", "disable");
+    await queued([{ speaker: "self", text: "newer" }]);
+    const m = fake(answer([feeling("joy")]));
+    expect((await go(m, six)).notes![0]).toMatch(/extractor is not enabled/);
+    expect((await queueRows())[1]).toMatchObject({ status: "queued" });
+    expect((await go(m, eight)).notes![0]).toMatch(/1 expired unprocessed/);
+    expect((await queueRows())[1]).toMatchObject({ status: "failed", note: "expired unprocessed" });
+    expect(m.calls).toHaveLength(0);
+  });
+
   it("the gate is checked again under the lock: an extractor paused while the model worked leaves the stretch queued and writes nothing", async () => {
     await enable();
     await queued();
@@ -457,7 +522,7 @@ describe("notice.metabolise", () => {
       name: "fake", model: "m",
       async metabolise() {
         await setExtractorState(admin, "alpha", "pause");
-        return answer([feeling("joy")]);
+        return asResult(answer([feeling("joy")]));
       },
     };
     const p = await go(m);
@@ -726,7 +791,7 @@ describe("mind_health", () => {
     await queued();
     await queued([{ speaker: "self", text: "b" }]);
     await queued([{ speaker: "self", text: "c" }]);
-    await go(fake(null)); // the three stretches are worked together: all fail
+    await go(fake(UNUSABLE)); // the three stretches are worked together: all fail
     await queued([{ speaker: "self", text: "d" }]);
     await go(fake(answer()));
     const h = (await run(alpha, "mind_health", { mind_id: "alpha" })).receipt.projection.metabolise;

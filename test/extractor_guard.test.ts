@@ -236,7 +236,7 @@ describe("src/extractor never writes memory (runtime)", () => {
         name: "fake",
         model: "fake-model",
         async metabolise() {
-          return { feelings: [{ emotion: "joy", weight: "medium", pillar: "bond", content: "I felt joy for Rowan." }], relations: [{ subject: "Rowan", note: "Starts a new job.", warmth: true }] };
+          return { kind: "answer" as const, feelings: [{ emotion: "joy", weight: "medium", pillar: "bond", content: "I felt joy for Rowan." }], relations: [{ subject: "Rowan", note: "Starts a new job.", warmth: true }] };
         },
       };
       const reports = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, metaboliser, now: () => now }, { trigger: "manual", minds: ["alpha"], passes: [noticeMetabolise] });

@@ -6,15 +6,23 @@ import type { MetaboliserConfig } from "./metabolise_config.js";
 
 /**
  * The metaboliser: one chat completion against an OpenAI-compatible endpoint, answering with a JSON object
- * `{"feelings": [...], "relations": [...]}`. The same "one warning, null on failure" posture as the dreamer: the pass marks the
- * stretch failed when the model is silent, and writes no proposal. An answer with both arrays empty is a complete answer, not a failure.
+ * `{"feelings": [...], "relations": [...]}`. The result says what happened, so the pass can tell an outage from a bad answer:
+ * `answer` (proposals), `empty` (both arrays empty: a complete answer, the stretch is done with nothing proposed), `unusable` (the model
+ * answered but with no JSON object or neither array: the stretch is marked failed with the note), and `unavailable` (network error,
+ * timeout, non-2xx, empty body, or a throw: the stretch stays queued and the pass stops for this tick).
  */
 export interface Metaboliser {
   readonly name: string;
   /** The model's name, for the run record. */
   readonly model: string;
-  metabolise(system: string, user: string): Promise<MetaboliseAnswer | null>;
+  metabolise(system: string, user: string): Promise<MetaboliseResult>;
 }
+
+export type MetaboliseResult =
+  | ({ kind: "answer" } & MetaboliseAnswer)
+  | { kind: "empty" }
+  | { kind: "unusable"; note: string }
+  | { kind: "unavailable"; note: string };
 
 export const FEELING_WEIGHTS = ["light", "medium", "heavy"] as const;
 export type FeelingWeight = (typeof FEELING_WEIGHTS)[number];
@@ -58,8 +66,8 @@ export function answerFrom(text: string): MetaboliseAnswer | null {
     const emotion = clean(f.emotion, 64);
     const content = clean(f.content, 4000);
     const weight = typeof f.weight === "string" ? f.weight.trim().toLowerCase() : "";
-    const pillar = typeof f.pillar === "string" ? f.pillar.replace(/\u0000/g, "").trim() : null;
-    if (emotion === null || content === null || pillar === null || pillar.length > 64 || !(FEELING_WEIGHTS as readonly string[]).includes(weight)) continue;
+    const pillar = clean(f.pillar, 64); // a missing or empty pillar is absent, and the prompt asks for one: the entry is dropped
+    if (emotion === null || content === null || pillar === null || !(FEELING_WEIGHTS as readonly string[]).includes(weight)) continue;
     feelings.push({ emotion, weight: weight as FeelingWeight, pillar, content });
   }
   const relations: MetaboliseRelation[] = [];
@@ -78,7 +86,7 @@ export function answerFrom(text: string): MetaboliseAnswer | null {
 export const NONE_METABOLISER: Metaboliser = {
   name: "none",
   model: "none",
-  metabolise: async () => null,
+  metabolise: async () => ({ kind: "unavailable", note: "METABOLISER=none" }),
 };
 
 export function httpMetaboliser(cfg: MetaboliserConfig, fetchImpl: typeof fetch = fetch): Metaboliser {
@@ -106,13 +114,17 @@ export function httpMetaboliser(cfg: MetaboliserConfig, fetchImpl: typeof fetch 
         const data = (await res.json()) as { choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string } }> };
         const m = data?.choices?.[0]?.message;
         const text = m?.content?.trim() || m?.reasoning_content?.trim() || m?.reasoning?.trim() || "";
-        return text === "" ? null : answerFrom(text);
+        if (text === "") throw new Error("empty response body");
+        const a = answerFrom(text);
+        if (a === null) return { kind: "unusable", note: "the metaboliser answered without a JSON object holding feelings or relations" };
+        return a.feelings.length === 0 && a.relations.length === 0 ? { kind: "empty" } : { kind: "answer", ...a };
       } catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
         if (!warned) {
           warned = true;
-          console.warn(`[metabolise] the metaboliser at ${cfg.url} failed (${e instanceof Error ? e.message : String(e)}); stretches are marked failed until it answers`);
+          console.warn(`[metabolise] the metaboliser at ${cfg.url} failed (${why}); stretches stay queued until it answers`);
         }
-        return null;
+        return { kind: "unavailable", note: `the metaboliser was unavailable: ${why}` };
       }
     },
   };
