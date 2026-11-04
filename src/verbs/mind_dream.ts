@@ -96,10 +96,19 @@ export const mind_dream = defineVerb({
   // mind_observe embeds the text it stores (its content); anchor stores input.text, or else the dream's own content, so that is
   // what is embedded (the dream is read before the write transaction; its content is immutable once laid)
   embedText: (input) => (input.operation === "anchor" ? (input.text ?? null) : null),
-  embedTextFrom: async (read, input) => {
+  // Only an anchor without the mind's own words needs a lookup. The dream is embedded only if the handler could accept the anchor:
+  // laid, at stage propose, not past fades_at, and the operator's stage for the mind is propose; otherwise nothing is embedded.
+  embedTextFrom: (input) => {
     if (input.operation !== "anchor" || input.text !== undefined || input.dream_id === undefined) return null;
-    const r = await read<{ content: string }>(`select content from dreams where id = $1 and mind_id = $2 and stage = 'propose'`, [input.dream_id, input.mind_id]);
-    return r[0]?.content ?? null;
+    const dreamId = input.dream_id;
+    return async (read, now) => {
+      const r = await read<{ content: string }>(
+        `select d.content from dreams d join dream_state s on s.mind_id = d.mind_id
+          where d.id = $1 and d.mind_id = $2 and d.stage = 'propose' and d.status = 'laid' and d.fades_at > $3 and s.stage = 'propose'`,
+        [dreamId, input.mind_id, now],
+      );
+      return r[0]?.content ?? null;
+    };
   },
   handler: async (ctx, input): Promise<Result<unknown>> => {
     if (input.operation === "list") {

@@ -1,7 +1,7 @@
 // sanctum-mind. Copyright 2026 LKM Constructs LLC.
 // Licensed under the PolyForm Noncommercial License 1.0.0; see LICENSE.md. Required Notice: Copyright 2026 LKM Constructs LLC.
 
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +23,7 @@ import { exportMind } from "../src/export.js";
 import { importMind } from "../src/import-mind.js";
 import { purgeMind } from "../src/purge.js";
 import { NEEDS_OPERATOR, dreamReport, formatDreamReport, parseDreamArgs, runDreamCommand, setDreamState } from "../src/dream-admin.js";
-import type { Caller } from "../src/verbs/types.js";
+import type { Caller, Embedder } from "../src/verbs/types.js";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -485,6 +485,53 @@ describe("review fixes", () => {
     expect((await q("alpha", "select embedding is not null as e from nodes where id = $1", [r2.receipt.projection.observation.node_id]))[0].e).toBe(true);
   });
 
+  it("the runner opens one connection for list, read, release, prefer and anchor with text, whatever the embedder; an anchor without text opens a lookup first only when an embedder could use it", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    await D(alpha, { operation: "list" }); // warm the pool (its first transaction may ask the database about its lane)
+    const connections = async (embedder: Embedder, input: Record<string, unknown>): Promise<number> => {
+      const spy = vi.spyOn(pool, "connect");
+      try {
+        const r = (await runVerb({ pool, registry, now: () => clock, embedder }, alpha, "mind_dream", { mind_id: "alpha", ...input })) as any;
+        expect(r.ok).toBe(true);
+        return spy.mock.calls.length;
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    for (const [embedder, anchorNoText] of [[NONE_EMBEDDER, 1], [FAKE_EMBEDDER, 2]] as const) {
+      const [a, b, c] = [await seedDream(), await seedDream(), await seedDream()];
+      expect(await connections(embedder, { operation: "list" })).toBe(1);
+      expect(await connections(embedder, { operation: "read", dream_id: a })).toBe(1);
+      expect(await connections(embedder, { operation: "prefer", relations: "all" })).toBe(1);
+      expect(await connections(embedder, { operation: "release", dream_id: c })).toBe(1);
+      expect(await connections(embedder, { operation: "anchor", dream_id: a, text: "my words", texture: { charge: ["x"] } })).toBe(1);
+      expect(await connections(embedder, { operation: "anchor", dream_id: b, texture: { charge: ["x"] } })).toBe(anchorNoText);
+    }
+  });
+
+  it("anchor calls the embedder only for a dream the handler could accept: laid, unfaded, at stage propose, with the operator at propose", async () => {
+    let calls = 0;
+    const counting: Embedder = { ...FAKE_EMBEDDER, embed: async (t) => { calls++; return FAKE_EMBEDDER.embed(t); } };
+    const anchorIt = (id: string) => runVerb({ pool, registry, now: () => clock, embedder: counting }, alpha, "mind_dream", { mind_id: "alpha", operation: "anchor", dream_id: id, texture: { charge: ["x"] } }) as Promise<any>;
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    const released = await seedDream();
+    expect((await D(alpha, { operation: "release", dream_id: released })).ok).toBe(true);
+    const faded = await seedDream({ fadeInDays: -1 });
+    const shadow = await seedDream({ stage: "shadow" });
+    for (const id of [released, faded, shadow]) {
+      expect((await anchorIt(id)).ok).toBe(false);
+    }
+    expect(calls).toBe(0);
+    // the operator backed out to shadow: the handler refuses, so nothing is embedded
+    const live = await seedDream();
+    await setDreamState(admin, "alpha", "stage", { stage: "shadow" });
+    expect((await anchorIt(live)).ok).toBe(false);
+    expect(calls).toBe(0);
+    await setDreamState(admin, "alpha", "stage", { stage: "propose" });
+    expect((await anchorIt(live)).ok).toBe(true);
+    expect(calls).toBe(1);
+  });
+
   it("the gap is checked again under the lock: a gap raised while the model works holds the dream back", async () => {
     await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00", gapHours: 20 });
     await texturedEvent("a long day");
@@ -645,5 +692,58 @@ describe("portability", () => {
     const pr = await purgeMind(a2, "alpha", { confirm: "alpha" });
     expect(pr.counts).toMatchObject({ dreams: 2, dream_state: 1, dream_preferences: 1 });
     expect((await a2.query("select count(*)::int as n from dreams")).rows[0].n).toBe(0);
+  });
+
+  async function exportTampered(seed: (id: string) => Promise<void>, status: string, tamper: (row: any, events: any[]) => void): Promise<{ id: string; f: string }> {
+    const id = await seedDream({ fadeInDays: status === "faded" ? -1 : 7 });
+    await seed(id);
+    const f = join(dir, `t${seq++}.json`);
+    await exportMind(pool, "alpha", f);
+    const doc = JSON.parse(readFileSync(f, "utf8"));
+    const row = doc.projections.dreams.find((r: any) => r.id === id);
+    expect(row.status).toBe(status);
+    tamper(row, doc.events);
+    writeFileSync(f, JSON.stringify(doc));
+    return { id, f };
+  }
+
+  it("import: a faded row whose decision event has the wrong kind or subject takes the fade path (a fresh dream.faded event), counted apart from laid ones", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "05:15" });
+    const wrongKind = await exportTampered(async () => { await daemon([dreamFade]); }, "faded", (row) => { row.decided_event_id = row.laid_event_id; });
+    const { a2, p2 } = await secondDb();
+    const rep = await importMind(p2, wrongKind.f, "alpha");
+    const d = (await a2.query("select status, decided_event_id, decided_at from dreams where id = $1", [wrongKind.id])).rows[0];
+    expect(d.status).toBe("faded");
+    expect(d.decided_at).toBeInstanceOf(Date);
+    expect((await a2.query("select kind, subject_id from events where id = $1", [d.decided_event_id])).rows[0]).toEqual({ kind: "dream.faded", subject_id: wrongKind.id });
+    expect(rep.notes.some((n) => /1 dream\(s\) in the file were already faded but had no dream\.faded event of their own/.test(n))).toBe(true);
+    expect(rep.notes.some((n) => /arrived faded/.test(n))).toBe(false);
+  });
+
+  it("import: a faded row whose decision event is about another dream also takes the fade path", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "05:15" });
+    const other = await seedDream();
+    const r = await exportTampered(async () => { await daemon([dreamFade]); }, "faded", (row, events) => {
+      const ev = events.find((e: any) => e.kind === "dream.laid" && e.subject_id === other);
+      row.decided_event_id = ev.id;
+    });
+    const { a2, p2 } = await secondDb();
+    await importMind(p2, r.f, "alpha");
+    const d = (await a2.query("select decided_event_id from dreams where id = $1", [r.id])).rows[0];
+    expect((await a2.query("select kind, subject_id from events where id = $1", [d.decided_event_id])).rows[0]).toEqual({ kind: "dream.faded", subject_id: r.id });
+  });
+
+  it("import: an anchored or released row whose decision event is wrong fails the import, naming the dream; nothing is written", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "05:15" });
+    for (const [op, status] of [["anchor", "anchored"], ["release", "released"]] as const) {
+      const r = await exportTampered(
+        async (id) => { expect((await D(alpha, { operation: op, dream_id: id, texture: { charge: ["x"] } })).ok).toBe(true); },
+        status,
+        (row) => { row.decided_event_id = row.laid_event_id; },
+      );
+      const { a2, p2 } = await secondDb();
+      await expect(importMind(p2, r.f, "alpha")).rejects.toThrow(new RegExp(`dream ${r.id} is ${status} but the file holds no dream\\.${status} event for it`));
+      expect((await a2.query("select count(*)::int as n from dreams")).rows[0].n).toBe(0);
+    }
   });
 });

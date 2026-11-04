@@ -583,17 +583,31 @@ export async function importMind(
         if (key === "extractor_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));
         if (key === "dreams") {
           // A laid dream from another life is not shown again: it arrives faded, with a dream.faded event written as the mind
-          // (reason "imported"). Decided ones (anchored, released, and faded too) keep their status only if they carry their decision
-          // event (a faded row without one gets a dream.faded event like a laid one: every faded dream has one); a decision with no
-          // decided_at (written before migration 0028 required it) is dated at the import.
+          // (reason "imported"). Decided ones (anchored, released, and faded too) keep their status only if they carry a decision
+          // event the database's guard will accept (an event of this mind, subject = the dream, kind = dream.<status>). A faded row
+          // without such an event (0028 checks only new writes, so a database upgraded from 0027 may hold faded rows with no
+          // dream.faded event, or a wrong one) gets a fresh dream.faded event like a laid one; an anchored or released row without
+          // one fails the import, naming the dream. A decision with no decided_at (written before 0028 required it) is dated at the import.
           const fades: Row[] = [];
+          const evById = new Map(doc.events.map((e) => [lc(e.id), e]));
+          const eventPasses = (r: Row, st: string): boolean => {
+            if (typeof r.decided_event_id !== "string" || typeof r.id !== "string") return false;
+            const e = evById.get(lc(r.decided_event_id));
+            return e !== undefined && e.kind === `dream.${st}` && typeof e.subject_id === "string" && lc(e.subject_id) === lc(r.id);
+          };
           let laidCount = 0;
+          let refadedCount = 0;
           rows = rows.map((r) => {
             const st = String(r.status);
-            if ((st === "faded" || st === "anchored" || st === "released") && typeof r.decided_event_id === "string") {
+            if ((st === "faded" || st === "anchored" || st === "released") && eventPasses(r, st)) {
               return { ...r, status: st, decided_at: r.decided_at ?? importedAt };
             }
             if (typeof r.id !== "string") throw new ImportError("export file: a dream has no id");
+            if (st === "anchored" || st === "released") {
+              throw new ImportError(
+                `export file: dream ${lc(r.id)} is ${st} but the file holds no dream.${st} event for it (its decided_event_id is missing, or names an event of another kind or subject); nothing was imported`,
+              );
+            }
             const did = lc(r.id);
             const evId = importExpiryEventId(`dream:${did}`);
             fades.push({
@@ -601,14 +615,16 @@ export async function importMind(
               payload: dreamFadedPayload.parse({ dream_id: did, reason: "imported" }),
               written_by: target, recorded_at: importedAt, created_at: importedAt,
             });
-            laidCount++;
+            if (st === "faded") refadedCount++;
+            else laidCount++;
             return { ...r, status: "faded", decided_event_id: evId, decided_at: importedAt };
           });
           if (fades.length > 0) {
             const evRep = await insertRows(tx, "events", fades, await cols("events"), { byId: true, skipExisting: true, ...(dryEvents ? { dryEvents } : {}) });
             tables.events!.inserted += evRep.inserted;
             tables.events!.already_present += evRep.already_present;
-            notes.push(`${laidCount} dream(s) in the file arrived faded, each with a dream.faded event (reason "imported"): a dream from another life is not shown again`);
+            if (laidCount > 0) notes.push(`${laidCount} dream(s) in the file arrived faded, each with a dream.faded event (reason "imported"): a dream from another life is not shown again`);
+            if (refadedCount > 0) notes.push(`${refadedCount} dream(s) in the file were already faded but had no dream.faded event of their own; each was given one (reason "imported")`);
           }
         }
         if (key === "dream_state") rows = rows.map((r) => ({ ...r, enabled: false, stage: "shadow" }));

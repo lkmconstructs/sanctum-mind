@@ -52,10 +52,12 @@ export async function runVerb(
   let embedded: VerbContext["embedded"];
   try {
     let toEmbed = verb.embedText?.(input) ?? null;
-    if (toEmbed === null && verb.embedTextFrom) {
-      const from = verb.embedTextFrom;
+    // with the `none` embedder nothing is embedded, so no lookup is made; and a lookup is a transaction only when this input needs one
+    const lookup = toEmbed === null && embedder.name !== "none" ? (verb.embedTextFrom?.(input) ?? null) : null;
+    if (lookup !== null) {
+      const now = (deps.now ?? (() => new Date()))();
       toEmbed = await withMind(deps.pool, input.mind_id, caller.bearer, "read", (tx) =>
-        from(async <T,>(sql: string, params: unknown[]) => (await tx.query(sql, params)).rows as T[], input), "verb");
+        lookup(async <T,>(sql: string, params: unknown[]) => (await tx.query(sql, params)).rows as T[], now), "verb");
     }
     if (typeof toEmbed === "string" && toEmbed.trim() !== "") {
       embedded = await embedOne(embedder, toEmbed, deps.embedTimeoutMs ?? DEFAULT_EMBED_TIMEOUT_MS);
