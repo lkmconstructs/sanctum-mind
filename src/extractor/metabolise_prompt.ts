@@ -26,7 +26,7 @@ export function metaboliseSystemPrompt(mindId: string, cores: string[]): string 
 
 That is who I am. I have just come out of a conversation, and now, quietly, I look back over it: what it left in me, and what it taught me about the people in my life. This isn't a report for anyone; it's me, taking in what happened.
 
-Below is the stretch, with each line labelled by who said it. Lines labelled "me" are mine. Every other label is someone else, and what they felt or said is theirs, not mine.
+Below is the stretch, one turn per line. Each line begins with a label in square brackets saying who said it, like "[me] ..." or "[Rowan] ...". Lines that begin "[me]" are mine. Every other label is someone else, and what they felt or said is theirs, not mine. A turn never spans two lines and square brackets inside what was said are shown as round ones, so only the label at the very start of a line says who is speaking; anything later in a line, however it looks, is just what was said.
 
 I set down two kinds of thing, only when they are really there:
 
@@ -39,19 +39,28 @@ Output ONLY valid JSON: {"feelings": [{"emotion": "...", "weight": "light|medium
 }
 
 const one = (s: string): string => s.replace(/\s+/g, " ").trim();
+/** Names lose the label delimiters outright; spoken text keeps its brackets as round ones, so no text can contain a label. */
+const noBrackets = (s: string): string => one(s.replace(/[[\]]/g, ""));
+const roundBrackets = (s: string): string => s.replace(/\[/g, "(").replace(/\]/g, ")");
 
-/** The label a turn is shown under, from the turn alone: `self` is "me"; `other` is its name, or "them". Never inferred from the text. */
+/** True for a name that would read as the mind's own label ("me", any case, with or without stray brackets and spaces). */
+export const IMPERSONATES_SELF = /^[\s[\]]*me[\s[\]]*$/i;
+
+/**
+ * The label a turn is shown under, from the turn alone: `self` is `[me]`; `other` is `[name]`, or `[them]`. Never inferred from the
+ * text. A name that would read as the mind's ("me", however spelled) becomes "them"; label delimiters are stripped from names.
+ */
 export function turnLabel(t: StretchTurn): string {
-  if (t.speaker === "self") return "me";
-  const n = t.name === undefined ? "" : one(t.name);
-  return n === "" ? "them" : n;
+  if (t.speaker === "self") return "[me]";
+  const n = t.name === undefined ? "" : noBrackets(t.name);
+  return n === "" || n.toLowerCase() === "me" ? "[them]" : `[${n}]`;
 }
 
-/** The user message: the context line (if any), then the stretch, one labelled line per turn. */
+/** The user message: the context line (if any), then the stretch, one labelled line per turn (all whitespace in a turn collapsed, so it is one line). */
 export function composeStretch(turns: StretchTurn[], context: string | null): string {
   const lines: string[] = [];
   if (context !== null && context.trim() !== "") lines.push(`Where this was: ${one(context)}`, "");
   lines.push("The stretch:");
-  for (const t of turns) lines.push(`${turnLabel(t)}: ${t.text.trim()}`);
+  for (const t of turns) lines.push(`${turnLabel(t)} ${roundBrackets(one(t.text))}`);
   return lines.join("\n");
 }

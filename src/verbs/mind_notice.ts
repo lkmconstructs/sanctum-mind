@@ -405,11 +405,14 @@ async function acceptRelation(ctx: VerbContext, n: NoticingRow, input: z.infer<t
   const alias = str(n.payload.alias);
 
   await ctx.tx.query("select pg_advisory_xact_lock(hashtext('relation:' || $1 || ':' || $2))", [ctx.mind_id, subject]);
-  const cur = await ctx.tx.query<{ state: string; intensity: number; note: string | null; aliases: string[] }>(
-    `select state, intensity, note, aliases from relations where mind_id = $1 and subject = $2 and cleared_at is null`,
+  const cur = await ctx.tx.query<{ state: string; intensity: number; note: string | null; aliases: string[]; cleared_at: Date | null }>(
+    `select state, intensity, note, aliases, cleared_at from relations where mind_id = $1 and subject = $2`,
     [ctx.mind_id, subject],
   );
-  const have = cur.rows[0];
+  const row = cur.rows[0];
+  // A cleared relation is a new one as far as state, intensity and note go (the mind is re-opening it, so it must say how), but the
+  // aliases the cleared row held are still the mind's and are merged with, never replaced.
+  const have = row !== undefined && row.cleared_at === null ? row : undefined;
   let state: string;
   let intensity: number;
   let note: string;
@@ -424,7 +427,7 @@ async function acceptRelation(ctx: VerbContext, n: NoticingRow, input: z.infer<t
     intensity = input.intensity ?? 0.5;
     note = proposedNote;
   }
-  const known = have?.aliases ?? [];
+  const known = row?.aliases ?? [];
   const addAlias = alias !== null && !known.some((a) => a.toLowerCase() === alias.toLowerCase()) && alias.toLowerCase() !== subject.toLowerCase();
   const set = await setRelation(ctx, { subject, state, intensity, note, ...(addAlias ? { aliases: [...known, alias!] } : {}) });
 

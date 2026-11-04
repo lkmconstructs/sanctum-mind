@@ -746,4 +746,29 @@ describe("portability", () => {
       expect((await a2.query("select count(*)::int as n from dreams")).rows[0].n).toBe(0);
     }
   });
+
+  it("import: an anchored or released row whose decided_event_id names an event absent from the file fails the import, naming the dream (not a silent drop); nothing is written", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "05:15" });
+    for (const [op, status] of [["anchor", "anchored"], ["release", "released"]] as const) {
+      const r = await exportTampered(
+        async (id) => { expect((await D(alpha, { operation: op, dream_id: id, texture: { charge: ["x"] } })).ok).toBe(true); },
+        status,
+        (row) => { row.decided_event_id = "00000000-0000-4000-8000-000000000abc"; },
+      );
+      const { a2, p2 } = await secondDb();
+      await expect(importMind(p2, r.f, "alpha")).rejects.toThrow(new RegExp(`dream ${r.id} is ${status} but its decided_event_id names an event that is not in the file`));
+      expect((await a2.query("select count(*)::int as n from dreams")).rows[0].n).toBe(0);
+    }
+  });
+
+  it("import: a faded row whose decided_event_id is absent from the file is kept and takes the fresh dream.faded path", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "05:15" });
+    const r = await exportTampered(async () => { await daemon([dreamFade]); }, "faded", (row) => { row.decided_event_id = "00000000-0000-4000-8000-000000000abc"; });
+    const { a2, p2 } = await secondDb();
+    const rep = await importMind(p2, r.f, "alpha");
+    const d = (await a2.query("select status, decided_event_id from dreams where id = $1", [r.id])).rows[0];
+    expect(d.status).toBe("faded");
+    expect((await a2.query("select kind, subject_id from events where id = $1", [d.decided_event_id])).rows[0]).toEqual({ kind: "dream.faded", subject_id: r.id });
+    expect(rep.notes.some((n) => /1 dream\(s\) in the file were already faded but had no dream\.faded event of their own/.test(n))).toBe(true);
+  });
 });

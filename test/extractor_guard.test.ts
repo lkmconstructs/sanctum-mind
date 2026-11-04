@@ -9,8 +9,12 @@ import type { Pool } from "pg";
 import { appPool, closePool, queryAs, resetDatabase } from "./helpers.js";
 import { runDaemonOnce } from "../src/daemon/index.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
-import { violations, WHITELISTED_KINDS } from "./guard_scan.js";
-import { EXTRACTOR_PASSES } from "../src/extractor/index.js";
+import { DREAM_FORBIDDEN_TABLES, violations, WHITELISTED_KINDS } from "./guard_scan.js";
+import { EXTRACTOR_PASSES, noticeMetabolise } from "../src/extractor/index.js";
+import { setExtractorState } from "../src/extractor-admin.js";
+import { runVerb } from "../src/verbs/run.js";
+import { registry } from "../src/verbs/registry.js";
+import type { Metaboliser } from "../src/extractor/metaboliser.js";
 
 /**
  * The extractor proposes; it never writes memory. Two layers check that, and neither is the real boundary (that is the
@@ -67,6 +71,16 @@ describe("src/extractor never writes memory (static)", () => {
       ["copy", `copy nodes from stdin`],
       ["truncate", `truncate table edges`],
       ["a cte write", `with x as (insert into events (a) values (1) returning id) select * from x`],
+      ["insert into relations", `await tx.query("insert into relations (mind_id, subject) values ('a', 'b')")`],
+      ["update relations", `await tx.query("update relations set note = 'x'")`],
+      ["delete from drive_state", `await tx.query("delete from drive_state where true")`],
+      ["update drive_state, quoted", `await tx.query('update public."drive_state" set level = 1')`],
+      ["insert into attention_pins", `await tx.query("insert into attention_pins (a) values (1)")`],
+      ["update dream_preferences", `await tx.query("update dream_preferences set a = 1")`],
+      ["insert into dreams", `await tx.query("insert into dreams (id) values (1)")`],
+      ["update dreams", `await tx.query("update dreams set status = 'faded'")`],
+      ["insert into metabolise_queue", `await tx.query("insert into metabolise_queue (mind_id) values ('a')")`],
+      ["delete from metabolise_queue", `await tx.query("delete from metabolise_queue where true")`],
       ["insert into repair_work", `await tx.query("insert into repair_work (a) values (1)")`],
       ["insert into repair_work, quoted and qualified", `await tx.query('INSERT INTO public."repair_work" (a)')`],
       ["delete from repair_work", `await tx.query("delete from repair_work where true")`],
@@ -130,6 +144,15 @@ describe("src/extractor never writes memory (static)", () => {
       expect(violations(`await tx.query("select id from nodes where id = $1"); await tx.query("select * from events e join edges d on true")`)).toEqual([]);
       expect(violations(`on conflict (id) do update set status = excluded.status`)).toEqual([]);
     });
+    it("updating a metabolise_queue row's status, and reading the tables it may not write", () => {
+      expect(violations(`await tx.query("update metabolise_queue set status = 'done', done_at = now() where id = $1")`)).toEqual([]);
+      expect(violations(`await tx.query("select subject, state from relations where mind_id = $1"); await tx.query("select relations from dream_preferences"); await tx.query("select 1 from dreams")`)).toEqual([]);
+    });
+    it("the dream directory's own table list lets dreams be laid and decided, and still bars the rest", () => {
+      expect(violations(`await tx.query("insert into dreams (id) values (1)"); await tx.query("update dreams set status = 'faded'")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES)).toEqual([]);
+      expect(violations(`await tx.query("insert into relations (a) values (1)")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES).length).toBeGreaterThan(0);
+      expect(violations(`await tx.query("update drive_state set a = 1")`, ["dream.laid"], DREAM_FORBIDDEN_TABLES).length).toBeGreaterThan(0);
+    });
     it("mentions in comments", () => {
       expect(violations(`// never insert into nodes here\n/* appendEvent(ctx, { kind: "observe" }) and registry */\nconst x = 1;`)).toEqual([]);
     });
@@ -182,4 +205,47 @@ describe("src/extractor never writes memory (runtime)", () => {
     expect(kinds.length).toBeGreaterThan(0);
     for (const k of kinds) expect(WHITELISTED_KINDS).toContain(k);
   });
+
+  for (const stage of ["shadow", "propose"] as const) {
+    it(`the metabolise pass at ${stage} proposes but leaves nodes, edges, relations and drive_state byte-identical`, async () => {
+      const now = new Date(Date.now() + 1000);
+      const run = (name: string, input: Record<string, unknown>) =>
+        runVerb({ pool, registry, now: () => now, embedder: NONE_EMBEDDER }, { bearer: "alpha", grants: {} }, name, { mind_id: "alpha", ...input }) as Promise<any>;
+      const as = (sql: string, params: unknown[] = []) => queryAs(pool, "alpha", "alpha", sql, params);
+      const ns: string[] = [];
+      for (const c of ["one", "two"]) ns.push((await as(`insert into nodes (mind_id, node_type, label, content, written_by) values ('alpha', 'observation', $1, $1, 'alpha') returning id`, [c])).rows[0].id);
+      await as(`insert into edges (mind_id, edge_type, written_by, source_node_id, target_node_id) values ('alpha', 'related_to', 'alpha', $1, $2)`, ns);
+      expect((await run("mind_relate", { operation: "set", subject: "Rowan", state: "close", intensity: 0.7, note: "Old friend." })).ok).toBe(true);
+      expect((await run("mind_drive", { operation: "nudge", drive: "play", axis: "intensity", delta: 1 })).ok).toBe(true);
+      await setExtractorState(admin, "alpha", "enable", { stage, schedule: "23:59" });
+      const queued = await run("mind_metabolise", { turns: [{ speaker: "other", name: "Rowan", text: "I got the job." }, { speaker: "self", text: "I am so glad." }] });
+      expect(queued.ok).toBe(true);
+
+      const snap = async () => ({
+        nodes: (await admin.query("select to_jsonb(n)::text j from nodes n order by id")).rows.map((r) => r.j),
+        edges: (await admin.query("select to_jsonb(e)::text j from edges e order by id")).rows.map((r) => r.j),
+        relations: (await admin.query("select to_jsonb(r)::text j from relations r order by mind_id, subject")).rows.map((r) => r.j),
+        drive_state: (await admin.query("select to_jsonb(d)::text j from drive_state d order by mind_id, context, drive")).rows.map((r) => r.j),
+      });
+      const before = await snap();
+      expect(before.relations.length).toBeGreaterThan(0);
+      expect(before.drive_state.length).toBeGreaterThan(0);
+      const maxSeq = (await admin.query("select max(seq)::bigint s from events")).rows[0].s;
+
+      const metaboliser: Metaboliser = {
+        name: "fake",
+        model: "fake-model",
+        async metabolise() {
+          return { feelings: [{ emotion: "joy", weight: "medium", pillar: "bond", content: "I felt joy for Rowan." }], relations: [{ subject: "Rowan", note: "Starts a new job.", warmth: true }] };
+        },
+      };
+      const reports = await runDaemonOnce({ pool, embedder: NONE_EMBEDDER, metaboliser, now: () => now }, { trigger: "manual", minds: ["alpha"], passes: [noticeMetabolise] });
+      expect(reports[0]!.passes[0]).toMatchObject({ ok: true, changed: 2 }); // not vacuous: a feeling and a relation were proposed
+      expect((await admin.query("select count(*)::int c from noticings where stage = $1", [stage])).rows[0].c).toBe(2);
+
+      expect(await snap()).toEqual(before);
+      const kinds = (await admin.query("select distinct kind from events where seq > $1", [maxSeq])).rows.map((r) => r.kind);
+      expect(kinds).toEqual(["notice.proposed"]);
+    });
+  }
 });

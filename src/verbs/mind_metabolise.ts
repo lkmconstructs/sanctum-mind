@@ -6,6 +6,7 @@ import { ok, type Result } from "../result.js";
 import { defineVerb } from "./types.js";
 import { appendEvent, mindIdSchema, text } from "./common.js";
 import { MEMORY_MIND_ONLY } from "./self_common.js";
+import { IMPERSONATES_SELF } from "../extractor/metabolise_prompt.js";
 
 /** The most text one stretch may carry across all its turns (the model reads it in one call). */
 export const METABOLISE_MAX_CHARS = 24_000;
@@ -21,6 +22,14 @@ const schema = z.strictObject({
   /** where the stretch happened (a channel, a room, a situation), one short line */
   context: text(1000).optional(),
 }).superRefine((v, c) => {
+  v.turns.forEach((t, i) => {
+    if (t.speaker === "self" && t.name !== undefined) {
+      c.addIssue({ code: "custom", message: "a self turn is the mind and takes no name", path: ["turns", i, "name"] });
+    }
+    if (t.speaker === "other" && t.name !== undefined && IMPERSONATES_SELF.test(t.name)) {
+      c.addIssue({ code: "custom", message: 'an other turn cannot be named "me": that label is the mind\'s own', path: ["turns", i, "name"] });
+    }
+  });
   const total = v.turns.reduce((n, t) => n + t.text.length, 0);
   if (total > METABOLISE_MAX_CHARS) {
     c.addIssue({ code: "custom", message: `the turns carry ${total} characters; at most ${METABOLISE_MAX_CHARS} across a stretch`, path: ["turns"] });

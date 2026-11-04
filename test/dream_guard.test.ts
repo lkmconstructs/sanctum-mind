@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
 import { appPool, closePool, queryAs, resetDatabase } from "./helpers.js";
-import { violations } from "./guard_scan.js";
+import { DREAM_FORBIDDEN_TABLES, violations } from "./guard_scan.js";
 import { runDaemonOnce } from "../src/daemon/index.js";
 import { NONE_EMBEDDER } from "../src/embed/none.js";
 import { DREAM_PASSES } from "../src/dream/index.js";
@@ -36,7 +36,7 @@ describe("src/dream never writes memory (static scan)", () => {
   });
   for (const f of all) {
     it(`${path.relative(DIR, f)} has no memory writes, no verb imports and appends only dream.laid / dream.faded`, () => {
-      expect(violations(readFileSync(f, "utf8"), DREAM_WHITELISTED_KINDS)).toEqual([]);
+      expect(violations(readFileSync(f, "utf8"), DREAM_WHITELISTED_KINDS, DREAM_FORBIDDEN_TABLES)).toEqual([]);
     });
   }
 });

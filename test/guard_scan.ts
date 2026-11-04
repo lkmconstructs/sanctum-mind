@@ -61,8 +61,14 @@ function parenBody(code: string, open: number): string | null {
   return null;
 }
 
-const T = String.raw`(?:public\s*\.\s*)?"?(?:nodes|events|edges)"?(?![\w])`;
-const SQL_FORMS: Array<[RegExp, string]> = [
+/** Tables the extractor must not write, beyond the memory tables (nodes, events, edges) every guarded directory is barred from. */
+export const EXTRACTOR_FORBIDDEN_TABLES = ["relations", "drive_state", "attention_pins", "dream_preferences", "dreams"];
+/** The same for src/dream/: it lays `dreams` itself, so that one is not forbidden there. */
+export const DREAM_FORBIDDEN_TABLES = ["relations", "drive_state", "attention_pins", "dream_preferences"];
+
+function sqlForms(extra: readonly string[]): Array<[RegExp, string]> {
+  const T = String.raw`(?:public\s*\.\s*)?"?(?:${["nodes", "events", "edges", ...extra].join("|")})"?(?![\w])`;
+  return [
   [new RegExp(String.raw`\binsert\s+into\s+${T}`, "i"), "inserts into a memory table"],
   [new RegExp(String.raw`\bupdate\s+(?:only\s+)?${T}`, "i"), "updates a memory table"],
   [new RegExp(String.raw`\bmerge\s+into\s+${T}`, "i"), "merges into a memory table"],
@@ -73,7 +79,11 @@ const SQL_FORMS: Array<[RegExp, string]> = [
   // repair_work: the extractor may only claim and acknowledge (update); the rows are inserted by verbs in the invalidating transaction and by the operator's backfill
   [/\b(?:insert\s+into|merge\s+into|copy)\s+(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "inserts into repair_work (only verbs and the operator backfill insert work)"],
   [/\b(?:delete\s+from|truncate(?:\s+table)?)\s+(?:only\s+)?(?:public\s*\.\s*)?"?repair_work"?(?![\w])/i, "deletes from repair_work"],
-];
+  // metabolise_queue: rows are queued by mind_metabolise; a pass may only change a row's status (update)
+  [/\b(?:insert\s+into|merge\s+into|copy)\s+(?:public\s*\.\s*)?"?metabolise_queue"?(?![\w])/i, "inserts into metabolise_queue (only mind_metabolise queues a stretch)"],
+  [/\b(?:delete\s+from|truncate(?:\s+table)?)\s+(?:only\s+)?(?:public\s*\.\s*)?"?metabolise_queue"?(?![\w])/i, "deletes from metabolise_queue"],
+  ];
+}
 const FORBIDDEN_IDENTIFIERS: Array<[RegExp, string]> = [
   [/\bregistry\b/, "uses the verb registry"],
   [/\brunVerb\b/, "calls runVerb"],
@@ -83,7 +93,12 @@ const FORBIDDEN_IDENTIFIERS: Array<[RegExp, string]> = [
   [/\bsupersedeNode\b/, "uses supersedeNode"],
 ];
 
-export function violations(source: string, whitelist: readonly string[] = WHITELISTED_KINDS): string[] {
+export function violations(
+  source: string,
+  whitelist: readonly string[] = WHITELISTED_KINDS,
+  forbiddenTables: readonly string[] = EXTRACTOR_FORBIDDEN_TABLES,
+): string[] {
+  const SQL_FORMS = sqlForms(forbiddenTables);
   const code = blankComments(source);
   const out: string[] = [];
 

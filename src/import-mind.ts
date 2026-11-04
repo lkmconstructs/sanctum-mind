@@ -324,6 +324,41 @@ function dropForeignRefs(doc: Doc): Record<string, number> {
   }
 }
 
+/**
+ * Run BEFORE dropForeignRefs, which would silently drop a row whose decided_event_id names an event the file does not hold.
+ * - dreams: an anchored or released one whose decision id is absent from the file fails the import, naming the dream; a faded one
+ *   loses the dangling id (its decision is re-made, as for any faded row without a valid event, in the dreams section).
+ * - noticings: an accepted or rejected one that names a decision event must name, in the file, an event of kind notice.<status>
+ *   about that noticing; otherwise the import fails, naming the noticing. (One that names none still arrives expired.)
+ */
+function checkDecisionEvents(doc: Doc): void {
+  const evById = new Map(doc.events.filter((e) => typeof e.id === "string").map((e) => [lc(e.id), e]));
+  for (const r of doc.projections.dreams ?? []) {
+    const st = String(r.status);
+    if (typeof r.decided_event_id !== "string" || evById.has(lc(r.decided_event_id))) continue;
+    if (st === "anchored" || st === "released") {
+      throw new ImportError(
+        `export file: dream ${typeof r.id === "string" ? lc(r.id) : "(no id)"} is ${st} but its decided_event_id names an event that is not in the file; nothing was imported`,
+      );
+    }
+    if (st === "faded") r.decided_event_id = null;
+  }
+  for (const r of doc.projections.noticings ?? []) {
+    const st = String(r.status);
+    if ((st !== "accepted" && st !== "rejected") || typeof r.decided_event_id !== "string") continue;
+    const e = evById.get(lc(r.decided_event_id));
+    const nid = typeof r.id === "string" ? lc(r.id) : "(no id)";
+    if (e === undefined) {
+      throw new ImportError(`export file: noticing ${nid} is ${st} but its decided_event_id names an event that is not in the file; nothing was imported`);
+    }
+    if (e.kind !== `notice.${st}` || typeof e.subject_id !== "string" || typeof r.id !== "string" || lc(e.subject_id) !== lc(r.id)) {
+      throw new ImportError(
+        `export file: noticing ${nid} is ${st} but its decided_event_id names an event that is not a notice.${st} event about it; nothing was imported`,
+      );
+    }
+  }
+}
+
 const CORE_TYPES = ["identity", "vow"];
 
 /** A fixed event id per imported noticing, so re-running an import finds its own expiry event instead of writing another. */
@@ -405,6 +440,9 @@ export async function importMind(
     if ("written_by" in o) o.written_by = target;
     return o;
   };
+
+  // a decision whose event is not in the file must not be dropped quietly by the filter below
+  checkDecisionEvents(doc);
 
   // references outside the file are refused before anything is written
   const refused = dropForeignRefs(doc);
