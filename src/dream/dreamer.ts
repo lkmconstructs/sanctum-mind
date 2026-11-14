@@ -60,11 +60,27 @@ export function parseLastJson<T>(text: string): T | null {
   return null;
 }
 
-/** A dream and a question, or null when the answer carries no dream. The question defaults to ''. */
+// "content" is a letter, a combining mark (abugida scripts keep vowels in marks) or a number; a word token is a maximal run of them
+const contentCount = (s: string): number => (s.match(/[\p{L}\p{M}\p{N}]/gu) ?? []).length;
+const tokenCount = (s: string): number => (s.match(/[\p{L}\p{M}\p{N}]+/gu) ?? []).length;
+const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const MIN_DREAM_CONTENT = 12;
+const MIN_DREAM_TOKENS = 3;
+
+/**
+ * A dream and a question, or null when the answer carries no usable dream. After trimming, a dream needs at least 12 content
+ * code points (letters, combining marks, numbers) and at least 3 word tokens; text with a Han, Hiragana, Katakana or Hangul
+ * character, which is written without spaces, needs only the 12. That refuses placeholders ("...", "{}", "d", one word) and
+ * not short dreams. The question may legitimately be absent: with no content code point it becomes ''.
+ */
 export function answerFrom(text: string): DreamAnswer | null {
   const o = parseLastJson<{ dream?: unknown; question?: unknown }>(text);
-  if (!o || typeof o.dream !== "string" || o.dream.trim() === "") return null;
-  return { dream: o.dream.trim(), question: typeof o.question === "string" ? o.question.trim() : "" };
+  if (!o || typeof o.dream !== "string") return null;
+  const dream = o.dream.trim();
+  if (contentCount(dream) < MIN_DREAM_CONTENT) return null;
+  if (tokenCount(dream) < MIN_DREAM_TOKENS && !UNSPACED.test(dream)) return null;
+  const question = typeof o.question === "string" ? o.question.trim() : "";
+  return { dream, question: contentCount(question) < 1 ? "" : question };
 }
 
 export const NONE_DREAMER: Dreamer = {

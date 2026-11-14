@@ -118,13 +118,16 @@ export const dreamGenerate: DetachedPass = {
           return { changed: 0, notes: [`skipped: ${tooSoon}`] };
         }
         if (answer === null) {
-          await recordRun(c.tx, mind, "dream.generate", started, ctx.now(), false, { error: "the dreamer answered with no dream" });
-          return { changed: 0, notes: ["failed: the dreamer answered with no dream; nothing was written"] };
+          await recordRun(c.tx, mind, "dream.generate", started, ctx.now(), false, { error: "the model returned no usable dream" });
+          return { changed: 0, notes: ["failed: the model returned no usable dream; nothing was written"] };
         }
         const r = plan.residue;
+        const pinnedNodeIds = r.pinned.filter((p) => p.type === "node").map((p) => p.id);
         const residue = {
           event_ids: r.events.map((e) => e.id),
-          node_ids: r.pinned.filter((p) => p.type === "node").map((p) => p.id),
+          // node_ids is the union (observation nodes and pinned nodes); pinned_node_ids is the pinned subset, so a count of pins stays exact
+          node_ids: [...new Set([...pinnedNodeIds, ...r.eventNodeIds])],
+          pinned_node_ids: pinnedNodeIds,
           pinned_event_ids: r.pinned.filter((p) => p.type === "event").map((p) => p.id),
           relation_subjects: r.relations.map((x) => x.subject),
           charge_counts: Object.fromEntries(r.chargeCounts.map((c) => [c.tag, c.n])),

@@ -20,6 +20,8 @@ export interface Residue {
   chargeCounts: Array<{ tag: string; n: number }>;
   relations: Array<{ subject: string; state: string; note: string | null }>;
   pinned: Array<{ id: string; type: "node" | "event"; text: string }>;
+  /** live nodes of the selected events (the observation node mind_observe curates beside its event), in the residue's event order */
+  eventNodeIds: string[];
   handoff: { unresolved_tension: string | null; active_texture: string | null };
   dropped: number;
   window: { from: Date; to: Date };
@@ -88,6 +90,20 @@ export async function readResidue(tx: PoolClient, mind: string, now: Date, windo
     if (events.length >= MAX_EVENTS) break;
   }
 
+  // the observation node of each selected event: mind_observe stores the event id in nodes.metadata->>'event_id'
+  const eventNodeIds: string[] = [];
+  if (events.length > 0) {
+    const ids = events.map((e) => e.id);
+    const nr = await tx.query<{ id: string }>(
+      `select n.id from nodes n
+         join unnest($2::uuid[]) with ordinality as e(id, ord) on n.metadata->>'event_id' = e.id::text
+        where n.mind_id = $1 and n.invalidated_at is null
+        order by e.ord, n.created_at, n.id`,
+      [mind, ids],
+    );
+    for (const r of nr.rows) if (!eventNodeIds.includes(r.id)) eventNodeIds.push(r.id);
+  }
+
   const counts = new Map<string, number>();
   for (const e of events) for (const t of e.charge) counts.set(t, (counts.get(t) ?? 0) + 1);
   const chargeCounts = [...counts].map(([tag, n]) => ({ tag, n })).sort((a, b) => b.n - a.n || a.tag.localeCompare(b.tag)).slice(0, 10);
@@ -129,6 +145,7 @@ export async function readResidue(tx: PoolClient, mind: string, now: Date, windo
     chargeCounts,
     relations,
     pinned,
+    eventNodeIds,
     handoff: { unresolved_tension: field("unresolved_tension"), active_texture: field("active_texture") },
     dropped,
     window: { from, to: now },

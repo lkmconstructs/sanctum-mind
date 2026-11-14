@@ -59,9 +59,13 @@ export interface ListedDream {
   residue_counts: { events: number; nodes: number; relations: number; pinned: number };
 }
 
-const counts = (r: Record<string, unknown>): ListedDream["residue_counts"] => {
+export const counts = (r: Record<string, unknown>): ListedDream["residue_counts"] => {
   const n = (k: string): number => (Array.isArray(r[k]) ? (r[k] as unknown[]).length : 0);
-  return { events: n("event_ids"), nodes: n("node_ids"), relations: n("relation_subjects"), pinned: n("node_ids") + n("pinned_event_ids") };
+  // node_ids holds observation nodes as well as pinned ones, so the pinned nodes are counted from pinned_node_ids. A dream laid
+  // before pinned_node_ids existed has no such key; under the old code its node_ids were exactly the pinned nodes, so for those
+  // (and only those) node_ids is the pinned-node count.
+  const pinnedNodes = Array.isArray(r["pinned_node_ids"]) ? n("pinned_node_ids") : n("node_ids");
+  return { events: n("event_ids"), nodes: n("node_ids"), relations: n("relation_subjects"), pinned: pinnedNodes + n("pinned_event_ids") };
 };
 
 /**
