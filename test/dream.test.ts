@@ -11,6 +11,7 @@ import { upsertMinds } from "../src/auth.js";
 import { runMigrations } from "../src/db/migrate.js";
 import { createPool, withMind } from "../src/db/pool.js";
 import { ArgError } from "../src/cli-args.js";
+import { counts } from "../src/verbs/mind_dream.js";
 import { runVerb } from "../src/verbs/run.js";
 import { registry } from "../src/verbs/registry.js";
 import { runDaemonOnce, PASSES } from "../src/daemon/index.js";
@@ -97,11 +98,13 @@ describe("the dreamer", () => {
     expect(answerFrom('{"question": "only"}')).toBeNull();
     expect(answerFrom('{"dream": " A forge that hummed under the floor all night, and nobody asked it to stop. ", "question": 3}')).toEqual({ dream: "A forge that hummed under the floor all night, and nobody asked it to stop.", question: "" });
   });
-  it("answerFrom rejects what is not a dream: under 40 letters is null, a question under 3 letters is empty", () => {
-    for (const bad of ['{"dream": "...", "question": "q"}', '{"dream": "", "question": "q"}', '{"dream": "   ", "question": "q"}', "{}", '{"dream": "abcdefghijklmnopqrst", "question": "Which door?"}']) expect(answerFrom(bad)).toBeNull();
+  it("answerFrom rejects what is not a dream: a placeholder is null, a short dream is kept, a question with no content is empty", () => {
+    for (const bad of ['{"dream": "...", "question": "q"}', '{"dream": "", "question": "q"}', '{"dream": "   ", "question": "q"}', "{}", '{"dream": "d", "question": "q"}', '{"dream": "Forgetfulnessandmore", "question": "q"}', '{"dream": "two words", "question": "q"}']) expect(answerFrom(bad)).toBeNull();
     const real = "A ledger of doors opened onto one kitchen. Someone was humming the forge song under the floor.";
     expect(answerFrom(JSON.stringify({ dream: real, question: "Which door was mine?" }))).toEqual({ dream: real, question: "Which door was mine?" });
     expect(answerFrom(JSON.stringify({ dream: real, question: "..." }))).toEqual({ dream: real, question: "" });
+    for (const ok of ["I flew. The sea sang back.", "मैंने एक नदी को अपने घर में बहते देखा।", "海が台所に入ってきて私を呼んだ"]) expect(answerFrom(JSON.stringify({ dream: ok, question: "q" }))).toEqual({ dream: ok, question: "q" });
+    expect(answerFrom(JSON.stringify({ dream: real, question: "誰？" }))).toEqual({ dream: real, question: "誰？" });
   });
   it("dreamerConfig validates DREAMER, DREAM_URL and DREAM_MODEL", () => {
     expect(dreamerConfig({}).kind).toBe("none");
@@ -199,6 +202,31 @@ describe("dream.generate", () => {
     expect(r[0]!.passes[0]).toMatchObject({ ok: true, changed: 1 });
     d = (await q("alpha", "select * from dreams"))[0];
     expect([...d.residue.node_ids].sort()).toEqual([n1, n2].sort());
+  });
+
+  it("residue_counts.pinned counts pins, not observation nodes (list and the dream.laid event agree)", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    const obs = async (content: string) => (await run(alpha, "mind_observe", { mind_id: "alpha", content, texture: { charge: ["warm"] } })).receipt.projection.node_id as string;
+    const n1 = await obs("the forge held through the night");
+    await obs("she laughed at the ledger joke");
+    const dreamer = fake({ dream: "A ledger of doors, each opening onto the same kitchen.", question: "Which door was mine?" });
+    await daemon([dreamGenerate], dreamer);
+    let l = (await D(alpha, { operation: "list" })).receipt.projection;
+    expect(l.dreams[0].residue_counts).toMatchObject({ nodes: 2, pinned: 0 });
+    await admin.query("delete from dreams");
+    await admin.query("delete from extractor_runs");
+    expect((await run(alpha, "mind_attend", { mind_id: "alpha", operation: "pin", item_type: "node", item_id: n1 })).ok).toBe(true);
+    await daemon([dreamGenerate], dreamer, new Date(clock.getTime() + DAY));
+    l = (await D(alpha, { operation: "list" })).receipt.projection;
+    expect(l.dreams[0].residue_counts).toMatchObject({ nodes: 2, pinned: 1 });
+    const d = (await q("alpha", "select residue from dreams"))[0];
+    expect(d.residue.pinned_node_ids).toEqual([n1]);
+  });
+
+  it("counts() reads a dream laid before pinned_node_ids as its node_ids being the pinned nodes", () => {
+    const legacy = { event_ids: ["e1"], node_ids: ["a", "b"], pinned_event_ids: ["e1"], relation_subjects: [] };
+    expect(counts(legacy)).toEqual({ events: 1, nodes: 2, relations: 0, pinned: 3 });
+    expect(counts({ ...legacy, pinned_node_ids: [] })).toEqual({ events: 1, nodes: 2, relations: 0, pinned: 1 });
   });
 
   it("lays one dream from the residue with its dream.laid event (ids and counts only), at the operator's stage, once a day and once per gap", async () => {

@@ -60,21 +60,27 @@ export function parseLastJson<T>(text: string): T | null {
   return null;
 }
 
-const letters = (s: string): number => (s.match(/\p{L}/gu) ?? []).length;
-const MIN_DREAM_LETTERS = 40;
-const MIN_QUESTION_LETTERS = 3;
+// "content" is a letter, a combining mark (abugida scripts keep vowels in marks) or a number; a word token is a maximal run of them
+const contentCount = (s: string): number => (s.match(/[\p{L}\p{M}\p{N}]/gu) ?? []).length;
+const tokenCount = (s: string): number => (s.match(/[\p{L}\p{M}\p{N}]+/gu) ?? []).length;
+const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const MIN_DREAM_CONTENT = 12;
+const MIN_DREAM_TOKENS = 3;
 
 /**
- * A dream and a question, or null when the answer carries no usable dream: after trimming, a dream with fewer than 40 letters
- * ("...", "{}", a fragment) is not a dream. The question may legitimately be absent: under 3 letters it becomes ''.
+ * A dream and a question, or null when the answer carries no usable dream. After trimming, a dream needs at least 12 content
+ * code points (letters, combining marks, numbers) and at least 3 word tokens; text with a Han, Hiragana, Katakana or Hangul
+ * character, which is written without spaces, needs only the 12. That refuses placeholders ("...", "{}", "d", one word) and
+ * not short dreams. The question may legitimately be absent: with no content code point it becomes ''.
  */
 export function answerFrom(text: string): DreamAnswer | null {
   const o = parseLastJson<{ dream?: unknown; question?: unknown }>(text);
   if (!o || typeof o.dream !== "string") return null;
   const dream = o.dream.trim();
-  if (letters(dream) < MIN_DREAM_LETTERS) return null;
+  if (contentCount(dream) < MIN_DREAM_CONTENT) return null;
+  if (tokenCount(dream) < MIN_DREAM_TOKENS && !UNSPACED.test(dream)) return null;
   const question = typeof o.question === "string" ? o.question.trim() : "";
-  return { dream, question: letters(question) < MIN_QUESTION_LETTERS ? "" : question };
+  return { dream, question: contentCount(question) < 1 ? "" : question };
 }
 
 export const NONE_DREAMER: Dreamer = {

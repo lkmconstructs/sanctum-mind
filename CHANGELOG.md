@@ -6,7 +6,8 @@ All notable changes to sanctum-mind are listed here, newest first. The format fo
 
 ### Fixed
 
-- Dreaming: a dream of fewer than 40 letters (such as `...` or `{}`) is no longer laid; the pass records "the model returned no usable dream" and tries again the next day, and a question under 3 letters becomes empty. A dream's residue now carries the nodes of the observations it was made from (`residue.node_ids`, and `residue_counts.nodes`), not only pinned nodes. No migration.
+- Dreaming: a placeholder dream (such as `...`, `{}`, a single word; fewer than 12 letters, marks or digits, or fewer than 3 words unless written in Han, kana or Hangul) is no longer laid; the pass records "the model returned no usable dream" and tries again the next day, and a question with no letter, mark or digit becomes empty. A dream's residue now carries the nodes of the observations it was made from (`residue.node_ids`, and `residue_counts.nodes`), not only pinned nodes. No migration.
+- Dreaming: `mind_dream list` and `mind_orient` no longer count observation nodes as pins; the residue now also carries `pinned_node_ids`, and dreams laid before it are counted as before.
 
 ## [0.3.0] - 2026-11-04
 
