@@ -95,7 +95,13 @@ describe("the dreamer", () => {
     expect(parseLastJson('<think>{not json}</think> {"dream": "a } inside", "question": "q"}')).toEqual({ dream: "a } inside", question: "q" });
     expect(parseLastJson("nothing")).toBeNull();
     expect(answerFrom('{"question": "only"}')).toBeNull();
-    expect(answerFrom('{"dream": " d ", "question": 3}')).toEqual({ dream: "d", question: "" });
+    expect(answerFrom('{"dream": " A forge that hummed under the floor all night, and nobody asked it to stop. ", "question": 3}')).toEqual({ dream: "A forge that hummed under the floor all night, and nobody asked it to stop.", question: "" });
+  });
+  it("answerFrom rejects what is not a dream: under 40 letters is null, a question under 3 letters is empty", () => {
+    for (const bad of ['{"dream": "...", "question": "q"}', '{"dream": "", "question": "q"}', '{"dream": "   ", "question": "q"}', "{}", '{"dream": "abcdefghijklmnopqrst", "question": "Which door?"}']) expect(answerFrom(bad)).toBeNull();
+    const real = "A ledger of doors opened onto one kitchen. Someone was humming the forge song under the floor.";
+    expect(answerFrom(JSON.stringify({ dream: real, question: "Which door was mine?" }))).toEqual({ dream: real, question: "Which door was mine?" });
+    expect(answerFrom(JSON.stringify({ dream: real, question: "..." }))).toEqual({ dream: real, question: "" });
   });
   it("dreamerConfig validates DREAMER, DREAM_URL and DREAM_MODEL", () => {
     expect(dreamerConfig({}).kind).toBe("none");
@@ -109,9 +115,9 @@ describe("the dreamer", () => {
     const calls: any[] = [];
     const ok = httpDreamer({ kind: "http", url: "http://d.test/v1", model: "m", apiKey: "k", timeoutMs: 1000 }, (async (url: any, init: any) => {
       calls.push({ url, body: JSON.parse(init.body), auth: init.headers.authorization });
-      return new Response(JSON.stringify({ choices: [{ message: { content: 'thinking... {"dream": "A forge that hummed.", "question": "For whom?"}' } }] }));
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'thinking... {"dream": "A forge that hummed under the floor all night, and nobody asked it to stop.", "question": "For whom?"}' } }] }));
     }) as any);
-    expect(await ok.dream("SYS", "USER")).toEqual({ dream: "A forge that hummed.", question: "For whom?" });
+    expect(await ok.dream("SYS", "USER")).toEqual({ dream: "A forge that hummed under the floor all night, and nobody asked it to stop.", question: "For whom?" });
     expect(calls[0]).toMatchObject({ url: "http://d.test/v1/chat/completions", auth: "Bearer k", body: { model: "m", temperature: 0.9, messages: [{ role: "system", content: "SYS" }, { role: "user", content: "USER" }] } });
     const bad = httpDreamer({ kind: "http", url: "http://d.test/v1", model: "m", apiKey: null, timeoutMs: 1000 }, (async () => new Response("nope", { status: 500 })) as any);
     expect(await bad.dream("s", "u")).toBeNull();
@@ -165,9 +171,34 @@ describe("dream.generate", () => {
     await texturedEvent("a long day");
     clock = new Date(clock.getTime() + DAY);
     r = await daemon([dreamGenerate], fake(null));
-    expect(r[0]!.passes[0]!.notes![0]).toMatch(/answered with no dream/);
+    expect(r[0]!.passes[0]!.notes![0]).toMatch(/the model returned no usable dream/);
     expect(await q("alpha", "select count(*)::int as n from dreams")).toEqual([{ n: 0 }]);
     expect((await q("alpha", "select ok, notes from extractor_runs order by started_at")).map((x) => [x.ok, x.notes.skipped ?? false])).toEqual([[false, true], [false, false]]);
+  });
+
+  it("residue.node_ids are the live nodes of the residue's observations plus pinned nodes, once each", async () => {
+    await setDreamState(admin, "alpha", "enable", { stage: "propose", schedule: "00:00" });
+    const obs = async (content: string) => (await run(alpha, "mind_observe", { mind_id: "alpha", content, texture: { charge: ["warm"] } })).receipt.projection.node_id as string;
+    const n1 = await obs("the forge held through the night");
+    const n2 = await obs("she laughed at the ledger joke");
+    await texturedEvent("a plain write with no node", ["calm"]);
+    const dreamer = fake({ dream: "A ledger of doors, each opening onto the same kitchen.", question: "Which door was mine?" });
+    let r = await daemon([dreamGenerate], dreamer);
+    expect(r[0]!.passes[0]).toMatchObject({ ok: true, changed: 1 });
+    let d = (await q("alpha", "select * from dreams"))[0];
+    expect([...d.residue.node_ids].sort()).toEqual([n1, n2].sort());
+    expect(d.residue.event_ids).toHaveLength(3);
+    const ev = (await q("alpha", "select payload from events where kind = 'dream.laid'"))[0];
+    expect(DREAM_EVENT_SHAPES["dream.laid"].parse(ev.payload)).toMatchObject({ residue_counts: { events: 3, nodes: 2 } });
+
+    // pinned as well: still two, no duplicate
+    await admin.query("delete from dreams");
+    await admin.query("delete from extractor_runs");
+    expect((await run(alpha, "mind_attend", { mind_id: "alpha", operation: "pin", item_type: "node", item_id: n1 })).ok).toBe(true);
+    r = await daemon([dreamGenerate], dreamer, new Date(clock.getTime() + DAY));
+    expect(r[0]!.passes[0]).toMatchObject({ ok: true, changed: 1 });
+    d = (await q("alpha", "select * from dreams"))[0];
+    expect([...d.residue.node_ids].sort()).toEqual([n1, n2].sort());
   });
 
   it("lays one dream from the residue with its dream.laid event (ids and counts only), at the operator's stage, once a day and once per gap", async () => {

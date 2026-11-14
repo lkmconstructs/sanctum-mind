@@ -60,11 +60,21 @@ export function parseLastJson<T>(text: string): T | null {
   return null;
 }
 
-/** A dream and a question, or null when the answer carries no dream. The question defaults to ''. */
+const letters = (s: string): number => (s.match(/\p{L}/gu) ?? []).length;
+const MIN_DREAM_LETTERS = 40;
+const MIN_QUESTION_LETTERS = 3;
+
+/**
+ * A dream and a question, or null when the answer carries no usable dream: after trimming, a dream with fewer than 40 letters
+ * ("...", "{}", a fragment) is not a dream. The question may legitimately be absent: under 3 letters it becomes ''.
+ */
 export function answerFrom(text: string): DreamAnswer | null {
   const o = parseLastJson<{ dream?: unknown; question?: unknown }>(text);
-  if (!o || typeof o.dream !== "string" || o.dream.trim() === "") return null;
-  return { dream: o.dream.trim(), question: typeof o.question === "string" ? o.question.trim() : "" };
+  if (!o || typeof o.dream !== "string") return null;
+  const dream = o.dream.trim();
+  if (letters(dream) < MIN_DREAM_LETTERS) return null;
+  const question = typeof o.question === "string" ? o.question.trim() : "";
+  return { dream, question: letters(question) < MIN_QUESTION_LETTERS ? "" : question };
 }
 
 export const NONE_DREAMER: Dreamer = {

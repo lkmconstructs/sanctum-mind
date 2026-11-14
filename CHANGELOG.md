@@ -2,6 +2,12 @@
 
 All notable changes to sanctum-mind are listed here, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Moving between versions is described in [UPGRADING.md](UPGRADING.md).
 
+## Unreleased
+
+### Fixed
+
+- Dreaming: a dream of fewer than 40 letters (such as `...` or `{}`) is no longer laid; the pass records "the model returned no usable dream" and tries again the next day, and a question under 3 letters becomes empty. A dream's residue now carries the nodes of the observations it was made from (`residue.node_ids`, and `residue_counts.nodes`), not only pinned nodes. No migration.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added
